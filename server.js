@@ -451,30 +451,31 @@ app.post("/webhook", (req, res) => {
     " | tp1 $" + tp1Price
   );
 
+  // ── AUTO-EXECUTE immediately — no dashboard click needed ──────────────────
   res.json({ status: "received", signal });
+  executeSignal(signal.id);
 });
 
-// Execute — dashboard one-click
-app.post("/execute/:id", async (req, res) => {
-  const id     = parseInt(req.params.id);
+// ── Core execute function — called automatically on every signal ──────────────
+async function executeSignal(id) {
   const signal = signalHistory.find(s => s.id === id);
-
-  if (!signal)                     return res.status(404).json({ error: "Signal not found" });
-  if (signal.status !== "PENDING") return res.status(400).json({ error: "Signal not pending — status: " + signal.status });
+  if (!signal)                     return log("ERROR", "executeSignal: signal #" + id + " not found");
+  if (signal.status !== "PENDING") return log("ERROR", "executeSignal: signal #" + id + " not pending (" + signal.status + ")");
 
   if (!ALPACA_KEY || !ALPACA_SECRET) {
-    return res.status(400).json({ error: "Alpaca API keys not configured — add ALPACA_KEY and ALPACA_SECRET in Railway env vars" });
+    log("ERROR", "Alpaca API keys not configured — add ALPACA_KEY and ALPACA_SECRET in Railway env vars");
+    return;
   }
 
   signal.status = "EXECUTING";
   broadcast({ type: "signal_update", id, status: "EXECUTING" });
+  log("AUTO", "Auto-executing signal #" + id + " — " + signal.direction + " SPXW " + signal.longStrike + "/" + signal.shortStrike);
 
   try {
-    // Place spread entry orders
     const result = await placeSpreadOrders(signal);
 
-    signal.longSymbol  = result.longSymbol;
-    signal.shortSymbol = result.shortSymbol;
+    signal.longSymbol   = result.longSymbol;
+    signal.shortSymbol  = result.shortSymbol;
     signal.longOrderId  = result.longOrderId;
     signal.shortOrderId = result.shortOrderId;
     signal.fillDebit    = result.netDebit;
@@ -489,24 +490,21 @@ app.post("/execute/:id", async (req, res) => {
       fillDebit:    result.netDebit,
     });
 
-    log("ORDER", "Spread orders sent for signal #" + id);
+    log("AUTO", "Orders placed — polling for fill...");
 
-    // Poll for long leg fill then attach bracket
     pollOrderFill(result.longOrderId, 60000).then(async (filled) => {
       if (!filled) {
         log("ORDER", "Long leg unfilled after 60s — signal #" + id + " remains open");
         return;
       }
-
-      const fillPrice = parseFloat(filled.filled_avg_price || result.longMid);
+      const fillPrice  = parseFloat(filled.filled_avg_price || result.longMid);
       signal.fillPrice = fillPrice;
       signal.status    = "FILLED";
       broadcast({ type: "signal_update", id, status: "FILLED", fillPrice });
-      log("FILL", "Long leg filled @ $" + fillPrice + " | placing bracket...");
+      log("FILL", "Filled @ $" + fillPrice + " | placing bracket...");
 
-      // Attach stop + TP1
       try {
-        const bracket = await placeBracketClosing(signal);
+        const bracket      = await placeBracketClosing(signal);
         signal.stopOrderId = bracket.stopOrderId;
         signal.tp1OrderId  = bracket.tp1OrderId;
         signal.stopPrice   = bracket.stopPrice;
@@ -518,24 +516,31 @@ app.post("/execute/:id", async (req, res) => {
           stopPrice:   bracket.stopPrice,
           tp1Price:    bracket.tp1Price,
         });
+        log("AUTO", "Bracket attached — stop $" + bracket.stopPrice + " | tp1 $" + bracket.tp1Price);
       } catch (bracketErr) {
-        log("ERROR", "Bracket placement failed for signal #" + id + ": " + bracketErr.message);
+        log("ERROR", "Bracket failed for signal #" + id + ": " + bracketErr.message);
       }
-
     }).catch(err => {
-      log("ERROR", "Fill poll error for signal #" + id + ": " + err.message);
+      log("ERROR", "Fill poll error signal #" + id + ": " + err.message);
       signal.status = "PENDING";
       broadcast({ type: "signal_update", id, status: "PENDING" });
     });
 
-    res.json({ status: "sent", longOrderId: result.longOrderId, shortOrderId: result.shortOrderId });
-
   } catch (err) {
     signal.status = "PENDING";
     broadcast({ type: "signal_update", id, status: "PENDING" });
-    log("ERROR", "Execute failed for signal #" + id + ": " + err.message);
-    res.status(500).json({ error: err.message });
+    log("ERROR", "Auto-execute failed signal #" + id + ": " + err.message);
   }
+}
+
+// Execute — manual fallback (dashboard or direct API call)
+app.post("/execute/:id", async (req, res) => {
+  const id     = parseInt(req.params.id);
+  const signal = signalHistory.find(s => s.id === id);
+  if (!signal)                     return res.status(404).json({ error: "Signal not found" });
+  if (signal.status !== "PENDING") return res.status(400).json({ error: "Signal not pending — status: " + signal.status });
+  res.json({ status: "executing", id });
+  executeSignal(id);
 });
 
 // Cancel — cancels all open orders for a signal
