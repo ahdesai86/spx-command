@@ -157,11 +157,10 @@ async function fetchGEX(emergency) {
     gexPullsToday++;
     log("GEX", "Fetching from FlashAlpha — pull " + gexPullsToday + "/" + GEX_MAX_PULLS + (emergency ? " [EMERGENCY]" : " [SCHEDULED]"));
 
-    const res = await fetch("https://api.flashalpha.io/v1/gex/levels?symbol=SPY&type=all", {
+    const res = await fetch("https://lab.flashalpha.com/v1/exposure/summary/SPY", {
       headers: {
-        "Authorization": "Bearer " + FLASHALPHA_KEY,
-        "Content-Type":  "application/json",
-        "Accept":        "application/json",
+        "X-Api-Key": FLASHALPHA_KEY,
+        "Accept":    "application/json",
       },
     });
 
@@ -172,23 +171,24 @@ async function fetchGEX(emergency) {
       return gexCache;
     }
 
-    const data   = await res.json();
-    const levels = data.levels || data.data || [];
+    const data    = await res.json();
+    // Response: { symbol, net_gex, gamma_flip, regime, strikes:[{strike,call_gex,put_gex,net_gex}] }
+    const strikes = data.strikes || [];
 
-    const callWalls = levels
-      .filter(l => l.type === "call" || l.gex > 0)
-      .map(l => ({ price: parseFloat(l.price), gex: parseFloat(l.gex) }))
-      .sort((a, b) => Math.abs(b.gex) - Math.abs(a.gex))
-      .slice(0, 5);
-
-    const putWalls = levels
-      .filter(l => l.type === "put" || l.gex < 0)
-      .map(l => ({ price: parseFloat(l.price), gex: Math.abs(parseFloat(l.gex)) }))
+    const callWalls = strikes
+      .filter(s => s.call_gex > 0)
+      .map(s => ({ price: parseFloat(s.strike), gex: parseFloat(s.call_gex) }))
       .sort((a, b) => b.gex - a.gex)
       .slice(0, 5);
 
-    const magnet = parseFloat(data.magnet  || data.magnetLevel || 0);
-    const netGex = parseFloat(data.netGex  || data.net_gex     || 0);
+    const putWalls = strikes
+      .filter(s => s.put_gex < 0)
+      .map(s => ({ price: parseFloat(s.strike), gex: Math.abs(parseFloat(s.put_gex)) }))
+      .sort((a, b) => b.gex - a.gex)
+      .slice(0, 5);
+
+    const magnet = parseFloat(data.gamma_flip || 0);
+    const netGex = parseFloat(data.net_gex    || 0);
 
     gexCache     = { callWalls, putWalls, magnet, netGex, updatedAt: new Date().toISOString(), pullNumber: gexPullsToday };
     gexCacheTime = now;
