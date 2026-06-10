@@ -613,8 +613,10 @@ async function executeSignal(id) {
 
 // ── Express app ───────────────────────────────────────────────────────────────
 const app = express();
-app.use(cors());
+// Open CORS — allows dashboard on any domain to connect
+app.use(cors({ origin: "*", methods: ["GET","POST","DELETE","OPTIONS"], allowedHeaders: ["Content-Type"] }));
 app.use(express.json());
+app.options("*", cors());
 
 app.get("/", (req, res) => res.json({
   service: "SPX COMMAND", status: "running",
