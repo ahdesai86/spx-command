@@ -16,7 +16,7 @@
  *
  * EXIT LOGIC:
  *   Stop loss     = 50% of premium paid (configurable via PREMIUM_STOP_PCT)
- *   TP1           = 100% gain on premium (2× entry price)
+ *   TP1           = 200% gain on premium (3× entry price) = 8:1 R:R with 25% stop
  *   Trailing stop = after TP1 hit, stop moves to breakeven (entry price)
  *   Force close   = all open positions closed at 3:45 PM ET
  *
@@ -615,7 +615,7 @@ async function placeLongOption(signal) {
 async function placeExitOrders(signal) {
   const entryPrice = signal.fillPrice || signal.midPrice;
   const stopPrice  = parseFloat((entryPrice * (1 - PREMIUM_STOP_PCT)).toFixed(2));
-  const tp1Price   = parseFloat((entryPrice * 2.0).toFixed(2));
+  const tp1Price   = parseFloat((entryPrice * 3.0).toFixed(2));  // 3x = 8:1 R:R with 25% stop
   const contracts  = signal.contracts;
 
   log("EXIT", "Placing exits — entry: $" + entryPrice +
@@ -655,7 +655,7 @@ async function placeExitOrders(signal) {
 async function trailStopToBreakeven(signal) {
   const breakeven = signal.fillPrice || signal.midPrice;
 
-  log("TRAIL", "Moving stop to breakeven $" + breakeven + " for signal #" + signal.id);
+  log("TRAIL", "Moving stop to breakeven $" + breakeven + " for signal #" + signal.id + " | locking in profit");
 
   // Cancel existing stop
   if (signal.stopOrderId) {
