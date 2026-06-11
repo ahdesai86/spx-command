@@ -1,0 +1,617 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SPX COMMAND</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #07090c; color: #d4e4f4; font-family: 'Space Mono', monospace; }
+    @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Space+Grotesk:wght@400;700&display=swap');
+    @keyframes pip { 0%,100%{opacity:1} 50%{opacity:0.2} }
+    @keyframes fadein { from{opacity:0;transform:translateY(3px)} to{opacity:1;transform:none} }
+    ::-webkit-scrollbar { width: 3px; }
+    ::-webkit-scrollbar-thumb { background: #1a2535; border-radius: 2px; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+
+const { useState, useEffect, useRef, useCallback } = React;
+
+// SERVER is same origin — dashboard served from server.js
+const SERVER = window.location.origin;
+
+const T = {
+  bg:"#07090c", panel:"#0c1017", border:"#151d28",
+  bull:"#2dd4a0", bear:"#f05b6d", yellow:"#f5c842",
+  purple:"#9d7ff5", blue:"#4db8ff", dim:"#1a2535",
+  muted:"#4a5e74", text:"#d4e4f4", textDim:"#5a7a94",
+};
+
+function fmtGex(v) {
+  if (!v) return "—";
+  const m = Math.abs(v)/1e6;
+  return (v>=0?"+":"-")+"$"+m.toFixed(0)+"M";
+}
+function fmtExpiry(raw) {
+  if (!raw||raw.length!==8) return raw||"—";
+  return raw.slice(4,6)+"/"+raw.slice(6)+"/"+raw.slice(0,4);
+}
+function fmtPnl(v) {
+  if (v==null) return null;
+  return (v>=0?"+":"")+"$"+Math.abs(v).toFixed(0);
+}
+
+function Pip({on,color}) {
+  return <div style={{width:6,height:6,borderRadius:"50%",flexShrink:0,
+    background:on?color:"#1a2535",
+    boxShadow:on?"0 0 6px "+color:"none",
+    animation:on?"pip 2s infinite":"none"}} />;
+}
+
+function Tag({label,color}) {
+  return <span style={{background:color+"18",color,
+    border:"1px solid "+color+"33",borderRadius:3,
+    padding:"1px 7px",fontSize:10,fontFamily:"monospace",
+    fontWeight:700}}>{label}</span>;
+}
+
+function GEXPanel({gex}) {
+  if (!gex) return (
+    <div style={{background:T.panel,border:"1px solid "+T.border,
+      borderRadius:10,padding:"20px 16px",textAlign:"center"}}>
+      <div style={{color:T.muted,fontSize:11,fontFamily:"monospace",marginBottom:6}}>
+        GEX calculates at 9:25 AM ET
+      </div>
+      <div style={{color:T.dim,fontSize:10,fontFamily:"monospace"}}>
+        From Alpaca option chain · free · no third party
+      </div>
+    </div>
+  );
+
+  const isPos   = gex.regime==="positive";
+  const rColor  = isPos ? T.bull : T.bear;
+  const spot    = gex.spotPrice||0;
+  const allWalls = [
+    ...(gex.callWalls||[]).map(w=>({...w,type:"call"})),
+    ...(gex.putWalls||[]).map(w=>({...w,type:"put"})),
+  ].sort((a,b)=>b.price-a.price);
+  const maxGex = Math.max(...allWalls.map(w=>w.gex),1);
+
+  return (
+    <div style={{background:T.panel,border:"1px solid "+T.border,borderRadius:10,overflow:"hidden"}}>
+      {/* Header */}
+      <div style={{padding:"12px 16px",borderBottom:"1px solid "+T.border,
+        display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          <Pip on color={rColor} />
+          <span style={{color:T.text,fontSize:12,fontFamily:"monospace",fontWeight:700}}>
+            GEX · {(gex.regime||"").toUpperCase()} REGIME
+          </span>
+        </div>
+        <div style={{display:"flex",gap:16}}>
+          {[
+            {k:"NET GEX", v:fmtGex(gex.netGex),    c:rColor},
+            {k:"FLIP",    v:"$"+(gex.gammaFlip||0), c:T.yellow},
+            {k:"SPY",     v:"$"+(spot.toFixed(2)),   c:T.text},
+          ].map(({k,v,c})=>(
+            <div key={k} style={{textAlign:"right"}}>
+              <div style={{color:T.muted,fontSize:9,fontFamily:"monospace",letterSpacing:1}}>{k}</div>
+              <div style={{color:c,fontSize:13,fontFamily:"monospace",fontWeight:700}}>{v}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Regime bar */}
+      <div style={{padding:"7px 16px",background:rColor+"08",
+        borderBottom:"1px solid "+T.border}}>
+        <span style={{color:rColor,fontSize:10,fontFamily:"monospace"}}>
+          {isPos
+            ? "▲ POSITIVE — Dealers long gamma · price magnetic to walls · range bound"
+            : "▼ NEGATIVE — Dealers short gamma · moves amplified · trending"}
+        </span>
+      </div>
+
+      {/* Wall bars */}
+      <div style={{padding:"12px 16px"}}>
+        {allWalls.map((wall,i)=>{
+          const isCall  = wall.type==="call";
+          const color   = isCall ? T.bull : T.bear;
+          const barPct  = (wall.gex/maxGex)*100;
+          const isAbove = wall.price>spot;
+          const isFirst = (isAbove && !allWalls.slice(0,i).some(w=>w.price>spot)) ||
+                          (!isAbove && !allWalls.slice(0,i).some(w=>w.price<=spot));
+          return (
+            <React.Fragment key={i}>
+              <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:5}}>
+                <div style={{width:48,textAlign:"right",color:isFirst?color:T.muted,
+                  fontSize:11,fontFamily:"monospace",fontWeight:isFirst?700:400,flexShrink:0}}>
+                  ${wall.price}
+                </div>
+                <div style={{width:34,background:color+"18",border:"1px solid "+color+"33",
+                  borderRadius:3,padding:"1px 4px",color,fontSize:8,
+                  fontFamily:"monospace",textAlign:"center",flexShrink:0}}>
+                  {isCall?"CALL":"PUT"}
+                </div>
+                <div style={{flex:1,height:12,background:T.dim,borderRadius:2,overflow:"hidden"}}>
+                  <div style={{width:barPct+"%",height:"100%",
+                    background:isFirst?color:color+"55",
+                    transition:"width 0.5s ease"}} />
+                </div>
+                <div style={{width:48,color:T.muted,fontSize:9,fontFamily:"monospace",flexShrink:0}}>
+                  ${(wall.gex/1e6).toFixed(1)}M
+                </div>
+                {isFirst && <span style={{color,fontSize:9,fontFamily:"monospace",flexShrink:0}}>
+                  {isCall?"▲ target":"▼ target"}
+                </span>}
+              </div>
+              {i<allWalls.length-1 && allWalls[i].price>spot && allWalls[i+1].price<=spot && (
+                <div style={{display:"flex",alignItems:"center",gap:6,margin:"7px 0"}}>
+                  <div style={{width:48}} /><div style={{width:34}} />
+                  <div style={{flex:1,display:"flex",alignItems:"center",gap:6}}>
+                    <div style={{flex:1,height:1,background:T.yellow+"44"}} />
+                    <span style={{color:T.yellow,fontSize:9,fontFamily:"monospace",whiteSpace:"nowrap"}}>
+                      SPY ${spot.toFixed(2)} ← HERE
+                    </span>
+                    <div style={{flex:1,height:1,background:T.yellow+"44"}} />
+                  </div>
+                </div>
+              )}
+            </React.Fragment>
+          );
+        })}
+      </div>
+
+      {/* Footer */}
+      <div style={{padding:"7px 16px",borderTop:"1px solid "+T.border,
+        display:"flex",justifyContent:"space-between"}}>
+        <span style={{color:T.dim,fontSize:9,fontFamily:"monospace"}}>
+          Source: Alpaca chain (self-calculated)
+        </span>
+        <span style={{color:T.muted,fontSize:9,fontFamily:"monospace"}}>
+          Compare → TradeEcho · Unusual Whales · SpotGamma
+        </span>
+        <span style={{color:T.dim,fontSize:9,fontFamily:"monospace"}}>
+          {gex.updatedAt ? new Date(gex.updatedAt).toLocaleTimeString("en-US",{hour12:false,timeZone:"America/New_York"})+" ET" : "—"}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function SignalCard({signal,onCancel}) {
+  const [busy,setBusy] = useState(false);
+  const isLong   = signal.direction==="LONG";
+  const dirColor = isLong ? T.bull : T.bear;
+  const isClosed = ["STOPPED","EOD_CLOSED","CANCELLED","TP1_HIT"].includes(signal.status);
+  const isActive = ["FILLED","TP1_HIT"].includes(signal.status);
+  const SC = {PENDING:T.yellow,EXECUTING:T.blue,SENT:T.purple,
+    FILLED:T.bull,TP1_HIT:T.bull,STOPPED:T.bear,EOD_CLOSED:T.muted,CANCELLED:T.dim};
+  const SL = {PENDING:"PENDING",EXECUTING:"PLACING...",SENT:"ORDER SENT",
+    FILLED:"LIVE",TP1_HIT:"TP1 HIT ✓",STOPPED:"STOPPED ✗",
+    EOD_CLOSED:"EOD CLOSED",CANCELLED:"CANCELLED"};
+  const sc  = SC[signal.status]||T.muted;
+  const pnl = signal.closePnl;
+
+  const doCancel = async()=>{
+    setBusy(true);
+    try { await fetch(SERVER+"/cancel/"+signal.id,{method:"POST"}); } finally{setBusy(false);}
+  };
+
+  return (
+    <div style={{background:T.panel,
+      border:"1px solid "+(isClosed?T.dim:dirColor+"33"),
+      borderLeft:"3px solid "+(isClosed?T.dim:dirColor),
+      borderRadius:9,padding:"13px 15px",
+      opacity:isClosed?0.6:1,animation:"fadein 0.25s ease"}}>
+
+      {/* Header */}
+      <div style={{display:"flex",justifyContent:"space-between",
+        alignItems:"flex-start",marginBottom:10}}>
+        <div>
+          <div style={{display:"flex",alignItems:"center",gap:7,flexWrap:"wrap",marginBottom:4}}>
+            <span style={{fontFamily:"monospace",fontSize:15,fontWeight:700,
+              color:T.text,letterSpacing:2}}>SPY</span>
+            <Tag label={signal.direction} color={dirColor} />
+            <span style={{color:T.textDim,fontSize:12,fontFamily:"monospace"}}>
+              ${signal.strike} {signal.right==="C"?"CALL":"PUT"}
+            </span>
+            {pnl!=null && <Tag label={fmtPnl(pnl)} color={pnl>=0?T.bull:T.bear} />}
+          </div>
+          <div style={{color:T.textDim,fontSize:10,fontFamily:"monospace"}}>
+            {signal.trigger} · {signal.time} ET
+          </div>
+        </div>
+        <div style={{background:sc+"15",color:sc,border:"1px solid "+sc+"30",
+          borderRadius:4,padding:"3px 9px",fontSize:9,fontFamily:"monospace",
+          display:"flex",alignItems:"center",gap:5,flexShrink:0}}>
+          {isActive && <Pip on color={sc} />}
+          {SL[signal.status]||signal.status}
+        </div>
+      </div>
+
+      {/* Contract */}
+      {signal.optionSymbol && (
+        <div style={{marginBottom:9,padding:"5px 10px",background:T.bg,
+          borderRadius:4,border:"1px solid "+T.border}}>
+          <span style={{color:T.muted,fontSize:9,fontFamily:"monospace"}}>CONTRACT </span>
+          <span style={{color:T.purple,fontSize:11,fontFamily:"monospace"}}>{signal.optionSymbol}</span>
+          {signal.contracts && <span style={{color:T.text,fontSize:11,fontFamily:"monospace"}}> x{signal.contracts}</span>}
+          {signal.totalCost && <span style={{color:T.yellow,fontSize:11,fontFamily:"monospace"}}> · ${signal.totalCost} total</span>}
+        </div>
+      )}
+
+      {/* Price grids */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:4,marginBottom:6}}>
+        {[
+          {k:"ENTRY",  v:signal.spyEntry?"$"+signal.spyEntry?.toFixed(2):"—", c:T.text},
+          {k:"STOP",   v:signal.stop?"$"+signal.stop?.toFixed(2):"—",          c:T.bear},
+          {k:"TP1",    v:signal.tp1?"$"+signal.tp1?.toFixed(2):"—",            c:T.blue},
+          {k:"TP2",    v:signal.tp2?"$"+signal.tp2?.toFixed(2):"—",            c:T.purple},
+        ].map(({k,v,c})=>(
+          <div key={k} style={{background:T.bg,borderRadius:4,padding:"6px 8px",border:"1px solid "+T.border}}>
+            <div style={{color:T.dim,fontSize:8,fontFamily:"monospace",letterSpacing:1,marginBottom:3}}>{k}</div>
+            <div style={{color:c,fontSize:12,fontFamily:"monospace",fontWeight:600}}>{v}</div>
+          </div>
+        ))}
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:4,marginBottom:9}}>
+        {[
+          {k:"PREM PAID", v:signal.fillPrice?"$"+signal.fillPrice?.toFixed(2):signal.midPrice?"$"+signal.midPrice?.toFixed(2):"—", c:T.text},
+          {k:"PREM STOP", v:signal.stopPrice?"$"+signal.stopPrice?.toFixed(2):"—", c:T.bear},
+          {k:"PREM TP1",  v:signal.tp1Price?"$"+signal.tp1Price?.toFixed(2):"—",   c:T.blue},
+          {k:"R:R",       v:signal.rr||"—",                                         c:T.yellow},
+        ].map(({k,v,c})=>(
+          <div key={k} style={{background:T.bg,borderRadius:4,padding:"6px 8px",border:"1px dashed "+T.border}}>
+            <div style={{color:T.dim,fontSize:8,fontFamily:"monospace",letterSpacing:1,marginBottom:3}}>{k}</div>
+            <div style={{color:c,fontSize:12,fontFamily:"monospace",fontWeight:600}}>{v}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* GEX reason */}
+      {signal.gexReason && (
+        <div style={{padding:"5px 9px",marginBottom:8,background:T.dim+"44",
+          borderRadius:4,border:"1px solid "+T.dim}}>
+          <span style={{color:T.muted,fontSize:9,fontFamily:"monospace"}}>GEX </span>
+          <span style={{color:T.textDim,fontSize:10,fontFamily:"monospace"}}>{signal.gexReason}</span>
+        </div>
+      )}
+
+      {/* Trail */}
+      {signal.trailedToBreakeven && (
+        <div style={{padding:"5px 9px",marginBottom:8,background:T.bull+"08",
+          border:"1px solid "+T.bull+"20",borderRadius:4}}>
+          <span style={{color:T.bull,fontSize:10,fontFamily:"monospace"}}>
+            ✓ Stop trailed to breakeven ${signal.fillPrice?.toFixed(2)}
+          </span>
+        </div>
+      )}
+
+      {/* Action */}
+      {isActive && (
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",
+          padding:"7px 10px",background:T.bull+"08",
+          border:"1px solid "+T.bull+"20",borderRadius:5}}>
+          <div style={{display:"flex",alignItems:"center",gap:6}}>
+            <Pip on color={T.bull} />
+            <span style={{color:T.bull,fontSize:10,fontFamily:"monospace"}}>
+              Live on Alpaca · stop + TP1 active
+            </span>
+          </div>
+          <button onClick={doCancel} disabled={busy} style={{
+            background:T.bear+"0f",border:"1px solid "+T.bear+"30",
+            borderRadius:4,color:T.bear,padding:"2px 8px",
+            fontSize:9,fontFamily:"monospace",cursor:"pointer"}}>
+            {busy?"...":"CLOSE"}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function LogFeed({logs}) {
+  const ref = useRef();
+  useEffect(()=>{ if(ref.current) ref.current.scrollTop=ref.current.scrollHeight; },[logs]);
+  const TC = {GEX:T.bull,"GEX ERR":T.bear,ALPACA:T.blue,WEBHOOK:T.yellow,
+    SIGNAL:T.bull,AUTO:T.purple,FILL:T.bull,EXIT:T.blue,TRAIL:T.bull,
+    STOP:T.bear,TP1:T.bull,EOD:T.yellow,ERROR:T.bear,CANCEL:T.bear};
+  return (
+    <div style={{background:T.panel,border:"1px solid "+T.border,borderRadius:10,padding:12,height:175}}>
+      <div style={{display:"flex",justifyContent:"space-between",marginBottom:7}}>
+        <span style={{color:T.muted,fontSize:9,fontFamily:"monospace",letterSpacing:2}}>LIVE LOG</span>
+        <span style={{color:T.dim,fontSize:9,fontFamily:"monospace"}}>{logs.length} events</span>
+      </div>
+      <div ref={ref} style={{overflowY:"auto",height:120}}>
+        {logs.length===0
+          ? <div style={{color:T.dim,fontSize:10,fontFamily:"monospace"}}>Waiting for events...</div>
+          : [...logs].reverse().map((l,i)=>(
+              <div key={i} style={{fontSize:10,fontFamily:"monospace",marginBottom:3,display:"flex",gap:7}}>
+                <span style={{color:T.dim,flexShrink:0}}>{l.time}</span>
+                <span style={{color:TC[l.tag]||T.muted,flexShrink:0,minWidth:55}}>[{l.tag}]</span>
+                <span style={{color:T.textDim}}>{l.msg}</span>
+              </div>
+            ))
+        }
+      </div>
+    </div>
+  );
+}
+
+function App() {
+  const [signals,    setSignals]    = useState([]);
+  const [logs,       setLogs]       = useState([]);
+  const [gex,        setGex]        = useState(null);
+  const [alpacaOk,   setAlpacaOk]   = useState(false);
+  const [sseOk,      setSseOk]      = useState(false);
+  const [sessionPnL, setSessionPnL] = useState(0);
+  const [dailyLoss,  setDailyLoss]  = useState(0);
+  const [riskBudget, setRiskBudget] = useState(500);
+  const [clock,      setClock]      = useState("");
+  const [tab,        setTab]        = useState("signals");
+  const esRef = useRef(null);
+
+  useEffect(()=>{
+    const t=()=>setClock(new Date().toLocaleTimeString("en-US",{hour12:false,timeZone:"America/New_York"})+" ET");
+    t(); const id=setInterval(t,1000); return()=>clearInterval(id);
+  },[]);
+
+  const connect = useCallback(()=>{
+    if(esRef.current) esRef.current.close();
+    const es = new EventSource(SERVER+"/events");
+    esRef.current = es;
+    es.onmessage = e => {
+      try {
+        const ev = JSON.parse(e.data);
+        setSseOk(true);
+        switch(ev.type) {
+          case "init":
+            if(ev.signals)    setSignals(ev.signals);
+            if(ev.gex)        setGex(ev.gex);
+            if(ev.riskBudget) setRiskBudget(ev.riskBudget);
+            setSessionPnL(parseFloat(ev.sessionPnL)||0);
+            setDailyLoss(parseFloat(ev.dailyLoss)||0);
+            break;
+          case "alpaca_status": setAlpacaOk(ev.connected); break;
+          case "gex_update":    setGex(ev); break;
+          case "new_signal":    setSignals(p=>[ev.signal,...p]); break;
+          case "signal_update":
+            setSignals(p=>p.map(s=>s.id===ev.id?{...s,...ev}:s));
+            if(ev.pnl!=null){
+              setSessionPnL(p=>p+ev.pnl);
+              if(ev.pnl<0) setDailyLoss(p=>p+Math.abs(ev.pnl));
+            }
+            break;
+          case "log": setLogs(p=>[...p.slice(-299),ev]); break;
+        }
+      } catch(_){}
+    };
+    es.onerror = ()=>{ es.close(); setTimeout(connect,3000); };
+  },[]);
+
+  useEffect(()=>{ connect(); return()=>{ if(esRef.current) esRef.current.close(); }; },[connect]);
+
+  const pending = signals.filter(s=>s.status==="PENDING").length;
+  const active  = signals.filter(s=>["SENT","FILLED","TP1_HIT","EXECUTING"].includes(s.status)).length;
+  const closed  = signals.filter(s=>["STOPPED","EOD_CLOSED","CANCELLED"].includes(s.status)).length;
+  const wins    = signals.filter(s=>(s.closePnl||0)>0).length;
+  const losses  = signals.filter(s=>(s.closePnl||0)<0).length;
+  const pnlColor = sessionPnL>=0?T.bull:T.bear;
+
+  const forceClose = async()=>{ await fetch(SERVER+"/closeall",{method:"POST"}); };
+
+  return (
+    <div style={{minHeight:"100vh",background:T.bg}}>
+
+      {/* Top bar */}
+      <div style={{background:T.panel,borderBottom:"1px solid "+T.border,
+        padding:"9px 18px",position:"sticky",top:0,zIndex:100,
+        display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+        <div style={{display:"flex",alignItems:"center",gap:14}}>
+          <div>
+            <div style={{fontSize:16,fontWeight:700,color:T.text,letterSpacing:0.5,fontFamily:"sans-serif"}}>
+              <span style={{color:T.bull}}>SPX</span> COMMAND
+            </div>
+            <div style={{color:T.dim,fontSize:9,fontFamily:"monospace",letterSpacing:1.5}}>
+              SPY 0DTE · ALPACA PAPER · v7
+            </div>
+          </div>
+          <div style={{display:"flex",background:T.bg,border:"1px solid "+T.border,
+            borderRadius:6,overflow:"hidden"}}>
+            {[["signals","SIGNALS"],["gex","GEX LEVELS"]].map(([k,l])=>(
+              <button key={k} onClick={()=>setTab(k)} style={{
+                padding:"5px 13px",fontSize:10,
+                background:tab===k?T.dim:"transparent",
+                color:tab===k?T.text:T.muted,
+                border:"none",cursor:"pointer",fontFamily:"monospace"}}>
+                {l}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          <div style={{display:"flex",gap:5}}>
+            {pending>0 && <Tag label={pending+" PENDING"} color={T.yellow} />}
+            {active>0  && <Tag label={active+" ACTIVE"}   color={T.bull}   />}
+            {closed>0  && <Tag label={closed+" CLOSED"}   color={T.muted}  />}
+          </div>
+          <div style={{display:"flex",alignItems:"center",gap:7,
+            background:alpacaOk?T.bull+"0f":T.bear+"0f",
+            border:"1px solid "+(alpacaOk?T.bull:T.bear)+"25",
+            borderRadius:6,padding:"5px 11px"}}>
+            <Pip on={sseOk} color={alpacaOk?T.bull:T.yellow} />
+            <span style={{color:alpacaOk?T.bull:T.yellow,fontSize:9,fontFamily:"monospace"}}>
+              {!sseOk?"CONNECTING...":alpacaOk?"ALPACA PAPER · LIVE":"SERVER CONNECTED"}
+            </span>
+          </div>
+          {active>0 && (
+            <button onClick={forceClose} style={{background:T.bear+"0f",
+              border:"1px solid "+T.bear+"30",borderRadius:6,color:T.bear,
+              padding:"5px 11px",fontSize:9,fontFamily:"monospace",cursor:"pointer"}}>
+              CLOSE ALL
+            </button>
+          )}
+          <span style={{color:T.dim,fontSize:11,fontFamily:"monospace"}}>{clock}</span>
+        </div>
+      </div>
+
+      <div style={{padding:"13px 18px",maxWidth:1100,margin:"0 auto"}}>
+
+        {/* P&L bar */}
+        <div style={{display:"grid",gridTemplateColumns:"repeat(6,1fr)",
+          background:T.panel,border:"1px solid "+T.border,
+          borderRadius:10,overflow:"hidden",marginBottom:13}}>
+          {[
+            {k:"SESSION P&L", v:(sessionPnL>=0?"+":"")+"$"+Math.abs(sessionPnL).toFixed(0), c:pnlColor},
+            {k:"DAILY LOSS",  v:"$"+dailyLoss.toFixed(0),   c:dailyLoss>0?T.bear:T.dim},
+            {k:"LOSS LIMIT",  v:"$6,000 (6%)",               c:T.muted},
+            {k:"RISK/TRADE",  v:"$"+riskBudget,              c:T.yellow},
+            {k:"WIN RATE",    v:wins+losses>0?Math.round(wins/(wins+losses)*100)+"%":"—", c:T.blue},
+            {k:"TRADES",      v:wins+losses>0?wins+"W/"+losses+"L":"—", c:T.muted},
+          ].map(({k,v,c},i)=>(
+            <div key={k} style={{padding:"10px 13px",borderRight:i<5?"1px solid "+T.border:"none"}}>
+              <div style={{color:T.dim,fontSize:8,fontFamily:"monospace",letterSpacing:1.2,marginBottom:4}}>{k}</div>
+              <div style={{color:c,fontSize:13,fontFamily:"monospace",fontWeight:700}}>{v}</div>
+            </div>
+          ))}
+        </div>
+
+        {/* Two column layout */}
+        <div style={{display:"grid",gridTemplateColumns:"1fr 340px",gap:13}}>
+
+          {/* Left */}
+          <div>
+            {tab==="signals" ? (
+              <>
+                <div style={{display:"flex",justifyContent:"space-between",
+                  alignItems:"center",marginBottom:9}}>
+                  <span style={{color:T.muted,fontSize:9,fontFamily:"monospace",letterSpacing:2}}>
+                    LIVE SIGNALS
+                  </span>
+                  <span style={{color:T.dim,fontSize:9,fontFamily:"monospace"}}>
+                    {signals.length} total · auto-close 3:45 PM ET
+                  </span>
+                </div>
+                {signals.length===0 ? (
+                  <div style={{textAlign:"center",padding:"44px 20px",
+                    border:"1px dashed "+T.border,borderRadius:10,
+                    color:T.dim,fontFamily:"monospace",fontSize:11}}>
+                    Waiting for TradingView ORB breakout signal...
+                  </div>
+                ) : (
+                  <div style={{display:"flex",flexDirection:"column",gap:9}}>
+                    {signals.map(s=>(
+                      <SignalCard key={s.id} signal={s} onCancel={async(id)=>{
+                        await fetch(SERVER+"/cancel/"+id,{method:"POST"});
+                      }} />
+                    ))}
+                  </div>
+                )}
+              </>
+            ) : (
+              <>
+                <div style={{marginBottom:9,display:"flex",
+                  justifyContent:"space-between",alignItems:"center"}}>
+                  <span style={{color:T.muted,fontSize:9,fontFamily:"monospace",letterSpacing:2}}>
+                    GEX LEVELS
+                  </span>
+                  <span style={{color:T.dim,fontSize:9,fontFamily:"monospace"}}>
+                    Compare → TradeEcho / Unusual Whales
+                  </span>
+                </div>
+                <GEXPanel gex={gex} />
+              </>
+            )}
+          </div>
+
+          {/* Right sidebar */}
+          <div style={{display:"flex",flexDirection:"column",gap:12}}>
+
+            {/* GEX summary */}
+            <div style={{background:T.panel,border:"1px solid "+T.border,
+              borderRadius:10,padding:"12px 15px"}}>
+              <div style={{color:T.muted,fontSize:9,fontFamily:"monospace",
+                letterSpacing:2,marginBottom:10}}>GEX SUMMARY</div>
+              {!gex ? (
+                <div style={{color:T.dim,fontSize:10,fontFamily:"monospace",
+                  textAlign:"center",padding:"10px 0"}}>
+                  Calculates 9:25 AM ET
+                </div>
+              ) : (
+                <>
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:7,marginBottom:10}}>
+                    {[
+                      {k:"REGIME",  v:(gex.regime||"").toUpperCase(), c:gex.regime==="positive"?T.bull:T.bear},
+                      {k:"FLIP",    v:"$"+(gex.gammaFlip||0),         c:T.yellow},
+                      {k:"NET GEX", v:fmtGex(gex.netGex),             c:gex.netGex>=0?T.bull:T.bear},
+                      {k:"SPY",     v:"$"+(gex.spotPrice||0).toFixed(2), c:T.text},
+                    ].map(({k,v,c})=>(
+                      <div key={k} style={{background:T.bg,borderRadius:5,
+                        padding:"7px 9px",border:"1px solid "+T.border}}>
+                        <div style={{color:T.dim,fontSize:8,fontFamily:"monospace",letterSpacing:1,marginBottom:3}}>{k}</div>
+                        <div style={{color:c,fontSize:12,fontFamily:"monospace",fontWeight:700}}>{v}</div>
+                      </div>
+                    ))}
+                  </div>
+                  {[{label:"CALL WALLS",walls:gex.callWalls,color:T.bull},{label:"PUT WALLS",walls:gex.putWalls,color:T.bear}].map(({label,walls,color})=>(
+                    <div key={label} style={{marginBottom:10}}>
+                      <div style={{color:T.muted,fontSize:8,fontFamily:"monospace",letterSpacing:1,marginBottom:5}}>{label}</div>
+                      {(walls||[]).slice(0,3).map((w,i)=>(
+                        <div key={i} style={{display:"flex",alignItems:"center",gap:6,marginBottom:4}}>
+                          <span style={{color:i===0?color:T.muted,fontSize:11,
+                            fontFamily:"monospace",fontWeight:i===0?700:400,width:40}}>${w.price}</span>
+                          <div style={{flex:1,height:3,background:T.dim,borderRadius:1,overflow:"hidden"}}>
+                            <div style={{width:(i===0?100:i===1?65:40)+"%",height:"100%",
+                              background:color+(i===0?"":"66")}} />
+                          </div>
+                          <span style={{color:T.muted,fontSize:9,fontFamily:"monospace",width:40}}>
+                            ${(w.gex/1e6).toFixed(0)}M
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  ))}
+                </>
+              )}
+            </div>
+
+            {/* Config */}
+            <div style={{background:T.panel,border:"1px solid "+T.border,
+              borderRadius:10,padding:"12px 15px"}}>
+              <div style={{color:T.muted,fontSize:9,fontFamily:"monospace",
+                letterSpacing:2,marginBottom:10}}>CONFIG</div>
+              {[
+                ["Risk/trade",  "$"+riskBudget+" fixed"],
+                ["Stop",        "50% of premium"],
+                ["TP1",         "2× premium"],
+                ["Trail",       "Breakeven after TP1"],
+                ["Force close", "3:45 PM ET"],
+                ["GEX refresh", "9:25·10:30·12:00·14:00"],
+              ].map(([k,v])=>(
+                <div key={k} style={{display:"flex",justifyContent:"space-between",marginBottom:5}}>
+                  <span style={{color:T.dim,fontSize:9,fontFamily:"monospace"}}>{k}</span>
+                  <span style={{color:T.muted,fontSize:9,fontFamily:"monospace"}}>{v}</span>
+                </div>
+              ))}
+            </div>
+
+            {/* Log */}
+            <LogFeed logs={logs} />
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
