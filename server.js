@@ -127,10 +127,142 @@ async function alpacaDelete(path) {
   return res.status;
 }
 
-// ── Price helpers ─────────────────────────────────────────────────────────────
-// TradingView chart is on SPY — prices arrive directly in SPY range (~$590)
+// ── GEX-Based Strike Selection ───────────────────────────────────────────────
+/**
+ * Select optimal SPY strike based on GEX levels, regime, and R:R targets.
+ *
+ * LOGIC:
+ *   POSITIVE GEX regime (range-bound, price magnetic to walls):
+ *     → Place strike 30-40% of distance between entry and nearest wall
+ *     → Slightly OTM = cheaper premium = better R:R
+ *     → Example: entry $592, call wall $595 → 30% of $3 = $0.90 → strike $593
+ *
+ *   NEGATIVE GEX regime (trending, price can overshoot walls):
+ *     → Stay closer to ATM (1-2 strikes OTM max)
+ *     → Higher delta follows trend better
+ *     → Example: entry $592, direction LONG → strike $593
+ *
+ *   No GEX available:
+ *     → Fall back to ATM (round to nearest $1)
+ *
+ *   Safety caps:
+ *     → Never buy strike AT or BEYOND wall (no room to run)
+ *     → Max 5 strikes OTM from ATM (beyond that gamma too low for 0DTE)
+ *     → Min 1 strike OTM from ATM (pure ATM has widest spreads)
+ *
+ * @param {number} spyEntry  - Current SPY price from TradingView
+ * @param {string} direction - "LONG" or "SHORT"
+ * @param {object} gex       - Current GEX cache (may be null)
+ * @returns {object} { strike, strikeReason, otmDistance, estimatedDelta }
+ */
+function selectOptimalStrike(spyEntry, direction, gex) {
+  const atm         = Math.round(spyEntry);
+  const MAX_OTM     = 5;   // never go more than 5 strikes OTM
+  const MIN_OTM     = 1;   // always at least 1 strike OTM for better R:R
+  const WALL_BUFFER = 1;   // never buy a strike within $1 of wall
+
+  // ── No GEX available — use ATM ──────────────────────────────────────────
+  if (!gex || (!gex.callWalls.length && !gex.putWalls.length)) {
+    return {
+      strike:         atm,
+      strikeReason:   "ATM fallback (no GEX data)",
+      otmDistance:    0,
+      estimatedDelta: 0.50,
+    };
+  }
+
+  const regime = gex.regime || "positive";
+
+  if (direction === "LONG") {
+    // Find nearest call wall ABOVE entry
+    const wallsAbove = gex.callWalls
+      .filter(w => w.price > spyEntry + WALL_BUFFER)
+      .sort((a, b) => a.price - b.price);
+
+    const nearestWall = wallsAbove[0];
+
+    if (!nearestWall) {
+      // No call wall above — use slight OTM
+      const strike = Math.min(atm + MIN_OTM, atm + MAX_OTM);
+      return {
+        strike,
+        strikeReason:   "Slight OTM (no call wall above)",
+        otmDistance:    strike - atm,
+        estimatedDelta: 0.45,
+      };
+    }
+
+    const distToWall = nearestWall.price - spyEntry;
+
+    // Positive regime: 30% of distance to wall = sweet spot
+    // Negative regime: 15% of distance (stay closer to ATM)
+    const otmFraction = regime === "positive" ? 0.30 : 0.15;
+    const rawOTM      = distToWall * otmFraction;
+
+    // Clamp between MIN_OTM and MAX_OTM
+    const otmStrikes  = Math.min(MAX_OTM, Math.max(MIN_OTM, Math.round(rawOTM)));
+    const strike      = atm + otmStrikes;
+
+    // Safety: never buy AT or BEYOND the wall
+    const safestrike  = Math.min(strike, nearestWall.price - WALL_BUFFER);
+
+    const estDelta    = Math.max(0.15, 0.50 - otmStrikes * 0.08); // rough delta estimate
+
+    return {
+      strike:         Math.round(safestrike),
+      strikeReason:   regime + " GEX → $" + otmStrikes + " OTM toward call wall $" + nearestWall.price,
+      otmDistance:    otmStrikes,
+      estimatedDelta: parseFloat(estDelta.toFixed(2)),
+    };
+  }
+
+  if (direction === "SHORT") {
+    // Find nearest put wall BELOW entry
+    const wallsBelow = gex.putWalls
+      .filter(w => w.price < spyEntry - WALL_BUFFER)
+      .sort((a, b) => b.price - a.price);
+
+    const nearestWall = wallsBelow[0];
+
+    if (!nearestWall) {
+      const strike = Math.max(atm - MIN_OTM, atm - MAX_OTM);
+      return {
+        strike,
+        strikeReason:   "Slight OTM (no put wall below)",
+        otmDistance:    atm - strike,
+        estimatedDelta: 0.45,
+      };
+    }
+
+    const distToWall  = spyEntry - nearestWall.price;
+    const otmFraction = regime === "positive" ? 0.30 : 0.15;
+    const rawOTM      = distToWall * otmFraction;
+    const otmStrikes  = Math.min(MAX_OTM, Math.max(MIN_OTM, Math.round(rawOTM)));
+    const strike      = atm - otmStrikes;
+
+    // Safety: never buy AT or BEYOND the wall
+    const safestrike  = Math.max(strike, nearestWall.price + WALL_BUFFER);
+
+    const estDelta    = Math.max(0.15, 0.50 - otmStrikes * 0.08);
+
+    return {
+      strike:         Math.round(safestrike),
+      strikeReason:   regime + " GEX → $" + otmStrikes + " OTM toward put wall $" + nearestWall.price,
+      otmDistance:    otmStrikes,
+      estimatedDelta: parseFloat(estDelta.toFixed(2)),
+    };
+  }
+
+  // Fallback
+  return { strike: atm, strikeReason: "ATM fallback", otmDistance: 0, estimatedDelta: 0.50 };
+}
+
+/**
+ * Simple ATM fallback — used when GEX not available.
+ * Kept for compatibility.
+ */
 function nearestSPYStrike(spyPrice) {
-  return Math.round(spyPrice); // SPY strikes at $1 intervals
+  return Math.round(spyPrice);
 }
 
 // ── GEX self-calculation ──────────────────────────────────────────────────────
@@ -399,36 +531,84 @@ async function getOptionMidPrice(symbol) {
 // ── Place long option order ───────────────────────────────────────────────────
 async function placeLongOption(signal) {
   const expiryDate = get0DTEDate();
-  const symbol     = buildSPYSymbol(signal.strike, signal.right, expiryDate);
 
-  log("ALPACA", "Fetching price for: " + symbol);
+  // ── Step 1: GEX-optimized strike selection ──────────────────────────────
+  const strikeInfo = selectOptimalStrike(signal.spyEntry, signal.direction, gexCache);
+  let   strike     = strikeInfo.strike;
 
-  // Get live mid price
-  const midPrice = await getOptionMidPrice(symbol);
-  if (!midPrice) throw new Error("Could not get option price for " + symbol + " — market may be closed");
+  log("STRIKE", signal.direction + " SPY" +
+    " | ATM $" + Math.round(signal.spyEntry) +
+    " | Selected $" + strike +
+    " (" + strikeInfo.otmDistance + " OTM)" +
+    " | est delta " + strikeInfo.estimatedDelta +
+    " | " + strikeInfo.strikeReason);
 
-  // Calculate contracts based on risk budget
+  // Update signal with selected strike info
+  signal.strike         = strike;
+  signal.strikeReason   = strikeInfo.strikeReason;
+  signal.otmDistance    = strikeInfo.otmDistance;
+  signal.estimatedDelta = strikeInfo.estimatedDelta;
+
+  // ── Step 2: Verify price exists — try selected strike first ────────────
+  const symbol    = buildSPYSymbol(strike, signal.right, expiryDate);
+  let   midPrice  = await getOptionMidPrice(symbol);
+
+  // If selected strike has no market data (can happen near open),
+  // fall back to ATM strike
+  if (!midPrice) {
+    const atmStrike  = Math.round(signal.spyEntry);
+    log("STRIKE", "No price for $" + strike + " — falling back to ATM $" + atmStrike);
+    strike           = atmStrike;
+    signal.strike    = strike;
+    signal.strikeReason = "ATM fallback (no price for OTM strike)";
+    const atmSymbol  = buildSPYSymbol(strike, signal.right, expiryDate);
+    midPrice         = await getOptionMidPrice(atmSymbol);
+    if (!midPrice) throw new Error("No option price available — market may be closed");
+  }
+
+  // ── Step 3: Calculate contracts from risk budget ────────────────────────
   const contracts = calcContracts(midPrice);
   const totalCost = parseFloat((midPrice * 100 * contracts).toFixed(2));
 
-  log("ALPACA", "Mid price: $" + midPrice +
-    " | Risk budget: $" + getRiskBudget().toFixed(0) +
-    " | Contracts: " + contracts +
-    " | Total cost: $" + totalCost);
+  // ── Step 4: Calculate expected R:R based on GEX target ─────────────────
+  const gexTarget   = signal.gexTarget;
+  const distToTarget = gexTarget ? Math.abs(gexTarget - signal.spyEntry) : null;
+  const estPnlIfHit  = gexTarget
+    ? parseFloat(((distToTarget / midPrice) * midPrice * contracts * 100).toFixed(0))
+    : null;
 
-  // Place limit order at mid price
+  log("STRIKE", "Final: $" + strike + " " + signal.right +
+    " | mid $" + midPrice +
+    " | contracts " + contracts +
+    " | total cost $" + totalCost +
+    (gexTarget ? " | GEX target $" + gexTarget + " (" + (distToTarget?.toFixed(2)) + " pts away)" : "")
+  );
+
+  // ── Step 5: Place limit order at mid price ──────────────────────────────
+  const optionSymbol = buildSPYSymbol(strike, signal.right, expiryDate);
   const order = await alpacaPost("/v2/orders", {
-    symbol:           symbol,
-    qty:              String(contracts),
-    side:             "buy",
-    type:             "limit",
-    limit_price:      String(midPrice),
-    time_in_force:    "day",
-    client_order_id:  "spxcmd_" + signal.id,
+    symbol:          optionSymbol,
+    qty:             String(contracts),
+    side:            "buy",
+    type:            "limit",
+    limit_price:     String(midPrice),
+    time_in_force:   "day",
+    client_order_id: "spxcmd_" + signal.id,
   });
 
-  log("ALPACA", "Order placed: " + order.id + " | " + symbol + " x" + contracts + " @ $" + midPrice);
-  return { symbol, orderId: order.id, midPrice, contracts, totalCost };
+  log("ALPACA", "Order placed: " + order.id +
+    " | " + optionSymbol +
+    " x" + contracts +
+    " @ $" + midPrice +
+    " | total $" + totalCost);
+
+  return {
+    symbol: optionSymbol, orderId: order.id,
+    midPrice, contracts, totalCost,
+    strike, strikeReason: strikeInfo.strikeReason,
+    estimatedDelta: strikeInfo.estimatedDelta,
+    otmDistance: strikeInfo.otmDistance,
+  };
 }
 
 // ── Place exit orders ─────────────────────────────────────────────────────────
@@ -572,9 +752,16 @@ async function executeSignal(id) {
     signal.status        = "SENT";
 
     broadcast({ type: "signal_update", id, status: "SENT",
-      optionSymbol: result.symbol, orderId: result.orderId,
-      midPrice: result.midPrice, contracts: result.contracts,
-      totalCost: result.totalCost });
+      optionSymbol:   result.symbol,
+      orderId:        result.orderId,
+      midPrice:       result.midPrice,
+      contracts:      result.contracts,
+      totalCost:      result.totalCost,
+      strike:         result.strike,
+      strikeReason:   result.strikeReason,
+      otmDistance:    result.otmDistance,
+      estimatedDelta: result.estimatedDelta,
+    });
 
     // Poll for fill then attach exits
     pollOrderFill(result.orderId, 60000).then(async (filled) => {
@@ -718,7 +905,7 @@ app.post("/webhook", async (req, res) => {
     time:        new Date().toLocaleTimeString("en-US", { hour12: false, timeZone: "America/New_York" }),
     symbol:      "SPY",
     direction,   right,
-    strike,
+    strike,      // updated by selectOptimalStrike inside placeLongOption
     spyEntry,
     stop:        spyStop,
     tp1:         gexResult.tp1,
@@ -741,6 +928,9 @@ app.post("/webhook", async (req, res) => {
     tp1OrderId:   null,
     stopPrice:    null,
     tp1Price:     null,
+    strikeReason:       null,   // filled by selectOptimalStrike
+    otmDistance:        0,
+    estimatedDelta:     null,
     trailedToBreakeven: false,
     gexSnapshot: gexCache ? {
       callWalls: gexCache.callWalls.slice(0,3),
