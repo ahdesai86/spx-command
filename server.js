@@ -613,10 +613,29 @@ async function executeSignal(id) {
 
 // ── Express app ───────────────────────────────────────────────────────────────
 const app = express();
-// Open CORS — allows dashboard on any domain to connect
-app.use(cors({ origin: "*", methods: ["GET","POST","DELETE","OPTIONS"], allowedHeaders: ["Content-Type"] }));
+// CORS — open for all origins
+const corsConfig = {
+  origin: "*",
+  methods: ["GET","POST","DELETE","OPTIONS"],
+  allowedHeaders: ["Content-Type","Accept","Authorization"],
+  exposedHeaders: ["Content-Type"],
+  credentials: false,
+};
+app.use(cors(corsConfig));
+app.options("*", cors(corsConfig));
 app.use(express.json());
-app.options("*", cors());
+
+// Serve dashboard at /dashboard — same origin, no CORS issues
+const path = require("path");
+const fs   = require("fs");
+app.get("/dashboard", (req, res) => {
+  const file = path.join(__dirname, "dashboard.html");
+  if (fs.existsSync(file)) {
+    res.sendFile(file);
+  } else {
+    res.status(404).send("Dashboard not found — upload dashboard.html to the same folder as server.js");
+  }
+});
 
 app.get("/", (req, res) => res.json({
   service: "SPX COMMAND", status: "running",
