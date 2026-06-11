@@ -275,6 +275,22 @@ function SignalCard({signal,onCancel}) {
         ))}
       </div>
 
+      {/* Strike selection info */}
+      {signal.strikeReason && (
+        <div style={{padding:"5px 9px",marginBottom:6,
+          background:T.purple+"08",borderRadius:4,
+          border:"1px solid "+T.purple+"20"}}>
+          <span style={{color:T.purple,fontSize:9,fontFamily:"monospace",fontWeight:700}}>STRIKE </span>
+          <span style={{color:T.textDim,fontSize:10,fontFamily:"monospace"}}>{signal.strikeReason}</span>
+          {signal.estimatedDelta && (
+            <span style={{color:T.muted,fontSize:9,fontFamily:"monospace",marginLeft:8}}>
+              · est delta {signal.estimatedDelta}
+              {signal.otmDistance > 0 ? " · "+signal.otmDistance+" OTM" : " · ATM"}
+            </span>
+          )}
+        </div>
+      )}
+
       {/* GEX reason */}
       {signal.gexReason && (
         <div style={{padding:"5px 9px",marginBottom:8,background:T.dim+"44",
