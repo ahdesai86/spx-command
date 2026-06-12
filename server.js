@@ -30,6 +30,8 @@
 require("dotenv").config();
 const express = require("express");
 const cors    = require("cors");
+const fs      = require("fs");
+const path    = require("path");
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const ALPACA_KEY       = process.env.ALPACA_KEY       || "";
@@ -40,7 +42,15 @@ const ACCOUNT_SIZE     = parseFloat(process.env.ACCOUNT_SIZE     || "100000");
 const RISK_PER_TRADE   = parseFloat(process.env.RISK_PER_TRADE   || "0.02");
 const RISK_DOLLARS     = parseFloat(process.env.RISK_DOLLARS     || "0");    // 0 = use % instead
 const MAX_DAILY_LOSS   = parseFloat(process.env.MAX_DAILY_LOSS   || "0.06");
-const PREMIUM_STOP_PCT = parseFloat(process.env.PREMIUM_STOP_PCT || "0.50");
+const PREMIUM_STOP_PCT = parseFloat(process.env.PREMIUM_STOP_PCT || "0.25");
+
+// TP1 flexible config — set ONE in Railway env vars:
+//   TP1_MULTIPLIER = % gain multiplier (e.g. 3.0 = 3x entry price)
+//   TP1_FIXED_MOVE = fixed $ move in underlying (e.g. 2.5 = $2.50 move on SPY)
+// Priority: TP1_FIXED_MOVE > TP1_MULTIPLIER
+const TP1_MULTIPLIER   = parseFloat(process.env.TP1_MULTIPLIER   || "3.0");   // 3x entry premium
+const TP1_FIXED_MOVE   = parseFloat(process.env.TP1_FIXED_MOVE   || "0");     // 0 = use multiplier
+
 const GEX_BUFFER       = parseFloat(process.env.GEX_BUFFER       || "1.0");
 const PORT             = parseInt(process.env.PORT               || "3001");
 const IS_PAPER         = ALPACA_BASE.includes("paper");
@@ -80,6 +90,103 @@ let sessionPnL       = 0;
 let dailyLoss        = 0;
 let signalHistory    = [];
 let sseClients       = [];
+
+// ── Trade Journal ─────────────────────────────────────────────────────────────
+// Persistent record of all trades — survives server restarts
+const JOURNAL_FILE  = path.join(__dirname, "trade_journal.json");
+
+function loadJournal() {
+  try {
+    if (fs.existsSync(JOURNAL_FILE)) {
+      const data = JSON.parse(fs.readFileSync(JOURNAL_FILE, "utf8"));
+      log("JOURNAL", "Loaded " + data.trades.length + " historical trades");
+      return data;
+    }
+  } catch (e) { log("JOURNAL ERR", "Load failed: " + e.message); }
+  return { trades: [], stats: { totalTrades: 0, wins: 0, losses: 0, totalPnL: 0 } };
+}
+
+function saveJournal(journal) {
+  try {
+    fs.writeFileSync(JOURNAL_FILE, JSON.stringify(journal, null, 2));
+  } catch (e) { log("JOURNAL ERR", "Save failed: " + e.message); }
+}
+
+function addTradeToJournal(signal, closeReason) {
+  const journal   = loadJournal();
+  const pnl       = signal.closePnl || 0;
+  const isWin     = pnl > 0;
+
+  const trade = {
+    // Identity
+    id:             signal.id,
+    bot:            "SPX-COMMAND-v7",
+    date:           new Date().toLocaleDateString("en-US", { timeZone: "America/New_York" }),
+    time:           signal.time,
+    // Instrument
+    symbol:         signal.optionSymbol || "SPY",
+    direction:      signal.direction,
+    right:          signal.right,
+    strike:         signal.strike,
+    expiry:         signal.expiry,
+    contracts:      signal.contracts,
+    // Entry
+    spyEntry:       signal.spyEntry,
+    fillPrice:      signal.fillPrice,
+    totalCost:      signal.totalCost,
+    estimatedDelta: signal.estimatedDelta,
+    strikeReason:   signal.strikeReason,
+    // Exit
+    closeReason,
+    closePnl:       parseFloat(pnl.toFixed(2)),
+    pnlPct:         signal.fillPrice
+      ? parseFloat(((pnl / signal.totalCost) * 100).toFixed(1))
+      : null,
+    stopPrice:      signal.stopPrice,
+    tp1Price:       signal.tp1Price,
+    trailedToBreakeven: signal.trailedToBreakeven,
+    // GEX context
+    gexRegime:      signal.gexSnapshot?.regime || null,
+    gexTarget:      signal.gexTarget || null,
+    gexReason:      signal.gexReason || null,
+    // Config at time of trade
+    riskBudget:     getRiskBudget(),
+    tp1Mode:        TP1_FIXED_MOVE > 0 ? "fixed-$" + TP1_FIXED_MOVE : TP1_MULTIPLIER + "x",
+    stopPct:        PREMIUM_STOP_PCT,
+    // Signal
+    trigger:        signal.trigger,
+    confidence:     signal.confidence,
+    // Result
+    outcome:        isWin ? "WIN" : pnl === 0 ? "BREAKEVEN" : "LOSS",
+  };
+
+  journal.trades.unshift(trade);  // newest first
+  journal.stats.totalTrades++;
+  if (isWin)  journal.stats.wins++;
+  if (pnl < 0) journal.stats.losses++;
+  journal.stats.totalPnL = parseFloat((journal.stats.totalPnL + pnl).toFixed(2));
+  journal.stats.winRate  = parseFloat(((journal.stats.wins / journal.stats.totalTrades) * 100).toFixed(1));
+  journal.stats.avgWin   = journal.trades.filter(t => t.closePnl > 0).length > 0
+    ? parseFloat((journal.trades.filter(t => t.closePnl > 0).reduce((a, t) => a + t.closePnl, 0) /
+        journal.trades.filter(t => t.closePnl > 0).length).toFixed(2))
+    : 0;
+  journal.stats.avgLoss  = journal.trades.filter(t => t.closePnl < 0).length > 0
+    ? parseFloat((journal.trades.filter(t => t.closePnl < 0).reduce((a, t) => a + t.closePnl, 0) /
+        journal.trades.filter(t => t.closePnl < 0).length).toFixed(2))
+    : 0;
+
+  saveJournal(journal);
+  log("JOURNAL", trade.outcome + " | " + trade.symbol +
+    " | P&L $" + trade.closePnl +
+    " (" + (trade.pnlPct || 0) + "%)" +
+    " | " + closeReason +
+    " | Total trades: " + journal.stats.totalTrades +
+    " | Win rate: " + journal.stats.winRate + "%");
+  broadcast({ type: "journal_update", trade, stats: journal.stats });
+  return trade;
+}
+
+let journal = loadJournal();
 let gexCache         = null;
 let gexCacheTime     = 0;
 let gexScheduleFired = new Set();
@@ -284,9 +391,9 @@ async function fetchSPYChain(expiryStr) {
 
     do {
       let url = ALPACA_DATA +
-        "/v1beta1/options/contracts?underlying_symbols=SPY" +
+        "/v1beta1/options/snapshots?underlying_symbols=SPY" +
         "&expiration_date=" + expiryStr +
-        "&status=active&limit=250";
+        "&feed=indicative&limit=1000";
       if (nextToken) url += "&page_token=" + nextToken;
 
       const res = await fetch(url, { headers: alpacaHeaders() });
@@ -295,8 +402,18 @@ async function fetchSPYChain(expiryStr) {
         break;
       }
 
-      const data = await res.json();
-      const contracts = data.option_contracts || [];
+      const data      = await res.json();
+      // snapshots endpoint returns { snapshots: { symbol: {...} } }
+      // Convert to array of contract objects with symbol + greeks
+      const snaps     = data.snapshots || {};
+      const contracts = Object.entries(snaps).map(([sym, snap]) => ({
+        symbol:        sym,
+        strike_price:  snap.greeks ? parseFloat(sym.slice(13, 21)) / 1000 : 0,
+        type:          sym[12] === "C" ? "CALL" : "PUT",
+        open_interest: snap.openInterest || 0,
+        greeks:        snap.greeks || {},
+        snap,
+      })).filter(c => c.strike_price > 0);
       allContracts = allContracts.concat(contracts);
       nextToken    = data.next_page_token || null;
 
@@ -612,15 +729,40 @@ async function placeLongOption(signal) {
 }
 
 // ── Place exit orders ─────────────────────────────────────────────────────────
+/**
+ * Calculate TP1 price based on config:
+ *   TP1_FIXED_MOVE > 0: TP1 = entryPrice + (TP1_FIXED_MOVE / delta) — fixed underlying move
+ *   TP1_MULTIPLIER:     TP1 = entryPrice × multiplier — % gain on premium
+ */
+function calcTP1Price(entryPrice, estimatedDelta) {
+  if (TP1_FIXED_MOVE > 0) {
+    // Fixed underlying move → option price change = underlying move × delta
+    const delta       = estimatedDelta || 0.35;
+    const optionMove  = TP1_FIXED_MOVE * delta;
+    const tp1         = parseFloat((entryPrice + optionMove).toFixed(2));
+    log("TP1", "Fixed move mode: $" + TP1_FIXED_MOVE + " underlying × delta " + delta +
+      " = $" + optionMove.toFixed(2) + " option move → TP1 $" + tp1);
+    return tp1;
+  }
+  // Multiplier mode
+  const tp1 = parseFloat((entryPrice * TP1_MULTIPLIER).toFixed(2));
+  log("TP1", "Multiplier mode: $" + entryPrice + " × " + TP1_MULTIPLIER + "x → TP1 $" + tp1);
+  return tp1;
+}
+
 async function placeExitOrders(signal) {
   const entryPrice = signal.fillPrice || signal.midPrice;
   const stopPrice  = parseFloat((entryPrice * (1 - PREMIUM_STOP_PCT)).toFixed(2));
-  const tp1Price   = parseFloat((entryPrice * 3.0).toFixed(2));  // 3x = 8:1 R:R with 25% stop
+  const tp1Price   = calcTP1Price(entryPrice, signal.estimatedDelta);
   const contracts  = signal.contracts;
+  const tp1Mode    = TP1_FIXED_MOVE > 0
+    ? "fixed $" + TP1_FIXED_MOVE + " underlying move"
+    : TP1_MULTIPLIER + "x multiplier";
 
   log("EXIT", "Placing exits — entry: $" + entryPrice +
-    " | stop: $" + stopPrice +
-    " | tp1: $" + tp1Price);
+    " | stop: $" + stopPrice + " (" + (PREMIUM_STOP_PCT*100) + "%)" +
+    " | tp1: $" + tp1Price + " (" + tp1Mode + ")" +
+    " | R:R: " + ((tp1Price - entryPrice) / (entryPrice - stopPrice)).toFixed(1) + ":1");
 
   // Stop loss order
   const stopOrder = await alpacaPost("/v2/orders", {
@@ -630,6 +772,7 @@ async function placeExitOrders(signal) {
     type:            "stop",
     stop_price:      String(stopPrice),
     time_in_force:   "day",
+    position_intent: "close",
     client_order_id: "spxcmd_stop_" + signal.id,
   });
 
@@ -641,6 +784,7 @@ async function placeExitOrders(signal) {
     type:            "limit",
     limit_price:     String(tp1Price),
     time_in_force:   "day",
+    position_intent: "close",
     client_order_id: "spxcmd_tp1_" + signal.id,
   });
 
@@ -664,13 +808,14 @@ async function trailStopToBreakeven(signal) {
 
   // Place new stop at breakeven
   const newStop = await alpacaPost("/v2/orders", {
-    symbol:          signal.optionSymbol,
-    qty:             String(signal.contracts),
-    side:            "sell",
-    type:            "stop",
-    stop_price:      String(parseFloat(breakeven.toFixed(2))),
-    time_in_force:   "day",
-    client_order_id: "spxcmd_trail_" + signal.id,
+    symbol:           signal.optionSymbol,
+    qty:              String(signal.contracts),
+    side:             "sell",
+    type:             "stop",
+    stop_price:       String(parseFloat(breakeven.toFixed(2))),
+    time_in_force:    "day",
+    position_intent:  "close",
+    client_order_id:  "spxcmd_trail_" + signal.id,
   });
 
   signal.stopOrderId = newStop.id;
@@ -700,17 +845,19 @@ async function forceCloseAll() {
 
       // Close position at market
       await alpacaPost("/v2/orders", {
-        symbol:          sig.optionSymbol,
-        qty:             String(sig.contracts),
-        side:            "sell",
-        type:            "market",
-        time_in_force:   "day",
-        client_order_id: "spxcmd_eod_" + sig.id,
+        symbol:           sig.optionSymbol,
+        qty:              String(sig.contracts),
+        side:             "sell",
+        type:             "market",
+        time_in_force:    "day",
+        position_intent:  "close",
+        client_order_id:  "spxcmd_eod_" + sig.id,
       });
 
       sig.status = "EOD_CLOSED";
       broadcast({ type: "signal_update", id: sig.id, status: "EOD_CLOSED" });
       log("EOD", "Closed: " + sig.optionSymbol + " x" + sig.contracts);
+      addTradeToJournal(sig, "EOD_FORCE_CLOSE");
 
     } catch (e) {
       log("EOD ERR", "Failed to close signal #" + sig.id + ": " + e.message);
@@ -813,8 +960,6 @@ app.options("*", cors(corsConfig));
 app.use(express.json());
 
 // Serve dashboard at /dashboard — same origin, no CORS issues
-const path = require("path");
-const fs   = require("fs");
 app.get("/dashboard", (req, res) => {
   const file = path.join(__dirname, "dashboard.html");
   if (fs.existsSync(file)) {
@@ -858,6 +1003,27 @@ app.get("/gex", async (req, res) => {
     return res.json(fresh || { error: "GEX calculation failed — market may be closed" });
   }
   res.json(gexCache || { error: "GEX not yet calculated", hint: "?refresh=true to force fetch" });
+});
+
+// Journal — full trade history
+app.get("/journal", (req, res) => {
+  const j = loadJournal();
+  res.json(j);
+});
+
+// Journal CSV export
+app.get("/journal/csv", (req, res) => {
+  const j = loadJournal();
+  if (!j.trades.length) return res.json({ error: "No trades yet" });
+  const headers = Object.keys(j.trades[0]).join(",");
+  const rows    = j.trades.map(t =>
+    Object.values(t).map(v =>
+      typeof v === "string" && v.includes(",") ? '"' + v + '"' : v
+    ).join(",")
+  ).join("\n");
+  res.setHeader("Content-Type", "text/csv");
+  res.setHeader("Content-Disposition", "attachment; filename=spx_command_trades.csv");
+  res.send(headers + "\n" + rows);
 });
 
 // Webhook
