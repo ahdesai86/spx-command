@@ -1200,7 +1200,7 @@ app.get("/status", (req, res) => res.json({
   mode:           IS_PAPER ? "PAPER" : "LIVE",
   broker:         "Alpaca",
   underlying:     "SPY (long options)",
-  version:        "7.0-long-options",
+  version:        "7.1-journal-tp1",
   riskMode:       RISK_DOLLARS > 0 ? "Fixed $" + RISK_DOLLARS + " per trade" : (RISK_PER_TRADE*100) + "% of account",
   riskBudget:     "$" + getRiskBudget().toFixed(0) + " per trade",
   sessionPnL:     sessionPnL.toFixed(2),
@@ -1216,11 +1216,23 @@ app.get("/status", (req, res) => res.json({
     updatedAt: gexCache.updatedAt,
   } : null,
   signals: {
-    total:   signalHistory.length,
+    today:   signalHistory.length,
     pending: signalHistory.filter(s => s.status === "PENDING").length,
-    active:  signalHistory.filter(s => ["SENT","FILLED","TP1_HIT"].includes(s.status)).length,
-    closed:  signalHistory.filter(s => ["STOPPED","EOD_CLOSED","CANCELLED"].includes(s.status)).length,
-    blocked: signalHistory.filter(s => s.status === "BLOCKED").length,
+    active:  signalHistory.filter(s => ["SENT","FILLED","EXECUTING"].includes(s.status)).length,
+    closed:  signalHistory.filter(s => ["STOPPED","EOD_CLOSED","CANCELLED","TP1_HIT"].includes(s.status)).length,
+  },
+  journal: {
+    totalTrades: journal.stats.totalTrades || 0,
+    wins:        journal.stats.wins        || 0,
+    losses:      journal.stats.losses      || 0,
+    winRate:     journal.stats.winRate     || 0,
+    totalPnL:    journal.stats.totalPnL    || 0,
+    avgWin:      journal.stats.avgWin      || 0,
+    avgLoss:     journal.stats.avgLoss     || 0,
+  },
+  tp1Config: {
+    mode:  TP1_FIXED_MOVE > 0 ? "fixed-move" : "multiplier",
+    value: TP1_FIXED_MOVE > 0 ? "$" + TP1_FIXED_MOVE + " SPY move" : TP1_MULTIPLIER + "x premium",
   },
 }));
 
