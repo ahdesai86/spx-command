@@ -90,6 +90,8 @@ let sessionPnL       = 0;
 let dailyLoss        = 0;
 let signalHistory    = [];
 let sseClients       = [];
+let logHistory       = [];   // server-side log buffer — survives dashboard refresh
+const MAX_LOGS       = 500;  // keep last 500 log entries
 
 // ── Trade Journal ─────────────────────────────────────────────────────────────
 // Persistent record of all trades — survives server restarts
@@ -194,9 +196,13 @@ let gexLastDate      = "";
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 function log(tag, msg) {
-  const t = new Date().toLocaleTimeString("en-US", { hour12: false, timeZone: "America/New_York" });
+  const t   = new Date().toLocaleTimeString("en-US", { hour12: false, timeZone: "America/New_York" });
+  const entry = { type: "log", time: t, tag, msg };
   console.log("[" + t + " ET] [" + tag + "] " + msg);
-  broadcast({ type: "log", time: t, tag, msg });
+  // Store in server-side buffer
+  logHistory.push(entry);
+  if (logHistory.length > MAX_LOGS) logHistory.shift();
+  broadcast(entry);
 }
 
 function broadcast(payload) {
@@ -1022,6 +1028,7 @@ app.get("/events", (req, res) => {
     signals: signalHistory, gex: gexCache,
     expiry: get0DTEExpiry(),
     riskBudget: getRiskBudget(),
+    logs: logHistory,
   }) + "\n\n");
   const ping = setInterval(() => { try { res.write(": ping\n\n"); } catch (_) { clearInterval(ping); } }, 30000);
   req.on("close", () => { clearInterval(ping); sseClients = sseClients.filter(c => c !== res); });
@@ -1267,7 +1274,7 @@ app.get("/status", (req, res) => res.json({
   mode:           IS_PAPER ? "PAPER" : "LIVE",
   broker:         "Alpaca",
   underlying:     "SPY (long options)",
-  version:        "7.3-guards",
+  version:        "7.4-persistent-logs",
   riskMode:       RISK_DOLLARS > 0 ? "Fixed $" + RISK_DOLLARS + " per trade" : (RISK_PER_TRADE*100) + "% of account",
   riskBudget:     "$" + getRiskBudget().toFixed(0) + " per trade",
   sessionPnL:     sessionPnL.toFixed(2),

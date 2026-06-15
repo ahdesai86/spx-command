@@ -335,6 +335,7 @@ function App(){
           if(ev.riskBudget)setRisk(ev.riskBudget);
           setPnl(parseFloat(ev.sessionPnL)||0);
           setLoss(parseFloat(ev.dailyLoss)||0);
+          if(ev.logs && ev.logs.length>0) setLogs(ev.logs); // restore logs on reconnect
         }else if(ev.type==="alpaca_status")setAlpacaOk(ev.connected);
         else if(ev.type==="gex_update")setGex(ev);
         else if(ev.type==="new_signal")setSignals(p=>[ev.signal,...p]);
