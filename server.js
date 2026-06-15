@@ -391,9 +391,9 @@ async function fetchSPYChain(expiryStr) {
 
     do {
       let url = ALPACA_DATA +
-        "/v1beta1/options/snapshots?underlying_symbols=SPY" +
+        "/v1beta1/options/snapshots?symbols=SPY" +
         "&expiration_date=" + expiryStr +
-        "&feed=indicative&limit=1000";
+        "&limit=1000";
       if (nextToken) url += "&page_token=" + nextToken;
 
       const res = await fetch(url, { headers: alpacaHeaders() });
@@ -701,8 +701,44 @@ async function placeLongOption(signal) {
     (gexTarget ? " | GEX target $" + gexTarget + " (" + (distToTarget?.toFixed(2)) + " pts away)" : "")
   );
 
-  // ── Step 5: Place limit order at mid price ──────────────────────────────
+  // ── Step 5: Safety checks before placing order ────────────────────────────
+
   const optionSymbol = buildSPYSymbol(strike, signal.right, expiryDate);
+
+  // GUARD 1: Symbol must match OCC option format — never allow stock order
+  const occPattern = /^SPY\d{6}[CP]\d{8}$/;
+  if (!occPattern.test(optionSymbol)) {
+    throw new Error("SAFETY: Invalid OCC symbol format: " + optionSymbol + " — order blocked");
+  }
+
+  // GUARD 2: Symbol must contain today's date — never trade expired options
+  const todayStr = expiryDate.getFullYear().toString().slice(2) +
+    String(expiryDate.getMonth()+1).padStart(2,"0") +
+    String(expiryDate.getDate()).padStart(2,"0");
+  if (!optionSymbol.includes(todayStr)) {
+    throw new Error("SAFETY: Option symbol date mismatch — expected " + todayStr + " in " + optionSymbol);
+  }
+
+  // GUARD 3: Price sanity check — option price must be reasonable for SPY 0DTE
+  if (midPrice < 0.05 || midPrice > 50) {
+    throw new Error("SAFETY: Option price $" + midPrice + " outside valid range ($0.05-$50) — order blocked");
+  }
+
+  // GUARD 4: Contract count sanity — never more than 50 contracts
+  if (contracts > 50) {
+    throw new Error("SAFETY: Contract count " + contracts + " exceeds max 50 — order blocked");
+  }
+
+  // GUARD 5: Total cost sanity — never more than 10% of account in one trade
+  const maxAllowed = ACCOUNT_SIZE * 0.10;
+  if (totalCost > maxAllowed) {
+    throw new Error("SAFETY: Total cost $" + totalCost + " exceeds 10% of account ($" + maxAllowed + ") — order blocked");
+  }
+
+  log("SAFETY", "All guards passed — placing option order: " + optionSymbol +
+    " x" + contracts + " @ $" + midPrice + " = $" + totalCost);
+
+  // ── Step 6: Place limit order ───────────────────────────────────────────────
   const order = await alpacaPost("/v2/orders", {
     symbol:          optionSymbol,
     qty:             String(contracts),
@@ -772,7 +808,6 @@ async function placeExitOrders(signal) {
     type:            "stop",
     stop_price:      String(stopPrice),
     time_in_force:   "day",
-    position_intent: "close",
     client_order_id: "spxcmd_stop_" + signal.id,
   });
 
@@ -784,7 +819,6 @@ async function placeExitOrders(signal) {
     type:            "limit",
     limit_price:     String(tp1Price),
     time_in_force:   "day",
-    position_intent: "close",
     client_order_id: "spxcmd_tp1_" + signal.id,
   });
 
@@ -814,7 +848,6 @@ async function trailStopToBreakeven(signal) {
     type:             "stop",
     stop_price:       String(parseFloat(breakeven.toFixed(2))),
     time_in_force:    "day",
-    position_intent:  "close",
     client_order_id:  "spxcmd_trail_" + signal.id,
   });
 
@@ -850,8 +883,7 @@ async function forceCloseAll() {
         side:             "sell",
         type:             "market",
         time_in_force:    "day",
-        position_intent:  "close",
-        client_order_id:  "spxcmd_eod_" + sig.id,
+            client_order_id:  "spxcmd_eod_" + sig.id,
       });
 
       sig.status = "EOD_CLOSED";
@@ -1149,6 +1181,41 @@ app.post("/closeall", async (req, res) => {
   res.json({ status: "done" });
 });
 
+// Close specific Alpaca position directly by symbol
+// Use this to close stuck positions: POST /closeposition/SPY260612C00741000
+app.post("/closeposition/:symbol", async (req, res) => {
+  const symbol = req.params.symbol;
+  try {
+    // Alpaca native position close — most reliable way
+    const result = await fetch(ALPACA_BASE + "/v2/positions/" + symbol, {
+      method: "DELETE",
+      headers: alpacaHeaders(),
+    });
+    const data = await result.json();
+    log("MANUAL", "Closed position " + symbol + " → " + JSON.stringify(data));
+    res.json({ status: "closed", symbol, data });
+  } catch (e) {
+    log("ERROR", "closeposition failed: " + e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Close ALL Alpaca positions directly
+app.post("/closeallpositions", async (req, res) => {
+  try {
+    const result = await fetch(ALPACA_BASE + "/v2/positions?cancel_orders=true", {
+      method: "DELETE",
+      headers: alpacaHeaders(),
+    });
+    const data = await result.json();
+    log("MANUAL", "Closed all positions → " + JSON.stringify(data));
+    res.json({ status: "closed_all", data });
+  } catch (e) {
+    log("ERROR", "closeallpositions failed: " + e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Sync — check fills and trail stops
 app.get("/sync", async (req, res) => {
   const active  = signalHistory.filter(s => ["SENT","FILLED","TP1_HIT"].includes(s.status));
@@ -1200,7 +1267,7 @@ app.get("/status", (req, res) => res.json({
   mode:           IS_PAPER ? "PAPER" : "LIVE",
   broker:         "Alpaca",
   underlying:     "SPY (long options)",
-  version:        "7.1-journal-tp1",
+  version:        "7.3-guards",
   riskMode:       RISK_DOLLARS > 0 ? "Fixed $" + RISK_DOLLARS + " per trade" : (RISK_PER_TRADE*100) + "% of account",
   riskBudget:     "$" + getRiskBudget().toFixed(0) + " per trade",
   sessionPnL:     sessionPnL.toFixed(2),
