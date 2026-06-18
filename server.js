@@ -430,59 +430,66 @@ async function calcGEX() {
     const d   = new Date(new Date().toLocaleString("en-US",{timeZone:"America/New_York"}));
     const exp = d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0");
 
-    // Use option chain endpoint — returns greeks + quotes in one call
-    // /v2/stocks/{symbol}/options/chains — correct Alpaca endpoint for options chain with greeks
-    let contracts=[], next=null;
+    // Step 1: Get contract list for today from broker API (not data API)
+    // Uses /v2/options/contracts which supports underlying_symbols + expiration filters
+    let contractList=[], next=null;
     do {
-      let url = ALPACA_DATA+"/v1beta1/options/snapshots?underlying_symbols=SPY" +
-        "&expiration_date="+exp+"&feed=indicative&limit=1000";
+      let url = ALPACA_BASE+"/v2/options/contracts?underlying_symbols=SPY&status=active&limit=200"+
+        "&expiration_date_gte="+exp+"&expiration_date_lte="+exp;
       if (next) url+="&page_token="+next;
       const r = await fetch(url,{headers:aH()});
       if (!r.ok){
-        const errText = await r.text();
-        log("GEX ERR","Chain "+r.status+": "+errText);
-        // Fallback: try without expiration_date filter
-        if (r.status===400||r.status===404) {
-          log("GEX","Trying fallback — fetching all SPY contracts...");
-          const r2 = await fetch(ALPACA_DATA+"/v1beta1/options/snapshots?underlying_symbols=SPY&feed=indicative&limit=1000",{headers:aH()});
-          if (!r2.ok){log("GEX ERR","Fallback also failed: "+r2.status);break;}
-          const d2 = await r2.json();
-          const snaps2 = d2.snapshots||{};
-          // Filter to today's expiry only
-          const todayContracts = Object.entries(snaps2)
-            .filter(([sym])=>sym.includes(exp.replace(/-/g,"").slice(2)))
-            .map(([sym,snap])=>({symbol:sym,snap,...snap}));
-          contracts = contracts.concat(todayContracts);
-          log("GEX","Fallback got "+todayContracts.length+" contracts for today");
-        }
+        log("GEX ERR","Contracts "+r.status+": "+await r.text());
         break;
       }
       const data=await r.json();
-      const snaps=data.snapshots||{};
-      // Convert snapshot map to array
-      const snapContracts = Object.entries(snaps).map(([sym,snap])=>({symbol:sym,snap,...snap}));
-      contracts=contracts.concat(snapContracts);
-      next=data.next_page_token||null;
+      contractList = contractList.concat(data.option_contracts||[]);
+      next = data.next_page_token||null;
     } while(next);
+
+    if (!contractList.length){
+      log("GEX ERR","No 0DTE contracts for "+exp+" — market closed or no options today");
+      return null;
+    }
+    log("GEX","Got "+contractList.length+" contracts — fetching greeks...");
+
+    // Step 2: Fetch snapshots (greeks + quotes) in batches of 100
+    const contracts = [];
+    const symbols   = contractList.map(c=>c.symbol).filter(Boolean);
+    for (let i=0; i<symbols.length; i+=100) {
+      const batch = symbols.slice(i,i+100);
+      try {
+        const r = await fetch(
+          ALPACA_DATA+"/v1beta1/options/snapshots?symbols="+batch.join(",")+"&feed=indicative",
+          {headers:aH()}
+        );
+        if (!r.ok) { log("GEX ERR","Snapshots batch "+r.status); continue; }
+        const data  = await r.json();
+        const snaps = data.snapshots||{};
+        for (const [sym,snap] of Object.entries(snaps)) {
+          contracts.push({symbol:sym, ...snap});
+        }
+      } catch(e) { log("GEX ERR","Snapshot batch: "+e.message); }
+    }
+    log("GEX","Got greeks for "+contracts.length+"/"+symbols.length+" contracts");
 
     if (!contracts.length){log("GEX ERR","No 0DTE contracts for "+exp);return null;}
     log("GEX","Got "+contracts.length+" contracts — fetching greeks...");
 
-    // Contracts already have greeks embedded from snapshots endpoint
-    // Parse OCC symbol to get strike and type: SPY YYMMDD C/P XXXXXXXX
+    // Extract GEX from snapshots
+    // OCC symbol format: SPY260618C00746000
+    // Position 12 = right (C/P), positions 13-20 = strike * 1000
     const strikeMap={};
     for(const c of contracts){
       const sym = c.symbol||"";
       if(sym.length<21) continue;
-      // Parse OCC symbol: SPY260618C00746000 → type=C strike=746
-      const right  = sym[12]; // C or P
+      const right  = sym[12];
       const strike = parseFloat(sym.slice(13,21))/1000;
-      const greeks = c.greeks||c.snap?.greeks||{};
+      const greeks = c.greeks||{};
       const gamma  = parseFloat(greeks.gamma||0);
-      const oi     = parseFloat(c.openInterest||c.snap?.openInterest||c.open_interest||0);
-
+      const oi     = parseFloat(c.openInterest||0);
       if(!strike||!gamma||!oi) continue;
-      const gex=gamma*oi*100*spot;
+      const gex = gamma*oi*100*spot;
       if(!strikeMap[strike]) strikeMap[strike]={call:0,put:0};
       if(right==="C") strikeMap[strike].call+=gex;
       if(right==="P") strikeMap[strike].put -=gex;
