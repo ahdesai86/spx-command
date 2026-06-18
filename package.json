@@ -1,18 +1,19 @@
 {
   "name": "spx-command",
-  "version": "4.0.0",
-  "description": "SPX COMMAND — SPXW 0DTE trading bot · Alpaca Edition",
+  "version": "9.0.0",
+  "description": "SPX COMMAND — Autonomous SPY 0DTE options bot",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev":   "node --watch server.js"
+    "dev":   "node server.js"
+  },
+  "dependencies": {
+    "express":        "^4.18.2",
+    "cors":           "^2.8.5",
+    "dotenv":         "^16.0.3",
+    "better-sqlite3": "^9.4.3"
   },
   "engines": {
     "node": ">=18.0.0"
-  },
-  "dependencies": {
-    "cors":    "^2.8.5",
-    "dotenv":  "^16.4.5",
-    "express": "^4.19.2"
   }
 }

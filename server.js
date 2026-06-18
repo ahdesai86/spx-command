@@ -1,18 +1,30 @@
 /**
- * SPX COMMAND v8 — Clean Rebuild
+ * SPX COMMAND v9 — Fully Self-Contained
  * ─────────────────────────────────────────────────────────────────────────────
- * SPY 0DTE long options · Alpaca Paper API · Railway hosting
+ * No TradingView dependency. Uses Alpaca live data for all signals.
  *
- * EXIT STRATEGY (fixes all 403 errors):
- *   Uses price monitoring + DELETE /v2/positions/{symbol} to close
- *   NO sell orders placed — eliminates all "uncovered option" errors
+ * SIGNAL ENGINE:
+ *   - Fetches SPY 5-min bars from Alpaca every 5 minutes
+ *   - Calculates ORB (9:30-9:45 AM ET, 15-min range)
+ *   - Calculates VWAP, RSI(14), EMA(9/21)
+ *   - MODERATE mode: ORB + VWAP + RSI must agree
+ *   - STRICT mode:   ORB + VWAP + RSI + EMA must agree
+ *   - GEX filter: blocks signals at walls, sets TP targets
  *
- * ENV VARIABLES (set in Railway):
+ * EXIT STRATEGY:
+ *   Price monitor (30s) + DELETE /v2/positions — no sell orders
+ *
+ * DATABASE:
+ *   SQLite on /data/spx_command.db (Railway Volume)
+ *   Tables: signals, trades, gex_snapshots
+ *
+ * ENV VARIABLES:
  *   ALPACA_KEY, ALPACA_SECRET, ALPACA_BASE_URL
  *   ACCOUNT_SIZE, RISK_DOLLARS, RISK_PER_TRADE
  *   MAX_DAILY_LOSS, PREMIUM_STOP_PCT
  *   TP1_MULTIPLIER, TP1_FIXED_MOVE
- *   GEX_BUFFER, PORT
+ *   GEX_BUFFER, SIGNAL_MODE (MODERATE or STRICT)
+ *   PORT
  */
 
 "use strict";
@@ -35,525 +47,840 @@ const PREMIUM_STOP_PCT = parseFloat(process.env.PREMIUM_STOP_PCT || "0.25");
 const TP1_MULTIPLIER   = parseFloat(process.env.TP1_MULTIPLIER   || "3.0");
 const TP1_FIXED_MOVE   = parseFloat(process.env.TP1_FIXED_MOVE   || "0");
 const GEX_BUFFER       = parseFloat(process.env.GEX_BUFFER       || "1.0");
+const SIGNAL_MODE      = (process.env.SIGNAL_MODE || "MODERATE").toUpperCase(); // MODERATE or STRICT
 const PORT             = parseInt(process.env.PORT               || "3001");
 const IS_PAPER         = ALPACA_BASE.includes("paper");
+const ORB_MINUTES      = 15; // 9:30–9:45 ET
+const MAX_TRADES_DAY   = parseInt(process.env.MAX_TRADES_DAY || "3");
 
-function getRiskBudget() {
-  return RISK_DOLLARS > 0 ? RISK_DOLLARS : ACCOUNT_SIZE * RISK_PER_TRADE;
-}
-
-function calcContracts(premium) {
-  if (!premium || premium <= 0) return 1;
-  return Math.max(1, Math.floor(getRiskBudget() / (premium * 100)));
-}
-
+function getRiskBudget() { return RISK_DOLLARS > 0 ? RISK_DOLLARS : ACCOUNT_SIZE * RISK_PER_TRADE; }
+function calcContracts(p) { return !p||p<=0 ? 1 : Math.max(1, Math.floor(getRiskBudget()/(p*100))); }
 function calcTP1(entry, delta) {
-  if (TP1_FIXED_MOVE > 0) {
-    const move = TP1_FIXED_MOVE * (delta || 0.35);
-    return parseFloat((entry + move).toFixed(2));
-  }
+  if (TP1_FIXED_MOVE > 0) return parseFloat((entry + TP1_FIXED_MOVE*(delta||0.35)).toFixed(2));
   return parseFloat((entry * TP1_MULTIPLIER).toFixed(2));
 }
 
 // ── State ─────────────────────────────────────────────────────────────────────
-let sessionPnL    = 0;
-let dailyLoss     = 0;
-let signalHistory = [];
-let sseClients    = [];
-let logHistory    = [];
-let gexCache      = null;
-let gexCacheTime  = 0;
-let gexFired      = new Set();
-let gexLastDate   = "";
-const MAX_LOGS    = 500;
-const GEX_SCHEDULE = [{h:9,m:25},{h:10,m:30},{h:12,m:0},{h:14,m:0}];
+let sessionPnL      = 0;
+let dailyLoss       = 0;
+let signalHistory   = [];
+let sseClients      = [];
+let logHistory      = [];
+let gexCache        = null;
+let gexCacheTime    = 0;
+let gexFired        = new Set();
+let gexLastDate     = "";
+let orbState        = null;   // { high, low, built, date }
+let lastBarTime     = null;   // last processed 5-min bar timestamp
+let scanActive      = false;
+let tradesDay       = 0;
+const MAX_LOGS      = 500;
+const GEX_SCHEDULE  = [{h:9,m:25},{h:10,m:30},{h:12,m:0},{h:14,m:0}];
 
-// ── Journal ───────────────────────────────────────────────────────────────────
-const JOURNAL_FILE = path.join(__dirname, "trade_journal.json");
+// ── SQLite Database ───────────────────────────────────────────────────────────
+const DB_DIR  = fs.existsSync("/data") ? "/data" : __dirname;
+const DB_FILE = path.join(DB_DIR, "spx_command.db");
+let   db      = null;
 
-function loadJournal() {
+function initDB() {
   try {
-    if (fs.existsSync(JOURNAL_FILE)) {
-      return JSON.parse(fs.readFileSync(JOURNAL_FILE, "utf8"));
-    }
-  } catch(e) { log("JOURNAL ERR", e.message); }
-  return { trades:[], stats:{ totalTrades:0, wins:0, losses:0, totalPnL:0, winRate:0, avgWin:0, avgLoss:0 } };
+    const Database = require("better-sqlite3");
+    db = new Database(DB_FILE);
+    db.pragma("journal_mode = WAL");
+
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS signals (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp   TEXT NOT NULL,
+        date        TEXT NOT NULL,
+        time        TEXT NOT NULL,
+        direction   TEXT,
+        spy_price   REAL,
+        orb_high    REAL,
+        orb_low     REAL,
+        vwap        REAL,
+        rsi         REAL,
+        ema9        REAL,
+        ema21       REAL,
+        gex_regime  TEXT,
+        gex_flip    REAL,
+        nearest_wall REAL,
+        signal_strength TEXT,
+        signal_mode TEXT,
+        fired       INTEGER DEFAULT 0,
+        blocked_reason TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS trades (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        signal_id       INTEGER,
+        timestamp       TEXT NOT NULL,
+        date            TEXT NOT NULL,
+        time            TEXT NOT NULL,
+        bot             TEXT DEFAULT 'SPX-COMMAND-v9',
+        symbol          TEXT,
+        direction       TEXT,
+        right_type      TEXT,
+        strike          REAL,
+        expiry          TEXT,
+        contracts       INTEGER,
+        fill_price      REAL,
+        total_cost      REAL,
+        stop_price      REAL,
+        tp1_price       REAL,
+        close_price     REAL,
+        close_reason    TEXT,
+        pnl             REAL,
+        pnl_pct         REAL,
+        duration_min    REAL,
+        outcome         TEXT,
+        gex_regime      TEXT,
+        gex_flip        REAL,
+        orb_high        REAL,
+        orb_low         REAL,
+        vwap_at_entry   REAL,
+        rsi_at_entry    REAL,
+        ema9_at_entry   REAL,
+        ema21_at_entry  REAL,
+        tp1_mode        TEXT,
+        risk_budget     REAL,
+        signal_mode     TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS gex_snapshots (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp   TEXT NOT NULL,
+        spot_price  REAL,
+        net_gex     REAL,
+        regime      TEXT,
+        gamma_flip  REAL,
+        call_wall_1 REAL,
+        call_wall_2 REAL,
+        call_wall_3 REAL,
+        put_wall_1  REAL,
+        put_wall_2  REAL,
+        put_wall_3  REAL
+      );
+    `);
+    log("DB", "SQLite initialized at "+DB_FILE);
+  } catch(e) {
+    log("DB ERR", "SQLite unavailable: "+e.message+" — using JSON fallback");
+    db = null;
+  }
 }
 
-function saveJournal(j) {
-  try { fs.writeFileSync(JOURNAL_FILE, JSON.stringify(j, null, 2)); } catch(e) { log("JOURNAL ERR", e.message); }
+function dbRun(sql, params) {
+  if (!db) return null;
+  try { return db.prepare(sql).run(...(params||[])); } catch(e) { log("DB ERR", e.message); return null; }
 }
 
-function recordTrade(signal, reason) {
-  const j    = loadJournal();
-  const pnl  = signal.closePnl || 0;
-  const win  = pnl > 0;
-  const trade = {
-    id: signal.id, bot: "SPX-COMMAND-v8",
-    date: new Date().toLocaleDateString("en-US",{timeZone:"America/New_York"}),
-    time: signal.time,
-    symbol: signal.optionSymbol, direction: signal.direction,
-    right: signal.right, strike: signal.strike, expiry: signal.expiry,
-    contracts: signal.contracts, fillPrice: signal.fillPrice,
-    totalCost: signal.totalCost, stopPrice: signal.stopPrice,
-    tp1Price: signal.tp1Price, closePnl: parseFloat(pnl.toFixed(2)),
-    pnlPct: signal.fillPrice && signal.totalCost
-      ? parseFloat(((pnl / signal.totalCost) * 100).toFixed(1)) : null,
-    closeReason: reason, outcome: win ? "WIN" : pnl===0 ? "BREAKEVEN" : "LOSS",
-    trigger: signal.trigger, gexRegime: signal.gexSnapshot?.regime || null,
-    tp1Mode: TP1_FIXED_MOVE > 0 ? "fixed-$"+TP1_FIXED_MOVE : TP1_MULTIPLIER+"x",
-    riskBudget: getRiskBudget(),
-  };
-  j.trades.unshift(trade);
-  j.stats.totalTrades++;
-  if (win)   j.stats.wins++;
-  if (pnl<0) j.stats.losses++;
-  j.stats.totalPnL = parseFloat((j.stats.totalPnL + pnl).toFixed(2));
-  j.stats.winRate  = parseFloat(((j.stats.wins / j.stats.totalTrades)*100).toFixed(1));
-  const winTrades  = j.trades.filter(t=>t.closePnl>0);
-  const lossTrades = j.trades.filter(t=>t.closePnl<0);
-  j.stats.avgWin   = winTrades.length  ? parseFloat((winTrades.reduce((a,t)=>a+t.closePnl,0)/winTrades.length).toFixed(2))  : 0;
-  j.stats.avgLoss  = lossTrades.length ? parseFloat((lossTrades.reduce((a,t)=>a+t.closePnl,0)/lossTrades.length).toFixed(2)) : 0;
-  saveJournal(j);
-  log("JOURNAL", trade.outcome+" | "+trade.symbol+" | P&L $"+trade.closePnl+" | WinRate "+j.stats.winRate+"%");
-  broadcast({ type:"journal_update", trade, stats:j.stats });
+function dbAll(sql, params) {
+  if (!db) return [];
+  try { return db.prepare(sql).all(...(params||[])); } catch(e) { log("DB ERR", e.message); return []; }
 }
 
-// ── Utilities ─────────────────────────────────────────────────────────────────
+function saveSignalToDB(sig, indicators, fired, blockedReason) {
+  return dbRun(`INSERT INTO signals (
+    timestamp,date,time,direction,spy_price,orb_high,orb_low,
+    vwap,rsi,ema9,ema21,gex_regime,gex_flip,nearest_wall,
+    signal_strength,signal_mode,fired,blocked_reason
+  ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [
+    new Date().toISOString(),
+    new Date().toLocaleDateString("en-CA",{timeZone:"America/New_York"}),
+    new Date().toLocaleTimeString("en-US",{hour12:false,timeZone:"America/New_York"}),
+    sig.direction, sig.spyEntry,
+    indicators.orbHigh, indicators.orbLow,
+    indicators.vwap, indicators.rsi,
+    indicators.ema9, indicators.ema21,
+    gexCache?.regime||null, gexCache?.gammaFlip||null,
+    sig.gexTarget||null,
+    sig.strength||null, SIGNAL_MODE,
+    fired?1:0, blockedReason||null,
+  ]);
+}
+
+function saveTradeToDB(trade, signalDbId, indicators) {
+  return dbRun(`INSERT INTO trades (
+    signal_id,timestamp,date,time,bot,symbol,direction,right_type,
+    strike,expiry,contracts,fill_price,total_cost,stop_price,tp1_price,
+    close_price,close_reason,pnl,pnl_pct,duration_min,outcome,
+    gex_regime,gex_flip,orb_high,orb_low,vwap_at_entry,
+    rsi_at_entry,ema9_at_entry,ema21_at_entry,tp1_mode,risk_budget,signal_mode
+  ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [
+    signalDbId||null,
+    new Date().toISOString(),
+    new Date().toLocaleDateString("en-CA",{timeZone:"America/New_York"}),
+    new Date().toLocaleTimeString("en-US",{hour12:false,timeZone:"America/New_York"}),
+    "SPX-COMMAND-v9",
+    trade.optionSymbol, trade.direction, trade.right,
+    trade.strike, trade.expiry, trade.contracts,
+    trade.fillPrice, trade.totalCost,
+    trade.stopPrice, trade.tp1Price,
+    trade.closePrice||null, trade.closeReason||null,
+    trade.closePnl||null,
+    trade.closePnl&&trade.totalCost ? parseFloat(((trade.closePnl/trade.totalCost)*100).toFixed(1)) : null,
+    trade.durationMin||null,
+    trade.outcome||null,
+    gexCache?.regime||null, gexCache?.gammaFlip||null,
+    indicators?.orbHigh||null, indicators?.orbLow||null,
+    indicators?.vwap||null, indicators?.rsi||null,
+    indicators?.ema9||null, indicators?.ema21||null,
+    TP1_FIXED_MOVE>0?"fixed-$"+TP1_FIXED_MOVE:TP1_MULTIPLIER+"x",
+    getRiskBudget(), SIGNAL_MODE,
+  ]);
+}
+
+function saveGEXSnapshot(g) {
+  dbRun(`INSERT INTO gex_snapshots (
+    timestamp,spot_price,net_gex,regime,gamma_flip,
+    call_wall_1,call_wall_2,call_wall_3,
+    put_wall_1,put_wall_2,put_wall_3
+  ) VALUES (?,?,?,?,?,?,?,?,?,?,?)`, [
+    new Date().toISOString(),
+    g.spotPrice, g.netGex, g.regime, g.gammaFlip,
+    g.callWalls?.[0]?.price||null, g.callWalls?.[1]?.price||null, g.callWalls?.[2]?.price||null,
+    g.putWalls?.[0]?.price||null,  g.putWalls?.[1]?.price||null,  g.putWalls?.[2]?.price||null,
+  ]);
+}
+
+// ── Logging ───────────────────────────────────────────────────────────────────
 function log(tag, msg) {
   const t = new Date().toLocaleTimeString("en-US",{hour12:false,timeZone:"America/New_York"});
-  const entry = { type:"log", time:t, tag, msg };
+  const e = {type:"log",time:t,tag,msg};
   console.log("["+t+" ET] ["+tag+"] "+msg);
-  logHistory.push(entry);
-  if (logHistory.length > MAX_LOGS) logHistory.shift();
-  broadcast(entry);
+  logHistory.push(e);
+  if (logHistory.length>MAX_LOGS) logHistory.shift();
+  broadcast(e);
 }
 
-function broadcast(payload) {
-  const data = "data: "+JSON.stringify(payload)+"\n\n";
-  sseClients.forEach(c=>{ try { c.write(data); } catch(_){} });
+function broadcast(p) {
+  const d = "data: "+JSON.stringify(p)+"\n\n";
+  sseClients.forEach(c=>{ try{c.write(d);}catch(_){} });
 }
 
 // ── Alpaca helpers ─────────────────────────────────────────────────────────────
-function aHeaders() {
-  return {
-    "APCA-API-KEY-ID":     ALPACA_KEY,
-    "APCA-API-SECRET-KEY": ALPACA_SECRET,
-    "Content-Type":        "application/json",
-    "Accept":              "application/json",
-  };
+function aH() {
+  return {"APCA-API-KEY-ID":ALPACA_KEY,"APCA-API-SECRET-KEY":ALPACA_SECRET,
+    "Content-Type":"application/json","Accept":"application/json"};
+}
+async function aGet(p, base) {
+  const r = await fetch((base||ALPACA_BASE)+p,{headers:aH()});
+  if (!r.ok){const e=await r.text();throw new Error("GET "+p+" "+r.status+": "+e);}
+  return r.json();
+}
+async function aPost(p, body) {
+  const r = await fetch(ALPACA_BASE+p,{method:"POST",headers:aH(),body:JSON.stringify(body)});
+  if (!r.ok){const e=await r.text();throw new Error("POST "+p+" "+r.status+": "+e);}
+  return r.json();
+}
+async function aDel(p) {
+  const r = await fetch(ALPACA_BASE+p,{method:"DELETE",headers:aH()});
+  return {ok:r.ok,status:r.status,data:r.ok?await r.json().catch(()=>({})):await r.text()};
 }
 
-async function aGet(path, base) {
-  const res = await fetch((base||ALPACA_BASE)+path, {headers:aHeaders()});
-  if (!res.ok) { const e=await res.text(); throw new Error("GET "+path+" "+res.status+": "+e); }
-  return res.json();
-}
-
-async function aPost(path, body) {
-  const res = await fetch(ALPACA_BASE+path, {method:"POST",headers:aHeaders(),body:JSON.stringify(body)});
-  if (!res.ok) { const e=await res.text(); throw new Error("POST "+path+" "+res.status+": "+e); }
-  return res.json();
-}
-
-async function aDelete(path) {
-  const res = await fetch(ALPACA_BASE+path, {method:"DELETE",headers:aHeaders()});
-  return { ok:res.ok, status:res.status, data: res.ok ? await res.json().catch(()=>({})) : await res.text() };
-}
-
-// ── Position close (the only exit method) ────────────────────────────────────
-async function closePosition(symbol) {
-  // DELETE /v2/positions/{symbol} — Alpaca's official way to close any position
-  return await aDelete("/v2/positions/"+encodeURIComponent(symbol));
-}
-
-// ── Price monitor — checks every 30s, closes via DELETE when stop/TP1 hit ─────
-function startMonitor(signal) {
-  log("MONITOR", "Watching "+signal.optionSymbol+" | stop $"+signal.stopPrice+" | tp1 $"+signal.tp1Price);
-
-  const iv = setInterval(async () => {
-    if (!["FILLED"].includes(signal.status)) { clearInterval(iv); return; }
-
-    try {
-      const pos   = await aGet("/v2/positions/"+encodeURIComponent(signal.optionSymbol));
-      const price = parseFloat(pos.current_price || 0);
-      if (!price) return;
-
-      const entry  = signal.fillPrice || signal.midPrice;
-      const pnlPct = ((price-entry)/entry*100).toFixed(1);
-      log("MONITOR", signal.optionSymbol+" | $"+price+" | P&L "+pnlPct+"% | stop $"+signal.stopPrice+" | tp1 $"+signal.tp1Price);
-
-      // TP1 hit
-      if (price >= signal.tp1Price) {
-        clearInterval(iv);
-        log("TP1", "Target hit $"+price+" >= $"+signal.tp1Price);
-        const r = await closePosition(signal.optionSymbol);
-        log("TP1", "Close result: "+r.status+" "+JSON.stringify(r.data).slice(0,100));
-        const pnl = (price - entry) * 100 * signal.contracts;
-        signal.status   = "TP1_HIT";
-        signal.closePnl = pnl;
-        sessionPnL += pnl;
-        broadcast({type:"signal_update",id:signal.id,status:"TP1_HIT",pnl});
-        recordTrade(signal, "TP1_HIT");
-        // Trail stop to breakeven if TP1 hits but position still open
-        return;
-      }
-
-      // Stop hit
-      if (price <= signal.stopPrice) {
-        clearInterval(iv);
-        log("STOP", "Stop hit $"+price+" <= $"+signal.stopPrice);
-        const r = await closePosition(signal.optionSymbol);
-        log("STOP", "Close result: "+r.status+" "+JSON.stringify(r.data).slice(0,100));
-        const pnl = (price - entry) * 100 * signal.contracts;
-        signal.status   = "STOPPED";
-        signal.closePnl = pnl;
-        sessionPnL += pnl;
-        dailyLoss  += Math.abs(Math.min(0, pnl));
-        broadcast({type:"signal_update",id:signal.id,status:"STOPPED",pnl});
-        recordTrade(signal, "STOP_HIT");
-        return;
-      }
-
-    } catch(e) {
-      // 404 = position closed/expired
-      if (e.message.includes("404") || e.message.includes("40410000")) {
-        clearInterval(iv);
-        log("MONITOR", signal.optionSymbol+" no longer exists — expired or closed");
-        signal.status = "EOD_CLOSED";
-        broadcast({type:"signal_update",id:signal.id,status:"EOD_CLOSED"});
-        recordTrade(signal, "EXPIRED");
-      }
-    }
-  }, 30000);
-
-  signal._monitorInterval = iv;
-  return iv;
-}
-
-// ── GEX ───────────────────────────────────────────────────────────────────────
-async function getSPYSpot() {
+// ── Market data ───────────────────────────────────────────────────────────────
+/**
+ * Fetch SPY 5-minute bars for today from Alpaca
+ * Returns array of { t, o, h, l, c, v } sorted oldest first
+ */
+async function getSPYBars() {
   try {
-    const r = await fetch(ALPACA_DATA+"/v2/stocks/SPY/quotes/latest", {headers:aHeaders()});
+    const now    = new Date(new Date().toLocaleString("en-US",{timeZone:"America/New_York"}));
+    const today  = now.toISOString().slice(0,10);
+    const start  = today+"T09:30:00-04:00";
+    const url    = ALPACA_DATA+"/v2/stocks/SPY/bars?timeframe=5Min&start="+
+                   encodeURIComponent(start)+"&limit=100&feed=iex";
+    const r      = await fetch(url,{headers:aH()});
+    if (!r.ok) { log("DATA ERR","Bars "+r.status); return []; }
+    const data   = await r.json();
+    return (data.bars||[]).sort((a,b)=>new Date(a.t)-new Date(b.t));
+  } catch(e) { log("DATA ERR","getSPYBars: "+e.message); return []; }
+}
+
+async function getSPYQuote() {
+  try {
+    const r = await fetch(ALPACA_DATA+"/v2/stocks/SPY/quotes/latest",{headers:aH()});
     if (!r.ok) return null;
     const d = await r.json();
-    return parseFloat((d.quote||{}).ap || (d.quote||{}).bp || 0) || null;
+    const q = d.quote||{};
+    const p = parseFloat(q.ap||q.bp||0);
+    return p>0?p:null;
   } catch(_) { return null; }
 }
 
+// ── Technical Indicators ──────────────────────────────────────────────────────
+function calcEMA(closes, period) {
+  if (closes.length < period) return null;
+  const k   = 2/(period+1);
+  let   ema = closes.slice(0,period).reduce((a,b)=>a+b,0)/period;
+  for (let i=period; i<closes.length; i++) ema = closes[i]*k + ema*(1-k);
+  return parseFloat(ema.toFixed(4));
+}
+
+function calcRSI(closes, period=14) {
+  if (closes.length < period+1) return null;
+  let gains=0, losses=0;
+  for (let i=1; i<=period; i++) {
+    const d = closes[i]-closes[i-1];
+    if (d>0) gains+=d; else losses-=d;
+  }
+  let ag=gains/period, al=losses/period;
+  for (let i=period+1; i<closes.length; i++) {
+    const d = closes[i]-closes[i-1];
+    ag = (ag*(period-1)+(d>0?d:0))/period;
+    al = (al*(period-1)+(d<0?-d:0))/period;
+  }
+  return al===0 ? 100 : parseFloat((100-100/(1+ag/al)).toFixed(2));
+}
+
+function calcVWAP(bars) {
+  if (!bars.length) return null;
+  let cumPV=0, cumV=0;
+  for (const b of bars) {
+    const tp = (b.h+b.l+b.c)/3;
+    cumPV += tp*b.v;
+    cumV  += b.v;
+  }
+  return cumV>0 ? parseFloat((cumPV/cumV).toFixed(4)) : null;
+}
+
+/**
+ * Build ORB from first ORB_MINUTES of bars
+ * Returns { high, low, built } or null
+ */
+function buildORB(bars) {
+  const etDate = new Date(new Date().toLocaleString("en-US",{timeZone:"America/New_York"}));
+  const today  = etDate.toISOString().slice(0,10);
+
+  // Reset ORB on new day
+  if (!orbState || orbState.date !== today) {
+    orbState = { high:null, low:null, built:false, date:today };
+  }
+
+  if (orbState.built) return orbState;
+
+  // ORB bars: 9:30 to 9:30+ORB_MINUTES
+  const orbEnd = new Date(today+"T09:30:00-04:00");
+  orbEnd.setMinutes(orbEnd.getMinutes()+ORB_MINUTES);
+
+  const orbBars = bars.filter(b=>{
+    const bt = new Date(b.t);
+    return bt >= new Date(today+"T09:30:00-04:00") && bt < orbEnd;
+  });
+
+  if (orbBars.length < 3) return null; // need at least 3 bars to confirm ORB
+
+  orbState.high  = parseFloat(Math.max(...orbBars.map(b=>b.h)).toFixed(2));
+  orbState.low   = parseFloat(Math.min(...orbBars.map(b=>b.l)).toFixed(2));
+  orbState.built = true;
+
+  log("ORB","Built ✓ | High: $"+orbState.high+" | Low: $"+orbState.low+
+    " | Range: $"+( orbState.high-orbState.low).toFixed(2));
+  broadcast({type:"orb_update",...orbState});
+  return orbState;
+}
+
+/**
+ * Run full indicator suite on current bars
+ * Returns { price, orbHigh, orbLow, vwap, rsi, ema9, ema21, orbBreak, direction }
+ */
+function calcIndicators(bars, currentPrice) {
+  if (!bars.length) return null;
+  const closes = bars.map(b=>b.c);
+  const orb    = orbState?.built ? orbState : null;
+  const vwap   = calcVWAP(bars);
+  const rsi    = calcRSI(closes);
+  const ema9   = calcEMA(closes, 9);
+  const ema21  = calcEMA(closes, 21);
+  const price  = currentPrice || closes[closes.length-1];
+
+  // ORB breakout direction
+  let orbBreak = null;
+  if (orb) {
+    if (price > orb.high) orbBreak = "LONG";
+    if (price < orb.low)  orbBreak = "SHORT";
+  }
+
+  return { price, orbHigh:orb?.high||null, orbLow:orb?.low||null,
+    vwap, rsi, ema9, ema21, orbBreak };
+}
+
+/**
+ * Evaluate signal based on SIGNAL_MODE
+ * MODERATE: ORB + VWAP + RSI
+ * STRICT:   ORB + VWAP + RSI + EMA
+ * Returns { fire, direction, strength, reason, failed }
+ */
+function evaluateSignal(ind) {
+  if (!ind || !ind.orbBreak) return {fire:false,reason:"No ORB breakout"};
+  if (!ind.vwap)             return {fire:false,reason:"No VWAP"};
+  if (!ind.rsi)              return {fire:false,reason:"No RSI"};
+
+  const dir   = ind.orbBreak;
+  const isLong = dir==="LONG";
+  const failed = [];
+  const passed = [];
+
+  // ORB — already confirmed by orbBreak
+  passed.push("ORB "+dir);
+
+  // VWAP
+  if (isLong  && ind.price > ind.vwap) passed.push("VWAP above");
+  else if (!isLong && ind.price < ind.vwap) passed.push("VWAP below");
+  else failed.push("VWAP "+( isLong ? "price below VWAP" : "price above VWAP"));
+
+  // RSI — avoid extremes
+  const rsiOk = isLong ? ind.rsi<75&&ind.rsi>40 : ind.rsi>25&&ind.rsi<60;
+  if (rsiOk) passed.push("RSI "+ind.rsi);
+  else failed.push("RSI "+ind.rsi+" ("+(isLong?"overbought >75 or weak <40":"oversold <25 or weak >60")+")");
+
+  // EMA (STRICT mode only)
+  if (SIGNAL_MODE==="STRICT") {
+    if (!ind.ema9||!ind.ema21) {
+      failed.push("EMA unavailable");
+    } else {
+      const emaOk = isLong ? ind.ema9>ind.ema21 : ind.ema9<ind.ema21;
+      if (emaOk) passed.push("EMA9 "+(isLong?"above":"below")+" EMA21");
+      else failed.push("EMA9 "+(isLong?"below EMA21 (bearish)":"above EMA21 (bullish)"));
+    }
+  }
+
+  const required = SIGNAL_MODE==="STRICT" ? 4 : 3;
+  const fire     = failed.length===0 && passed.length>=required;
+
+  const strength = fire ? (passed.length===required ? "MODERATE" : "STRONG") : "WEAK";
+  const reason   = fire
+    ? "✓ "+passed.join(" | ")
+    : "✗ Failed: "+failed.join(", ")+" | Passed: "+passed.join(", ");
+
+  return {fire, direction:dir, strength, reason, passed, failed};
+}
+
+// ── GEX ───────────────────────────────────────────────────────────────────────
 async function calcGEX() {
   try {
-    log("GEX", "Calculating from Alpaca chain...");
-    const spot = await getSPYSpot();
-    if (!spot) { log("GEX ERR","No SPY spot — market may be closed"); return null; }
-    log("GEX","SPY spot: $"+spot.toFixed(2));
+    log("GEX","Calculating from Alpaca chain...");
+    const spot = await getSPYQuote();
+    if (!spot) { log("GEX ERR","No SPY spot"); return null; }
+    log("GEX","SPY: $"+spot.toFixed(2));
 
     const d   = new Date(new Date().toLocaleString("en-US",{timeZone:"America/New_York"}));
     const exp = d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0");
 
-    // Fetch contracts list first
     let contracts=[], next=null;
     do {
       let url = ALPACA_DATA+"/v1beta1/options/contracts?underlying_symbol=SPY&status=active&limit=250"+
         "&expiration_date_gte="+exp+"&expiration_date_lte="+exp;
-      if (next) url += "&page_token="+next;
-      const r = await fetch(url, {headers:aHeaders()});
-      if (!r.ok) { log("GEX ERR","Contracts "+r.status+": "+await r.text()); break; }
-      const data = await r.json();
-      contracts  = contracts.concat(data.option_contracts||[]);
-      next       = data.next_page_token||null;
+      if (next) url+="&page_token="+next;
+      const r = await fetch(url,{headers:aH()});
+      if (!r.ok){log("GEX ERR","Contracts "+r.status+": "+await r.text());break;}
+      const data=await r.json();
+      contracts=contracts.concat(data.option_contracts||[]);
+      next=data.next_page_token||null;
     } while(next);
 
-    if (!contracts.length) { log("GEX ERR","No contracts for "+exp); return null; }
+    if (!contracts.length){log("GEX ERR","No 0DTE contracts for "+exp);return null;}
     log("GEX","Got "+contracts.length+" contracts — fetching greeks...");
 
-    // Batch fetch snapshots for greeks
-    const symbols = contracts.map(c=>c.symbol).filter(Boolean);
-    const snaps   = {};
-    for (let i=0; i<symbols.length; i+=100) {
-      const batch = symbols.slice(i,i+100);
-      try {
-        const r = await fetch(ALPACA_DATA+"/v1beta1/options/snapshots?symbols="+batch.join(","), {headers:aHeaders()});
-        if (r.ok) Object.assign(snaps, (await r.json()).snapshots||{});
-      } catch(_){}
+    const syms={}, snaps={};
+    contracts.forEach(c=>{if(c.symbol)syms[c.symbol]=c;});
+    for(let i=0;i<Object.keys(syms).length;i+=100){
+      const batch=Object.keys(syms).slice(i,i+100);
+      try{
+        const r=await fetch(ALPACA_DATA+"/v1beta1/options/snapshots?symbols="+batch.join(","),{headers:aH()});
+        if(r.ok) Object.assign(snaps,(await r.json()).snapshots||{});
+      }catch(_){}
     }
 
-    // Calculate GEX per strike
-    const strikeMap = {};
-    for (const c of contracts) {
-      const snap   = snaps[c.symbol]||{};
-      const greeks = snap.greeks||{};
-      const gamma  = parseFloat(greeks.gamma||0);
-      const oi     = parseFloat(snap.openInterest||c.open_interest||0);
-      const strike = parseFloat(c.strike_price||0);
-      const type   = (c.type||"").toUpperCase();
-      if (!strike||!gamma||!oi) continue;
-      const gex = gamma*oi*100*spot;
-      if (!strikeMap[strike]) strikeMap[strike]={call:0,put:0};
-      if (type==="CALL"||type==="C") strikeMap[strike].call += gex;
-      if (type==="PUT" ||type==="P") strikeMap[strike].put  -= gex;
+    const strikeMap={};
+    for(const c of contracts){
+      const snap=snaps[c.symbol]||{}, g=(snap.greeks||{}), gamma=parseFloat(g.gamma||0);
+      const oi=parseFloat(snap.openInterest||c.open_interest||0), strike=parseFloat(c.strike_price||0);
+      const type=(c.type||"").toUpperCase();
+      if(!strike||!gamma||!oi) continue;
+      const gex=gamma*oi*100*spot;
+      if(!strikeMap[strike]) strikeMap[strike]={call:0,put:0};
+      if(type==="CALL"||type==="C") strikeMap[strike].call+=gex;
+      if(type==="PUT" ||type==="P") strikeMap[strike].put -=gex;
     }
 
-    const strikes = Object.keys(strikeMap).map(Number).sort((a,b)=>a-b);
-    if (!strikes.length) { log("GEX ERR","No GEX data — greeks unavailable"); return null; }
+    const strikes=Object.keys(strikeMap).map(Number).sort((a,b)=>a-b);
+    if(!strikes.length){log("GEX ERR","No GEX data");return null;}
 
-    let net=0, cum=0, flip=spot;
-    const levels = strikes.map(s=>{ const n=strikeMap[s].call+strikeMap[s].put; net+=n; return {strike:s,...strikeMap[s],net:n}; });
-    for (const l of levels) { const p=cum; cum+=l.net; if((p<0&&cum>=0)||(p>=0&&cum<0)){flip=l.strike;break;} }
+    let net=0,cum=0,flip=spot;
+    const levels=strikes.map(s=>{const n=strikeMap[s].call+strikeMap[s].put;net+=n;return{strike:s,...strikeMap[s],net:n};});
+    for(const l of levels){const p=cum;cum+=l.net;if((p<0&&cum>=0)||(p>=0&&cum<0)){flip=l.strike;break;}}
 
-    const callWalls = levels.filter(l=>l.strike>spot&&l.call>0).sort((a,b)=>b.call-a.call).slice(0,5).map(l=>({price:l.strike,gex:Math.round(l.call)}));
-    const putWalls  = levels.filter(l=>l.strike<spot&&l.put<0).sort((a,b)=>a.put-b.put).slice(0,5).map(l=>({price:l.strike,gex:Math.round(Math.abs(l.put))}));
+    const callWalls=levels.filter(l=>l.strike>spot&&l.call>0).sort((a,b)=>b.call-a.call).slice(0,5).map(l=>({price:l.strike,gex:Math.round(l.call)}));
+    const putWalls =levels.filter(l=>l.strike<spot&&l.put<0).sort((a,b)=>a.put-b.put).slice(0,5).map(l=>({price:l.strike,gex:Math.round(Math.abs(l.put))}));
 
-    const result = { callWalls, putWalls, gammaFlip:parseFloat(flip.toFixed(2)),
-      netGex:Math.round(net), regime:net>=0?"positive":"negative",
-      spotPrice:spot, updatedAt:new Date().toISOString(), source:"alpaca-calculated" };
+    const result={callWalls,putWalls,gammaFlip:parseFloat(flip.toFixed(2)),
+      netGex:Math.round(net),regime:net>=0?"positive":"negative",
+      spotPrice:spot,updatedAt:new Date().toISOString()};
 
     log("GEX","✓ Regime:"+result.regime+" | Flip:$"+result.gammaFlip+
-      " | Calls:"+callWalls.slice(0,3).map(w=>"$"+w.price).join(",")+" | Net:"+Math.round(net/1e6)+"M");
+      " | Calls:"+callWalls.slice(0,3).map(w=>"$"+w.price).join(","));
     broadcast({type:"gex_update",...result});
+    saveGEXSnapshot(result);
     return result;
-  } catch(e) { log("GEX ERR","calcGEX: "+e.message); return null; }
+  } catch(e){log("GEX ERR","calcGEX: "+e.message);return null;}
 }
 
 async function getGEX(force) {
-  const now   = Date.now();
-  const today = new Date().toLocaleDateString("en-CA",{timeZone:"America/New_York"});
-  if (today!==gexLastDate) { gexFired=new Set(); gexLastDate=today; gexCache=null; gexCacheTime=0; }
-  if (!force && gexCache && (now-gexCacheTime)<7200000) return gexCache;
-  const r = await calcGEX();
-  if (r) { gexCache=r; gexCacheTime=now; }
+  const now=Date.now();
+  const today=new Date().toLocaleDateString("en-CA",{timeZone:"America/New_York"});
+  if(today!==gexLastDate){gexFired=new Set();gexLastDate=today;gexCache=null;gexCacheTime=0;}
+  if(!force&&gexCache&&(now-gexCacheTime)<7200000) return gexCache;
+  const r=await calcGEX();
+  if(r){gexCache=r;gexCacheTime=now;}
   return gexCache;
 }
 
-function applyGEX(direction, entry, tp1, tp2) {
-  if (!gexCache) return {allowed:true,reason:"No GEX — using ORB targets",tp1,tp2,target:null};
-  if (direction==="LONG") {
-    const walls = (gexCache.callWalls||[]).filter(w=>w.price>entry+GEX_BUFFER).sort((a,b)=>a.price-b.price);
-    if (!walls.length) return {allowed:true,reason:"No call wall above",tp1,tp2,target:null};
-    if (walls[0].price-entry<GEX_BUFFER) return {allowed:false,reason:"LONG blocked — at call wall $"+walls[0].price,tp1,tp2,target:walls[0].price};
+function applyGEX(direction, entry) {
+  if(!gexCache) return {allowed:true,reason:"No GEX",tp1:entry*(direction==="LONG"?1.005:0.995),tp2:entry*(direction==="LONG"?1.01:0.99),target:null};
+  if(direction==="LONG"){
+    const walls=(gexCache.callWalls||[]).filter(w=>w.price>entry+GEX_BUFFER).sort((a,b)=>a.price-b.price);
+    if(!walls.length) return {allowed:true,reason:"No call wall above",tp1:entry+2,tp2:entry+4,target:null};
+    if(walls[0].price-entry<GEX_BUFFER) return {allowed:false,reason:"LONG blocked — at call wall $"+walls[0].price,tp1:walls[0].price,tp2:walls[0].price,target:walls[0].price};
     return {allowed:true,reason:"LONG → call wall $"+walls[0].price,tp1:walls[0].price,tp2:(walls[1]||walls[0]).price,target:walls[0].price};
   }
-  if (direction==="SHORT") {
-    const walls = (gexCache.putWalls||[]).filter(w=>w.price<entry-GEX_BUFFER).sort((a,b)=>b.price-a.price);
-    if (!walls.length) return {allowed:true,reason:"No put wall below",tp1,tp2,target:null};
-    if (entry-walls[0].price<GEX_BUFFER) return {allowed:false,reason:"SHORT blocked — at put wall $"+walls[0].price,tp1,tp2,target:walls[0].price};
+  if(direction==="SHORT"){
+    const walls=(gexCache.putWalls||[]).filter(w=>w.price<entry-GEX_BUFFER).sort((a,b)=>b.price-a.price);
+    if(!walls.length) return {allowed:true,reason:"No put wall below",tp1:entry-2,tp2:entry-4,target:null};
+    if(entry-walls[0].price<GEX_BUFFER) return {allowed:false,reason:"SHORT blocked — at put wall $"+walls[0].price,tp1:walls[0].price,tp2:walls[0].price,target:walls[0].price};
     return {allowed:true,reason:"SHORT → put wall $"+walls[0].price,tp1:walls[0].price,tp2:(walls[1]||walls[0]).price,target:walls[0].price};
   }
-  return {allowed:true,reason:"No GEX filter",tp1,tp2,target:null};
+  return {allowed:true,reason:"No GEX filter",tp1:entry,tp2:entry,target:null};
 }
 
 // ── Strike selection ──────────────────────────────────────────────────────────
-function selectStrike(spyEntry, direction) {
-  const atm = Math.round(spyEntry);
-  if (!gexCache) return {strike:atm,reason:"ATM (no GEX)",delta:0.50,otm:0};
-  const isPos = gexCache.regime==="positive";
-  if (direction==="LONG") {
-    const walls = (gexCache.callWalls||[]).filter(w=>w.price>spyEntry).sort((a,b)=>a.price-b.price);
-    if (!walls.length) return {strike:atm+1,reason:"OTM+1 (no call wall)",delta:0.45,otm:1};
-    const dist  = walls[0].price-spyEntry;
-    const otm   = Math.min(5,Math.max(1,Math.round(dist*(isPos?0.30:0.15))));
-    const strike= Math.min(atm+otm, walls[0].price-1);
-    return {strike:Math.round(strike),reason:(isPos?"positive":"negative")+" GEX → $"+otm+" OTM toward $"+walls[0].price,delta:Math.max(0.15,0.50-otm*0.08),otm};
+function selectStrike(price, direction) {
+  const atm=Math.round(price);
+  if(!gexCache) return {strike:atm,reason:"ATM (no GEX)",delta:0.50,otm:0};
+  const isPos=gexCache.regime==="positive";
+  if(direction==="LONG"){
+    const walls=(gexCache.callWalls||[]).filter(w=>w.price>price).sort((a,b)=>a.price-b.price);
+    if(!walls.length) return {strike:atm+1,reason:"OTM+1",delta:0.45,otm:1};
+    const dist=walls[0].price-price, otm=Math.min(5,Math.max(1,Math.round(dist*(isPos?0.30:0.15))));
+    return {strike:Math.min(Math.round(atm+otm),Math.round(walls[0].price-1)),reason:(isPos?"pos":"neg")+" GEX → "+otm+" OTM toward $"+walls[0].price,delta:Math.max(0.15,0.50-otm*0.08),otm};
   }
-  if (direction==="SHORT") {
-    const walls = (gexCache.putWalls||[]).filter(w=>w.price<spyEntry).sort((a,b)=>b.price-a.price);
-    if (!walls.length) return {strike:atm-1,reason:"OTM+1 (no put wall)",delta:0.45,otm:1};
-    const dist  = spyEntry-walls[0].price;
-    const otm   = Math.min(5,Math.max(1,Math.round(dist*(isPos?0.30:0.15))));
-    const strike= Math.max(atm-otm, walls[0].price+1);
-    return {strike:Math.round(strike),reason:(isPos?"positive":"negative")+" GEX → $"+otm+" OTM toward $"+walls[0].price,delta:Math.max(0.15,0.50-otm*0.08),otm};
+  if(direction==="SHORT"){
+    const walls=(gexCache.putWalls||[]).filter(w=>w.price<price).sort((a,b)=>b.price-a.price);
+    if(!walls.length) return {strike:atm-1,reason:"OTM+1",delta:0.45,otm:1};
+    const dist=price-walls[0].price, otm=Math.min(5,Math.max(1,Math.round(dist*(isPos?0.30:0.15))));
+    return {strike:Math.max(Math.round(atm-otm),Math.round(walls[0].price+1)),reason:(isPos?"pos":"neg")+" GEX → "+otm+" OTM toward $"+walls[0].price,delta:Math.max(0.15,0.50-otm*0.08),otm};
   }
   return {strike:atm,reason:"ATM fallback",delta:0.50,otm:0};
 }
 
-// ── OCC symbol ────────────────────────────────────────────────────────────────
-function buildSymbol(strike, right, date) {
-  const yy=String(date.getFullYear()).slice(2);
-  const mm=String(date.getMonth()+1).padStart(2,"0");
-  const dd=String(date.getDate()).padStart(2,"0");
+// ── OCC helpers ───────────────────────────────────────────────────────────────
+function buildSymbol(strike,right,date) {
+  const yy=String(date.getFullYear()).slice(2),mm=String(date.getMonth()+1).padStart(2,"0"),dd=String(date.getDate()).padStart(2,"0");
   return "SPY"+yy+mm+dd+right+String(Math.round(strike*1000)).padStart(8,"0");
 }
+function getETDate(){return new Date(new Date().toLocaleString("en-US",{timeZone:"America/New_York"}));}
+function getExpiry(){const d=getETDate();return d.getFullYear()+String(d.getMonth()+1).padStart(2,"0")+String(d.getDate()).padStart(2,"0");}
 
-function getETDate() {
-  return new Date(new Date().toLocaleString("en-US",{timeZone:"America/New_York"}));
+async function getMidPrice(symbol){
+  try{
+    const r=await fetch(ALPACA_DATA+"/v1beta1/options/snapshots?symbols="+symbol,{headers:aH()});
+    if(!r.ok) return null;
+    const d=await r.json(), s=(d.snapshots||{})[symbol];
+    if(!s||!s.latestQuote) return null;
+    const bid=parseFloat(s.latestQuote.bp||0),ask=parseFloat(s.latestQuote.ap||0);
+    return bid>0&&ask>0 ? parseFloat(((bid+ask)/2).toFixed(2)) : null;
+  }catch(_){return null;}
 }
 
-async function getMidPrice(symbol) {
-  try {
-    const r = await fetch(ALPACA_DATA+"/v1beta1/options/snapshots?symbols="+symbol, {headers:aHeaders()});
-    if (!r.ok) return null;
-    const d = await r.json();
-    const s = (d.snapshots||{})[symbol];
-    if (!s||!s.latestQuote) return null;
-    const bid=parseFloat(s.latestQuote.bp||0), ask=parseFloat(s.latestQuote.ap||0);
-    if (bid<=0||ask<=0) return null;
-    return parseFloat(((bid+ask)/2).toFixed(2));
-  } catch(_) { return null; }
+// ── Position close ────────────────────────────────────────────────────────────
+async function closePosition(symbol){
+  return await aDel("/v2/positions/"+encodeURIComponent(symbol));
 }
 
-// ── Execute signal ────────────────────────────────────────────────────────────
-async function executeSignal(id) {
-  const sig = signalHistory.find(s=>s.id===id);
-  if (!sig||sig.status!=="PENDING") return;
-  if (!ALPACA_KEY||!ALPACA_SECRET) { log("ERROR","No Alpaca keys"); return; }
+// ── Price monitor ─────────────────────────────────────────────────────────────
+function startMonitor(signal, indicators) {
+  log("MONITOR","Watching "+signal.optionSymbol+" | stop $"+signal.stopPrice+" | tp1 $"+signal.tp1Price);
+  const entryTime=Date.now();
 
-  sig.status = "EXECUTING";
-  broadcast({type:"signal_update",id,status:"EXECUTING"});
+  const iv=setInterval(async()=>{
+    if(!["FILLED"].includes(signal.status)){clearInterval(iv);return;}
+    try{
+      const pos=await aGet("/v2/positions/"+encodeURIComponent(signal.optionSymbol));
+      const price=parseFloat(pos.current_price||0);
+      if(!price) return;
+      const entry=signal.fillPrice||signal.midPrice;
+      const pct=((price-entry)/entry*100).toFixed(1);
+      log("MONITOR",signal.optionSymbol+" $"+price+" | P&L "+pct+"% | stop $"+signal.stopPrice+" | tp1 $"+signal.tp1Price);
 
-  try {
-    const date  = getETDate();
-    const si    = selectStrike(sig.spyEntry, sig.direction);
-    sig.strike  = si.strike;
-    sig.strikeReason   = si.reason;
-    sig.estimatedDelta = si.delta;
+      if(price>=signal.tp1Price){
+        clearInterval(iv);
+        log("TP1","Hit $"+price+" >= $"+signal.tp1Price);
+        await closePosition(signal.optionSymbol);
+        const pnl=(price-entry)*100*signal.contracts;
+        signal.status="TP1_HIT"; signal.closePnl=pnl; signal.closePrice=price;
+        signal.closeReason="TP1_HIT"; signal.durationMin=((Date.now()-entryTime)/60000).toFixed(1);
+        signal.outcome="WIN";
+        sessionPnL+=pnl;
+        broadcast({type:"signal_update",id:signal.id,status:"TP1_HIT",pnl});
+        saveTradeToDB(signal,signal._dbId,indicators);
+        return;
+      }
+      if(price<=signal.stopPrice){
+        clearInterval(iv);
+        log("STOP","Hit $"+price+" <= $"+signal.stopPrice);
+        await closePosition(signal.optionSymbol);
+        const pnl=(price-entry)*100*signal.contracts;
+        signal.status="STOPPED"; signal.closePnl=pnl; signal.closePrice=price;
+        signal.closeReason="STOP_HIT"; signal.durationMin=((Date.now()-entryTime)/60000).toFixed(1);
+        signal.outcome=pnl>=0?"WIN":"LOSS";
+        sessionPnL+=pnl; dailyLoss+=Math.abs(Math.min(0,pnl));
+        broadcast({type:"signal_update",id:signal.id,status:"STOPPED",pnl});
+        saveTradeToDB(signal,signal._dbId,indicators);
+        return;
+      }
+    }catch(e){
+      if(e.message.includes("404")||e.message.includes("40410000")){
+        clearInterval(iv);
+        log("MONITOR",signal.optionSymbol+" expired/closed");
+        signal.status="EOD_CLOSED"; signal.closeReason="EXPIRED";
+        signal.durationMin=((Date.now()-entryTime)/60000).toFixed(1);
+        signal.outcome="LOSS";
+        broadcast({type:"signal_update",id:signal.id,status:"EOD_CLOSED"});
+        saveTradeToDB(signal,signal._dbId,indicators);
+      }
+    }
+  },30000);
+  signal._monitorInterval=iv;
+}
 
-    log("STRIKE",sig.direction+" SPY | ATM $"+Math.round(sig.spyEntry)+" | Selected $"+si.strike+" ("+si.otm+" OTM) | "+si.reason);
+// ── Execute trade ─────────────────────────────────────────────────────────────
+async function executeTrade(direction, price, indicators, gexResult) {
+  if(!ALPACA_KEY||!ALPACA_SECRET){log("ERROR","No Alpaca keys");return;}
+  if(tradesDay>=MAX_TRADES_DAY){log("GUARD","Max "+MAX_TRADES_DAY+" trades/day reached");return;}
+  if(dailyLoss>=ACCOUNT_SIZE*MAX_DAILY_LOSS){log("GUARD","Daily loss limit reached");return;}
 
-    const symbol = buildSymbol(si.strike, sig.right, date);
+  const right = direction==="LONG"?"C":"P";
+  const date  = getETDate();
+  const si    = selectStrike(price, direction);
+
+  const sig = {
+    id:          Date.now(),
+    time:        new Date().toLocaleTimeString("en-US",{hour12:false,timeZone:"America/New_York"}),
+    symbol:      "SPY", direction, right,
+    spyEntry:    price, strike:si.strike,
+    strikeReason:si.reason, estimatedDelta:si.delta,
+    stop:        indicators.orbLow,
+    tp1:         gexResult.tp1, tp2:gexResult.tp2,
+    gexTarget:   gexResult.target, gexReason:gexResult.reason,
+    expiry:      getExpiry(), riskBudget:getRiskBudget(),
+    contracts:null, midPrice:null, totalCost:null,
+    fillPrice:null, stopPrice:null, tp1Price:null,
+    optionSymbol:null, closePnl:null,
+    closePrice:null, closeReason:null,
+    durationMin:null, outcome:null,
+    trigger:"Internal Signal Engine",
+    confidence:indicators.strength||"MEDIUM",
+    status:"PENDING",
+    indicators: {...indicators},
+    gexSnapshot: gexCache?{callWalls:(gexCache.callWalls||[]).slice(0,3),putWalls:(gexCache.putWalls||[]).slice(0,3),gammaFlip:gexCache.gammaFlip,regime:gexCache.regime}:null,
+  };
+
+  signalHistory.unshift(sig);
+  broadcast({type:"new_signal",signal:sig});
+  log("SIGNAL",direction+" SPY $"+price+" | strike $"+si.strike+" | "+gexResult.reason);
+
+  // Save to DB
+  const dbResult = saveSignalToDB(sig, indicators, true, null);
+  sig._dbId = dbResult?.lastInsertRowid||null;
+
+  sig.status="EXECUTING";
+  broadcast({type:"signal_update",id:sig.id,status:"EXECUTING"});
+
+  try{
+    const symbol = buildSymbol(si.strike, right, date);
+    if(!/^SPY\d{6}[CP]\d{8}$/.test(symbol)) throw new Error("SAFETY: Bad OCC symbol: "+symbol);
     sig.optionSymbol = symbol;
 
-    // Safety: verify OCC format
-    if (!/^SPY\d{6}[CP]\d{8}$/.test(symbol)) throw new Error("SAFETY: Bad OCC symbol: "+symbol);
-
-    // Get mid price
     let mid = await getMidPrice(symbol);
-    if (!mid || mid < 0.05 || mid > 50) {
-      // Try ATM fallback
-      const atmSymbol = buildSymbol(Math.round(sig.spyEntry), sig.right, date);
-      mid = await getMidPrice(atmSymbol);
-      if (!mid) throw new Error("No valid option price — market may be closed");
-      sig.optionSymbol = atmSymbol;
-      sig.strike = Math.round(sig.spyEntry);
-      sig.strikeReason = "ATM fallback (no price for OTM)";
-      log("STRIKE","Fell back to ATM $"+sig.strike);
+    if(!mid||mid<0.05||mid>50){
+      const atm = buildSymbol(Math.round(price),right,date);
+      mid = await getMidPrice(atm);
+      if(!mid) throw new Error("No valid option price — market closed?");
+      sig.optionSymbol=atm; sig.strike=Math.round(price); sig.strikeReason="ATM fallback";
     }
 
-    const contracts = calcContracts(mid);
-    const totalCost = parseFloat((mid*100*contracts).toFixed(2));
-
-    // Safety checks
-    if (contracts > 50)              throw new Error("SAFETY: "+contracts+" contracts > max 50");
-    if (totalCost > ACCOUNT_SIZE*0.10) throw new Error("SAFETY: $"+totalCost+" > 10% of account");
+    const contracts=calcContracts(mid);
+    const totalCost=parseFloat((mid*100*contracts).toFixed(2));
+    if(contracts>50)               throw new Error("SAFETY: "+contracts+" contracts > 50");
+    if(totalCost>ACCOUNT_SIZE*0.10) throw new Error("SAFETY: $"+totalCost+" > 10% of account");
 
     log("SAFETY","Guards passed — "+sig.optionSymbol+" x"+contracts+" @ $"+mid+" = $"+totalCost);
 
-    // Place buy order
-    const order = await aPost("/v2/orders", {
-      symbol:          sig.optionSymbol,
-      qty:             String(contracts),
-      side:            "buy",
-      type:            "limit",
-      limit_price:     String(mid),
-      time_in_force:   "day",
-      client_order_id: "spxcmd_"+sig.id,
+    const order=await aPost("/v2/orders",{
+      symbol:sig.optionSymbol, qty:String(contracts),
+      side:"buy", type:"limit", limit_price:String(mid),
+      time_in_force:"day", client_order_id:"spxcmd_"+sig.id,
     });
 
-    sig.contracts  = contracts;
-    sig.midPrice   = mid;
-    sig.totalCost  = totalCost;
-    sig.status     = "SENT";
-    broadcast({type:"signal_update",id,status:"SENT",optionSymbol:sig.optionSymbol,
-      contracts,midPrice:mid,totalCost,strike:sig.strike,strikeReason:sig.strikeReason});
+    sig.contracts=contracts; sig.midPrice=mid; sig.totalCost=totalCost;
+    sig.status="SENT";
+    broadcast({type:"signal_update",id:sig.id,status:"SENT",optionSymbol:sig.optionSymbol,contracts,midPrice:mid,totalCost});
     log("ALPACA","Order: "+order.id+" | "+sig.optionSymbol+" x"+contracts+" @ $"+mid);
 
-    // Poll for fill
-    const filled = await pollFill(order.id, 60000);
-    if (!filled) { log("ORDER","Unfilled after 60s"); return; }
+    const filled=await pollFill(order.id,60000);
+    if(!filled){log("ORDER","Unfilled after 60s");sig.status="PENDING";return;}
 
-    sig.fillPrice = parseFloat(filled.filled_avg_price||mid);
-    sig.status    = "FILLED";
+    sig.fillPrice=parseFloat(filled.filled_avg_price||mid);
+    const stop=parseFloat((sig.fillPrice*(1-PREMIUM_STOP_PCT)).toFixed(2));
+    const tp1=calcTP1(sig.fillPrice,si.delta);
+    sig.stopPrice=stop; sig.tp1Price=tp1; sig.status="FILLED";
+    tradesDay++;
 
-    // Calculate exits
-    const stop = parseFloat((sig.fillPrice*(1-PREMIUM_STOP_PCT)).toFixed(2));
-    const tp1  = calcTP1(sig.fillPrice, sig.estimatedDelta);
-    sig.stopPrice = stop;
-    sig.tp1Price  = tp1;
+    broadcast({type:"signal_update",id:sig.id,status:"FILLED",fillPrice:sig.fillPrice,stopPrice:stop,tp1Price:tp1});
+    log("FILL","Filled @ $"+sig.fillPrice+" | stop $"+stop+" | tp1 $"+tp1+" | R:R "+((tp1-sig.fillPrice)/(sig.fillPrice-stop)).toFixed(1)+":1");
+    log("EXIT","Price monitor active — exits via DELETE /v2/positions (no sell orders)");
 
-    broadcast({type:"signal_update",id,status:"FILLED",fillPrice:sig.fillPrice,stopPrice:stop,tp1Price:tp1});
-    log("FILL","Filled @ $"+sig.fillPrice+" | stop $"+stop+" ("+PREMIUM_STOP_PCT*100+"%) | tp1 $"+tp1+" ("+TP1_MULTIPLIER+"x) | R:R "+((tp1-sig.fillPrice)/(sig.fillPrice-stop)).toFixed(1)+":1");
-    log("EXIT","Using price monitor — no sell orders placed (avoids uncovered option errors)");
-
-    // Start price monitor — handles all exits
-    startMonitor(sig);
-
-  } catch(e) {
-    sig.status = "PENDING";
-    broadcast({type:"signal_update",id,status:"PENDING"});
-    log("ERROR","Execute failed #"+id+": "+e.message);
+    startMonitor(sig, indicators);
+  }catch(e){
+    sig.status="PENDING";
+    broadcast({type:"signal_update",id:sig.id,status:"PENDING"});
+    log("ERROR","Execute failed: "+e.message);
   }
 }
 
-async function pollFill(orderId, maxMs) {
-  const start = Date.now();
-  while (Date.now()-start < maxMs) {
-    const o = await aGet("/v2/orders/"+orderId);
-    if (o.status==="filled") return o;
-    if (["cancelled","expired","rejected"].includes(o.status)) throw new Error("Order "+orderId+" "+o.status);
+async function pollFill(orderId,maxMs){
+  const start=Date.now();
+  while(Date.now()-start<maxMs){
+    const o=await aGet("/v2/orders/"+orderId);
+    if(o.status==="filled") return o;
+    if(["cancelled","expired","rejected"].includes(o.status)) throw new Error("Order "+o.status);
     await new Promise(r=>setTimeout(r,2000));
   }
   return null;
 }
 
-// ── EOD force close ───────────────────────────────────────────────────────────
-async function forceCloseAll() {
-  const active = signalHistory.filter(s=>["FILLED","SENT"].includes(s.status));
-  if (!active.length) { log("EOD","No open positions"); return; }
-  log("EOD","Force closing "+active.length+" position(s)");
+// ── Signal Engine ─────────────────────────────────────────────────────────────
+let lastSignalBar = null; // prevent duplicate signals on same bar
 
-  for (const sig of active) {
-    // Stop monitor
-    if (sig._monitorInterval) { clearInterval(sig._monitorInterval); }
-    try {
-      const r = await closePosition(sig.optionSymbol);
+async function runSignalEngine() {
+  if(scanActive) return;
+  const now=new Date(new Date().toLocaleString("en-US",{timeZone:"America/New_York"}));
+  const h=now.getHours(),m=now.getMinutes();
+
+  // Only run during market hours, after ORB period
+  if(!((h>9||(h===9&&m>=45))&&h<15||(h===15&&m<=44))) return;
+
+  scanActive=true;
+  try{
+    const bars=await getSPYBars();
+    if(!bars.length){scanActive=false;return;}
+
+    // Build ORB if not built yet
+    buildORB(bars);
+    if(!orbState?.built){log("SCAN","ORB not built yet — waiting");scanActive=false;return;}
+
+    // Get latest bar
+    const latestBar=bars[bars.length-1];
+    if(lastBarTime===latestBar.t){scanActive=false;return;} // already processed this bar
+    lastBarTime=latestBar.t;
+
+    // Get live quote
+    const currentPrice=await getSPYQuote()||latestBar.c;
+    const ind=calcIndicators(bars,currentPrice);
+    if(!ind){scanActive=false;return;}
+
+    // Check if already in a trade
+    const activeTrades=signalHistory.filter(s=>["FILLED","SENT","EXECUTING"].includes(s.status));
+    if(activeTrades.length>0){
+      log("SCAN","Bar "+latestBar.t.slice(11,16)+" | SPY $"+currentPrice.toFixed(2)+" | Position open — skipping");
+      scanActive=false;return;
+    }
+
+    log("SCAN","Bar "+latestBar.t.slice(11,16)+
+      " | SPY $"+currentPrice.toFixed(2)+
+      " | VWAP $"+(ind.vwap||0).toFixed(2)+
+      " | RSI "+(ind.rsi||0)+
+      " | ORB H:$"+ind.orbHigh+" L:$"+ind.orbLow+
+      " | Break: "+(ind.orbBreak||"none")+
+      " | Mode: "+SIGNAL_MODE);
+
+    // Evaluate signal
+    const eval_result=evaluateSignal({...ind,strength:null});
+
+    if(!eval_result.fire){
+      log("SCAN","No signal — "+eval_result.reason);
+      // Still save to DB for analysis
+      saveSignalToDB({direction:ind.orbBreak||"NONE",spyEntry:currentPrice,gexTarget:null,strength:"WEAK"},{...ind},false,eval_result.reason);
+      scanActive=false;return;
+    }
+
+    // Apply GEX filter
+    const gexResult=applyGEX(eval_result.direction,currentPrice);
+    if(!gexResult.allowed){
+      log("GEX","Signal BLOCKED — "+gexResult.reason);
+      saveSignalToDB({direction:eval_result.direction,spyEntry:currentPrice,gexTarget:gexResult.target,strength:eval_result.strength},{...ind},false,"GEX: "+gexResult.reason);
+      scanActive=false;return;
+    }
+
+    log("SIGNAL","FIRED ✓ | "+eval_result.direction+" | "+eval_result.reason+" | GEX: "+gexResult.reason);
+    broadcast({type:"signal_fired",direction:eval_result.direction,price:currentPrice,reason:eval_result.reason});
+
+    await executeTrade(eval_result.direction, currentPrice, {...ind,strength:eval_result.strength}, gexResult);
+
+  }catch(e){ log("SCAN ERR","runSignalEngine: "+e.message); }
+  scanActive=false;
+}
+
+// ── EOD force close ───────────────────────────────────────────────────────────
+async function forceCloseAll(){
+  const active=signalHistory.filter(s=>["FILLED","SENT"].includes(s.status));
+  if(!active.length){log("EOD","No open positions");return;}
+  log("EOD","Force closing "+active.length+" position(s)");
+  for(const sig of active){
+    if(sig._monitorInterval) clearInterval(sig._monitorInterval);
+    try{
+      const r=await closePosition(sig.optionSymbol);
       log("EOD","Closed "+sig.optionSymbol+" → "+r.status);
-      if (r.ok) {
-        sig.status = "EOD_CLOSED";
+      if(r.ok){
+        sig.status="EOD_CLOSED"; sig.closeReason="EOD_FORCE_CLOSE"; sig.outcome="UNKNOWN";
         broadcast({type:"signal_update",id:sig.id,status:"EOD_CLOSED"});
-        recordTrade(sig,"EOD_FORCE_CLOSE");
-      } else {
-        log("EOD ERR","Close failed: "+JSON.stringify(r.data));
+        saveTradeToDB(sig,sig._dbId,sig.indicators||{});
       }
-    } catch(e) { log("EOD ERR",sig.optionSymbol+": "+e.message); }
+    }catch(e){log("EOD ERR",sig.optionSymbol+": "+e.message);}
   }
 }
 
 // ── Account check ─────────────────────────────────────────────────────────────
-async function checkAccount() {
-  if (!ALPACA_KEY||!ALPACA_SECRET) { log("WARN","No Alpaca keys set"); return; }
-  try {
-    const a = await aGet("/v2/account");
+async function checkAccount(){
+  if(!ALPACA_KEY||!ALPACA_SECRET){log("WARN","No Alpaca keys");return;}
+  try{
+    const a=await aGet("/v2/account");
     log("ALPACA","Connected — "+(IS_PAPER?"PAPER":"LIVE")+
       " | Balance: $"+parseFloat(a.portfolio_value).toLocaleString()+
-      " | Buying power: $"+parseFloat(a.buying_power).toLocaleString()+
-      " | Options level: "+( a.options_approved_level||"unknown"));
+      " | Options: Level "+(a.options_approved_level||"?"));
     broadcast({type:"alpaca_status",connected:true,paper:IS_PAPER,balance:a.portfolio_value});
-  } catch(e) {
-    log("ALPACA ERR",e.message);
-    broadcast({type:"alpaca_status",connected:false});
-  }
+  }catch(e){log("ALPACA ERR",e.message);broadcast({type:"alpaca_status",connected:false});}
 }
 
 // ── Express ───────────────────────────────────────────────────────────────────
-const app = express();
+const app=express();
 app.use(cors({origin:"*",methods:["GET","POST","DELETE","OPTIONS"],allowedHeaders:["Content-Type"]}));
 app.options("*",cors());
 app.use(express.json());
 
-// Health
-app.get("/", (req,res)=>res.json({
-  service:"SPX COMMAND",status:"running",version:"8.0-clean",
-  mode:IS_PAPER?"PAPER":"LIVE",time:new Date().toISOString(),
+app.get("/",(req,res)=>res.json({
+  service:"SPX COMMAND",version:"9.0-autonomous",status:"running",
+  mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
+  noTradingViewRequired:true,
 }));
 
-// Dashboard
 app.get("/dashboard",(req,res)=>{
-  const f = path.join(__dirname,"dashboard.html");
-  if (fs.existsSync(f)) res.sendFile(f);
-  else res.status(404).send("Upload dashboard.html to Railway");
+  const f=path.join(__dirname,"dashboard.html");
+  if(fs.existsSync(f)) res.sendFile(f);
+  else res.status(404).send("Upload dashboard.html");
 });
 
-// SSE
 app.get("/events",(req,res)=>{
   res.setHeader("Content-Type","text/event-stream");
   res.setHeader("Cache-Control","no-cache");
@@ -563,202 +890,194 @@ app.get("/events",(req,res)=>{
   sseClients.push(res);
   res.write("data: "+JSON.stringify({
     type:"init",sessionPnL,dailyLoss,signals:signalHistory,
-    gex:gexCache,expiry:getETDate().toISOString().slice(0,10).replace(/-/g,""),
-    riskBudget:getRiskBudget(),logs:logHistory,
+    gex:gexCache,expiry:getExpiry(),riskBudget:getRiskBudget(),
+    logs:logHistory,orb:orbState,signalMode:SIGNAL_MODE,
   })+"\n\n");
-  const ping=setInterval(()=>{ try{res.write(": ping\n\n");}catch(_){clearInterval(ping);} },30000);
-  req.on("close",()=>{ clearInterval(ping); sseClients=sseClients.filter(c=>c!==res); });
+  const ping=setInterval(()=>{try{res.write(": ping\n\n");}catch(_){clearInterval(ping);}},30000);
+  req.on("close",()=>{clearInterval(ping);sseClients=sseClients.filter(c=>c!==res);});
 });
 
-// GEX
 app.get("/gex",async(req,res)=>{
-  if (req.query.refresh==="true") { const g=await getGEX(true); return res.json(g||{error:"GEX unavailable"}); }
-  res.json(gexCache||{error:"Not yet calculated",hint:"?refresh=true"});
+  if(req.query.refresh==="true"){const g=await getGEX(true);return res.json(g||{error:"GEX unavailable"});}
+  res.json(gexCache||{error:"Not calculated yet",hint:"?refresh=true"});
 });
 
-// Webhook
+// Manual webhook still supported (for testing)
 app.post("/webhook",async(req,res)=>{
-  const raw = req.body;
-  log("WEBHOOK",JSON.stringify(raw));
-
-  const req_fields = ["symbol","direction","entry","stop","tp1","tp2"];
-  const missing    = req_fields.filter(k=>raw[k]==null);
-  if (missing.length) return res.status(400).json({error:"Missing: "+missing.join(",")});
-
-  if (dailyLoss >= ACCOUNT_SIZE*MAX_DAILY_LOSS) {
-    log("GUARD","Daily loss limit reached — signal rejected");
-    return res.json({status:"rejected",reason:"daily_loss_limit"});
-  }
-
-  const entry     = parseFloat(raw.entry);
-  const stop      = parseFloat(raw.stop);
-  const tp1       = parseFloat(raw.tp1);
-  const tp2       = parseFloat(raw.tp2);
-  const direction = raw.direction.toUpperCase();
-  const right     = direction==="LONG" ? "C" : "P";
-  const gexResult = applyGEX(direction, entry, tp1, tp2);
-
-  if (!gexResult.allowed) {
-    log("GEX","Signal BLOCKED — "+gexResult.reason);
-    broadcast({type:"signal_blocked",reason:gexResult.reason});
-    return res.json({status:"blocked",reason:gexResult.reason});
-  }
-  log("GEX","Signal ALLOWED — "+gexResult.reason);
-
-  const sig = {
-    id:          Date.now(),
-    time:        new Date().toLocaleTimeString("en-US",{hour12:false,timeZone:"America/New_York"}),
-    symbol:      "SPY", direction, right,
-    spyEntry:    entry,
-    strike:      Math.round(entry),
-    stop, tp1:gexResult.tp1, tp2:gexResult.tp2,
-    gexTarget:   gexResult.target,
-    gexReason:   gexResult.reason,
-    expiry:      (()=>{ const d=getETDate(); return d.getFullYear()+String(d.getMonth()+1).padStart(2,"0")+String(d.getDate()).padStart(2,"0"); })(),
-    riskBudget:  getRiskBudget(),
-    contracts:   null, midPrice:null, totalCost:null,
-    fillPrice:   null, stopPrice:null, tp1Price:null,
-    optionSymbol:null, strikeReason:null, estimatedDelta:null,
-    closePnl:    null, trailedToBreakeven:false,
-    trigger:     raw.trigger||"TradingView Alert",
-    confidence:  raw.confidence||"MEDIUM",
-    status:      "PENDING",
-    gexSnapshot: gexCache ? {callWalls:(gexCache.callWalls||[]).slice(0,3),putWalls:(gexCache.putWalls||[]).slice(0,3),gammaFlip:gexCache.gammaFlip,regime:gexCache.regime} : null,
-  };
-
-  signalHistory.unshift(sig);
-  broadcast({type:"new_signal",signal:sig});
-  log("SIGNAL",direction+" SPY | entry $"+entry+" | tp1 $"+gexResult.tp1+" | risk $"+getRiskBudget());
-
-  res.json({status:"received",signal:sig});
-  executeSignal(sig.id);
+  const raw=req.body;
+  log("WEBHOOK","Manual signal: "+JSON.stringify(raw));
+  const entry=parseFloat(raw.entry||0);
+  const dir=(raw.direction||"LONG").toUpperCase();
+  if(!entry) return res.status(400).json({error:"entry required"});
+  const gexResult=applyGEX(dir,entry);
+  if(!gexResult.allowed) return res.json({status:"blocked",reason:gexResult.reason});
+  const ind={orbHigh:entry+1,orbLow:entry-1,vwap:entry,rsi:50,ema9:entry,ema21:entry,orbBreak:dir,strength:"MANUAL"};
+  await executeTrade(dir,entry,ind,gexResult);
+  res.json({status:"received"});
 });
 
-// Manual execute
-app.post("/execute/:id",(req,res)=>{
-  const id  = parseInt(req.params.id);
-  const sig = signalHistory.find(s=>s.id===id);
-  if (!sig)                    return res.status(404).json({error:"Not found"});
-  if (sig.status!=="PENDING")  return res.status(400).json({error:"Not pending: "+sig.status});
-  res.json({status:"executing",id});
-  executeSignal(id);
-});
-
-// Cancel
 app.post("/cancel/:id",async(req,res)=>{
-  const id  = parseInt(req.params.id);
-  const sig = signalHistory.find(s=>s.id===id);
-  if (!sig) return res.status(404).json({error:"Not found"});
-  if (sig._monitorInterval) clearInterval(sig._monitorInterval);
-  if (sig.optionSymbol && ["FILLED","SENT"].includes(sig.status)) {
-    try { await closePosition(sig.optionSymbol); } catch(_){}
+  const id=parseInt(req.params.id);
+  const sig=signalHistory.find(s=>s.id===id);
+  if(!sig) return res.status(404).json({error:"Not found"});
+  if(sig._monitorInterval) clearInterval(sig._monitorInterval);
+  if(sig.optionSymbol&&["FILLED","SENT"].includes(sig.status)){
+    try{await closePosition(sig.optionSymbol);}catch(_){}
   }
-  sig.status = "CANCELLED";
+  sig.status="CANCELLED";
   broadcast({type:"signal_update",id,status:"CANCELLED"});
-  log("CANCEL","Signal #"+id+" cancelled");
   res.json({status:"cancelled"});
 });
 
-// Close all
-app.post("/closeall",async(req,res)=>{ await forceCloseAll(); res.json({status:"done"}); });
+app.post("/closeall",async(req,res)=>{await forceCloseAll();res.json({status:"done"});});
 
-// Close specific position
 app.post("/closeposition/:symbol",async(req,res)=>{
-  const symbol = req.params.symbol;
-  const r = await closePosition(symbol);
-  log("MANUAL","Closed "+symbol+" → "+r.status);
+  const r=await closePosition(req.params.symbol);
+  log("MANUAL","Closed "+req.params.symbol+" → "+r.status);
   res.json({status:r.ok?"closed":"failed",result:r.data});
 });
 
-// Journal
-app.get("/journal",(req,res)=>res.json(loadJournal()));
-app.get("/journal/csv",(req,res)=>{
-  const j = loadJournal();
-  if (!j.trades.length) return res.json({error:"No trades"});
-  const h = Object.keys(j.trades[0]).join(",");
-  const r = j.trades.map(t=>Object.values(t).map(v=>typeof v==="string"&&v.includes(",")?"\""+v+"\"":v).join(",")).join("\n");
+// DB query endpoints for data mining
+app.get("/db/trades",(req,res)=>{
+  const limit=parseInt(req.query.limit||"100");
+  const rows=dbAll("SELECT * FROM trades ORDER BY id DESC LIMIT ?",[ limit]);
+  res.json({count:rows.length,trades:rows});
+});
+
+app.get("/db/signals",(req,res)=>{
+  const limit=parseInt(req.query.limit||"100");
+  const rows=dbAll("SELECT * FROM signals ORDER BY id DESC LIMIT ?",[limit]);
+  res.json({count:rows.length,signals:rows});
+});
+
+app.get("/db/gex",(req,res)=>{
+  const rows=dbAll("SELECT * FROM gex_snapshots ORDER BY id DESC LIMIT 50",[]);
+  res.json({count:rows.length,snapshots:rows});
+});
+
+app.get("/db/stats",(req,res)=>{
+  const stats=dbAll(`
+    SELECT
+      COUNT(*) as total_trades,
+      SUM(CASE WHEN outcome='WIN' THEN 1 ELSE 0 END) as wins,
+      SUM(CASE WHEN outcome='LOSS' THEN 1 ELSE 0 END) as losses,
+      ROUND(AVG(CASE WHEN outcome='WIN' THEN pnl END),2) as avg_win,
+      ROUND(AVG(CASE WHEN outcome='LOSS' THEN pnl END),2) as avg_loss,
+      ROUND(SUM(pnl),2) as total_pnl,
+      ROUND(AVG(pnl_pct),2) as avg_pnl_pct,
+      ROUND(AVG(duration_min),1) as avg_duration_min,
+      MAX(pnl) as best_trade,
+      MIN(pnl) as worst_trade
+    FROM trades WHERE close_reason IS NOT NULL
+  `,[]);
+  const byMode=dbAll("SELECT signal_mode,outcome,COUNT(*) as count FROM trades GROUP BY signal_mode,outcome",[]);
+  const byReason=dbAll("SELECT close_reason,COUNT(*) as count,ROUND(SUM(pnl),2) as total_pnl FROM trades GROUP BY close_reason",[]);
+  res.json({stats:stats[0]||{},byMode,byReason});
+});
+
+app.get("/db/export",(req,res)=>{
+  const trades=dbAll("SELECT * FROM trades ORDER BY id DESC",[]);
+  if(!trades.length) return res.json({error:"No trades"});
+  const h=Object.keys(trades[0]).join(",");
+  const r=trades.map(t=>Object.values(t).map(v=>typeof v==="string"&&v.includes(",")?"\""+v+"\"":v||"").join(",")).join("\n");
   res.setHeader("Content-Type","text/csv");
-  res.setHeader("Content-Disposition","attachment;filename=spx_command_trades.csv");
+  res.setHeader("Content-Disposition","attachment;filename=spx_trades.csv");
   res.send(h+"\n"+r);
 });
 
-// Sync
-app.get("/sync",async(req,res)=>{
-  // Monitor handles exits — sync just reports status
-  const active = signalHistory.filter(s=>["FILLED"].includes(s.status));
-  res.json({active:active.length,monitoring:active.filter(s=>s._monitorInterval).length});
-});
-
-// Status
 app.get("/status",(req,res)=>{
-  const j = loadJournal();
+  const stats=dbAll("SELECT COUNT(*) as t,SUM(CASE WHEN outcome='WIN' THEN 1 ELSE 0 END) as w,ROUND(SUM(pnl),2) as p FROM trades WHERE close_reason IS NOT NULL",[]);
+  const s=stats[0]||{};
   res.json({
-    version:"8.0-clean", mode:IS_PAPER?"PAPER":"LIVE", broker:"Alpaca",
-    underlying:"SPY (long options)", exitStrategy:"price-monitor + DELETE position",
-    riskMode:"Fixed $"+getRiskBudget()+" per trade", riskBudget:"$"+getRiskBudget(),
-    tp1Config:{ mode:TP1_FIXED_MOVE>0?"fixed-move":"multiplier", value:TP1_FIXED_MOVE>0?"$"+TP1_FIXED_MOVE+" move":TP1_MULTIPLIER+"x premium" },
+    version:"9.0-autonomous", mode:IS_PAPER?"PAPER":"LIVE",
+    signalMode:SIGNAL_MODE, noTradingView:true,
+    exitStrategy:"price-monitor + DELETE /v2/positions",
+    riskBudget:"$"+getRiskBudget(),
+    tp1Config:{mode:TP1_FIXED_MOVE>0?"fixed":"multiplier",value:TP1_FIXED_MOVE>0?"$"+TP1_FIXED_MOVE:TP1_MULTIPLIER+"x"},
     sessionPnL:sessionPnL.toFixed(2), dailyLoss:dailyLoss.toFixed(2),
     dailyLossLimit:(ACCOUNT_SIZE*MAX_DAILY_LOSS).toFixed(2),
-    expiry:(()=>{ const d=getETDate(); return d.getFullYear()+String(d.getMonth()+1).padStart(2,"0")+String(d.getDate()).padStart(2,"0"); })(),
-    gex: gexCache ? {regime:gexCache.regime,gammaFlip:gexCache.gammaFlip,netGex:gexCache.netGex,callWalls:(gexCache.callWalls||[]).slice(0,3).map(w=>"$"+w.price),putWalls:(gexCache.putWalls||[]).slice(0,3).map(w=>"$"+w.price),updatedAt:gexCache.updatedAt} : null,
-    journal:{ totalTrades:j.stats.totalTrades||0, wins:j.stats.wins||0, losses:j.stats.losses||0, winRate:j.stats.winRate||0, totalPnL:j.stats.totalPnL||0 },
-    signals:{ today:signalHistory.length, pending:signalHistory.filter(s=>s.status==="PENDING").length, active:signalHistory.filter(s=>["SENT","FILLED","EXECUTING"].includes(s.status)).length, closed:signalHistory.filter(s=>["STOPPED","EOD_CLOSED","CANCELLED","TP1_HIT"].includes(s.status)).length },
+    tradesDay:tradesDay+"/"+MAX_TRADES_DAY,
+    orb:orbState,
+    gex:gexCache?{regime:gexCache.regime,gammaFlip:gexCache.gammaFlip,callWalls:(gexCache.callWalls||[]).slice(0,3).map(w=>"$"+w.price),putWalls:(gexCache.putWalls||[]).slice(0,3).map(w=>"$"+w.price)}:null,
+    signals:{today:signalHistory.length,active:signalHistory.filter(s=>["FILLED","SENT"].includes(s.status)).length},
+    db:{totalTrades:s.t||0,wins:s.w||0,totalPnL:s.p||0,winRate:s.t>0?((s.w/s.t)*100).toFixed(1)+"%":"—"},
   });
 });
 
 // ── Schedulers ────────────────────────────────────────────────────────────────
 
+// Signal engine: runs on 5-min bar close (every minute, fires when new bar available)
+setInterval(async()=>{
+  const now=new Date(new Date().toLocaleString("en-US",{timeZone:"America/New_York"}));
+  const h=now.getHours(),m=now.getMinutes();
+  // 5-min bars close at :00, :05, :10, :15, :20, :25, :30, :35, :40, :45, :50, :55
+  if(m%5===0){
+    await runSignalEngine();
+  }
+  // Reset daily counters at market open
+  if(h===9&&m===30) {
+    tradesDay=0; sessionPnL=0; dailyLoss=0;
+    orbState=null; lastBarTime=null;
+    log("DAY","New trading day — counters reset");
+  }
+},60000);
+
 // GEX scheduler
 setInterval(async()=>{
-  const now   = new Date(new Date().toLocaleString("en-US",{timeZone:"America/New_York"}));
-  const h=now.getHours(), m=now.getMinutes();
-  const today = now.toLocaleDateString("en-CA");
-  if (!((h>9||(h===9&&m>=25))&&h<16)) return;
-  const key = today+"_"+h+"_"+m;
-  if (GEX_SCHEDULE.some(s=>s.h===h&&s.m===m)&&!gexFired.has(key)) {
+  const now=new Date(new Date().toLocaleString("en-US",{timeZone:"America/New_York"}));
+  const h=now.getHours(),m=now.getMinutes();
+  const today=now.toLocaleDateString("en-CA");
+  if(!((h>9||(h===9&&m>=25))&&h<16)) return;
+  const key=today+"_"+h+"_"+m;
+  if(GEX_SCHEDULE.some(s=>s.h===h&&s.m===m)&&!gexFired.has(key)){
     gexFired.add(key);
-    log("GEX","Scheduled refresh at "+String(h).padStart(2,"0")+":"+String(m).padStart(2,"0")+" ET");
+    log("GEX","Scheduled refresh "+String(h).padStart(2,"0")+":"+String(m).padStart(2,"0"));
     await getGEX(true);
   }
 },60000);
 
 // EOD 3:45 PM
 setInterval(async()=>{
-  const now = new Date(new Date().toLocaleString("en-US",{timeZone:"America/New_York"}));
-  const h=now.getHours(), m=now.getMinutes();
-  if (h===15&&m===45) {
-    const key = now.toLocaleDateString("en-CA")+"_eod";
-    if (!gexFired.has(key)) { gexFired.add(key); await forceCloseAll(); }
+  const now=new Date(new Date().toLocaleString("en-US",{timeZone:"America/New_York"}));
+  const h=now.getHours(),m=now.getMinutes();
+  if(h===15&&m===45){
+    const key=now.toLocaleDateString("en-CA")+"_eod";
+    if(!gexFired.has(key)){gexFired.add(key);await forceCloseAll();}
   }
 },60000);
 
 // ── Start ─────────────────────────────────────────────────────────────────────
-app.listen(PORT, async()=>{
+app.listen(PORT,async()=>{
   console.log(`
  ╔══════════════════════════════════════════════════════╗
- ║   SPX COMMAND v8 · Clean Build                      ║
+ ║   SPX COMMAND v9 · Autonomous · No TradingView      ║
  ╠══════════════════════════════════════════════════════╣
- ║  Health    : GET  /                                  ║
- ║  Dashboard : GET  /dashboard                         ║
- ║  Webhook   : POST /webhook                           ║
- ║  Events    : GET  /events (SSE)                      ║
- ║  GEX       : GET  /gex (?refresh=true)               ║
- ║  Execute   : POST /execute/:id                       ║
- ║  Cancel    : POST /cancel/:id                        ║
- ║  CloseAll  : POST /closeall                          ║
- ║  Journal   : GET  /journal                           ║
- ║  CSV       : GET  /journal/csv                       ║
- ║  Status    : GET  /status                            ║
+ ║  Signal engine : 5-min bar close scan               ║
+ ║  Indicators    : ORB(15m) + VWAP + RSI + EMA        ║
+ ║  Signal mode   : ${SIGNAL_MODE.padEnd(35)}║
+ ║  Exit          : Price monitor + DELETE position     ║
+ ║  Database      : SQLite ${DB_FILE.slice(-30).padEnd(27)}║
  ╠══════════════════════════════════════════════════════╣
- ║  Broker    : Alpaca (${IS_PAPER?"PAPER":"LIVE "})                         ║
- ║  Exit      : Price monitor + DELETE /v2/positions    ║
- ║  Risk      : $${getRiskBudget()} per trade                       ║
- ║  Stop      : ${PREMIUM_STOP_PCT*100}% | TP1: ${TP1_MULTIPLIER}x | EOD: 3:45 PM ET      ║
+ ║  GET  /              Health check                   ║
+ ║  GET  /dashboard     Trading dashboard              ║
+ ║  GET  /status        Full system status             ║
+ ║  GET  /gex           GEX levels                     ║
+ ║  GET  /db/trades     All trades (data mining)       ║
+ ║  GET  /db/signals    All signals evaluated          ║
+ ║  GET  /db/stats      Performance statistics         ║
+ ║  GET  /db/export     Export trades CSV              ║
+ ║  POST /webhook       Manual signal (testing)        ║
+ ║  POST /closeall      Force close all positions      ║
  ╚══════════════════════════════════════════════════════╝
 `);
+  initDB();
   await checkAccount();
   const now=new Date(new Date().toLocaleString("en-US",{timeZone:"America/New_York"}));
   const h=now.getHours(),m=now.getMinutes();
-  if ((h>9||(h===9&&m>=30))&&h<16) { log("GEX","Market open — calculating GEX..."); await getGEX(true); }
-  else log("GEX","Market closed — GEX calculates at 9:25 AM ET Monday");
+  if((h>9||(h===9&&m>=30))&&h<16){
+    log("GEX","Market open — calculating initial GEX...");
+    await getGEX(true);
+  } else {
+    log("GEX","Market closed — signal engine starts at 9:45 AM ET");
+  }
 });
