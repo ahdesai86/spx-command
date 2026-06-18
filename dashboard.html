@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
-  <title>SPX COMMAND</title>
+  <title>SPX COMMAND v9</title>
   <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -17,13 +17,10 @@
     ::-webkit-scrollbar-thumb{background:#1a2535;border-radius:2px}
     button{cursor:pointer;transition:filter .15s}
     button:hover:not(:disabled){filter:brightness(1.2)}
-    .card{background:#0c1017;border:1px solid #151d28;border-radius:9px;padding:12px 14px}
-    .mono{font-family:'Space Mono',monospace}
-    .dim{color:#1a2535}.muted{color:#4a5e74}.textdim{color:#5a7a94}
   </style>
 </head>
 <body>
-<div id="root"><div style="display:flex;align-items:center;justify-content:center;height:100vh;color:#2dd4a0;font-family:monospace;font-size:14px">Loading SPX COMMAND...</div></div>
+<div id="root"><div style="display:flex;align-items:center;justify-content:center;height:100vh;color:#2dd4a0;font-size:14px;font-family:monospace">Loading SPX COMMAND v9...</div></div>
 <script type="text/babel" data-presets="react">
 const {useState,useEffect,useRef,useCallback} = React;
 const SERVER = window.location.origin;
@@ -33,8 +30,8 @@ const C = {
   purple:"#9d7ff5",blue:"#4db8ff",dim:"#1a2535",
   muted:"#4a5e74",text:"#d4e4f4",textDim:"#5a7a94"
 };
-const fp = v=>v==null?null:(v>=0?"+":"")+"$"+Math.abs(v).toFixed(0);
-const fg = v=>!v?"—":(v>=0?"+":"-")+"$"+(Math.abs(v)/1e6).toFixed(0)+"M";
+const fp=v=>v==null?"—":(v>=0?"+":"")+"$"+Math.abs(v).toFixed(0);
+const fg=v=>!v?"—":(v>=0?"+":"-")+"$"+(Math.abs(v)/1e6).toFixed(0)+"M";
 
 function Pip({on,color,sz=6}){
   return <div style={{width:sz,height:sz,borderRadius:"50%",flexShrink:0,
@@ -43,124 +40,214 @@ function Pip({on,color,sz=6}){
 }
 function Tag({label,color,sm}){
   return <span style={{background:color+"18",color,border:`1px solid ${color}33`,
-    borderRadius:3,padding:sm?"1px 5px":"1px 7px",
-    fontSize:sm?9:10,fontFamily:"monospace",fontWeight:700}}>{label}</span>;
+    borderRadius:3,padding:sm?"1px 5px":"1px 7px",fontSize:sm?9:10,fontFamily:"monospace",fontWeight:700}}>{label}</span>;
 }
-function Cell({k,v,c,br}){
-  return <div style={{padding:"10px 12px",borderRight:br?`1px solid ${C.border}`:"none"}}>
+function Stat({k,v,c,br}){
+  return <div style={{padding:"9px 12px",borderRight:br?`1px solid ${C.border}`:"none"}}>
     <div style={{color:C.dim,fontSize:7,letterSpacing:1.2,marginBottom:3}}>{k}</div>
-    <div style={{color:c,fontSize:12,fontWeight:700}}>{v}</div>
+    <div style={{color:c||C.text,fontSize:12,fontWeight:700}}>{v||"—"}</div>
   </div>;
 }
-function Grid4({items}){
-  return <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:3,marginBottom:4}}>
-    {items.map(({k,v,c,dash})=>(
-      <div key={k} style={{background:C.bg,borderRadius:4,padding:"5px 7px",
-        border:`1px ${dash?"dashed":"solid"} ${C.border}`}}>
-        <div style={{color:C.dim,fontSize:7,letterSpacing:1,marginBottom:2}}>{k}</div>
-        <div style={{color:c,fontSize:11,fontWeight:600}}>{v||"—"}</div>
+
+// ── Indicators panel ──────────────────────────────────────────────────────────
+function IndicatorsPanel({ind,orb,signalMode}){
+  if (!ind||!ind.price) return (
+    <div style={{background:C.panel,border:`1px solid ${C.border}`,borderRadius:10,padding:"20px 16px",textAlign:"center"}}>
+      <div style={{color:C.muted,fontSize:11,marginBottom:6}}>Indicators update on 5-min bar close</div>
+      <div style={{color:C.dim,fontSize:10}}>Market opens 9:30 AM ET</div>
+    </div>
+  );
+  const price=ind.price, vwap=ind.vwap, rsi=ind.rsi, ema9=ind.ema9, ema21=ind.ema21;
+  const aboveVWAP=vwap&&price>vwap;
+  const rsiColor=rsi?(rsi>70?C.bear:rsi<30?C.bull:C.text):C.muted;
+  const emaColor=ema9&&ema21?(ema9>ema21?C.bull:C.bear):C.muted;
+
+  return (
+    <div style={{background:C.panel,border:`1px solid ${C.border}`,borderRadius:10,overflow:"hidden"}}>
+      <div style={{padding:"10px 14px",borderBottom:`1px solid ${C.border}`,
+        display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          <Pip on color={C.blue}/>
+          <span style={{color:C.text,fontSize:12,fontWeight:700}}>INDICATORS · {(signalMode||"").toUpperCase()}</span>
+        </div>
+        <span style={{color:C.dim,fontSize:9}}>{ind.updatedAt?new Date(ind.updatedAt).toLocaleTimeString("en-US",{hour12:false,timeZone:"America/New_York"})+" ET":"—"}</span>
       </div>
-    ))}
-  </div>;
+
+      {/* ORB */}
+      <div style={{padding:"10px 14px",borderBottom:`1px solid ${C.border}`,
+        background:orb?.locked?C.bull+"08":C.yellow+"08"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <div style={{display:"flex",alignItems:"center",gap:8}}>
+            <Pip on={orb?.locked} color={orb?.locked?C.bull:C.yellow}/>
+            <span style={{color:orb?.locked?C.bull:C.yellow,fontSize:11,fontWeight:700}}>
+              ORB {orb?.locked?"LOCKED ✓":"BUILDING..."}
+            </span>
+          </div>
+          {orb?.locked&&<div style={{display:"flex",gap:16}}>
+            <div style={{textAlign:"right"}}>
+              <div style={{color:C.muted,fontSize:8,letterSpacing:1}}>HIGH</div>
+              <div style={{color:C.bull,fontSize:12,fontWeight:700}}>${orb.high?.toFixed(2)}</div>
+            </div>
+            <div style={{textAlign:"right"}}>
+              <div style={{color:C.muted,fontSize:8,letterSpacing:1}}>LOW</div>
+              <div style={{color:C.bear,fontSize:12,fontWeight:700}}>${orb.low?.toFixed(2)}</div>
+            </div>
+          </div>}
+        </div>
+        {orb?.locked&&<div style={{marginTop:8}}>
+          <div style={{position:"relative",height:20,background:C.dim,borderRadius:4,overflow:"hidden"}}>
+            {orb.high&&orb.low&&<>
+              <div style={{position:"absolute",left:"5%",right:"5%",top:0,bottom:0,background:C.yellow+"22",borderRadius:3}}/>
+              <div style={{
+                position:"absolute",
+                left: orb.low&&orb.high ? Math.max(0,Math.min(95,((price-orb.low)/(orb.high-orb.low)*90+5)))+"%" : "50%",
+                top:2,bottom:2,width:2,background:price>orb.high?C.bull:price<orb.low?C.bear:C.yellow,borderRadius:1,
+              }}/>
+            </>}
+          </div>
+          <div style={{display:"flex",justifyContent:"space-between",marginTop:3}}>
+            <span style={{color:C.bear,fontSize:9}}>${orb.low?.toFixed(2)}</span>
+            <span style={{color:price>orb.high?C.bull:price<orb.low?C.bear:C.text,fontSize:9,fontWeight:700}}>
+              ${price?.toFixed(2)} {price>orb.high?"▲ ABOVE HIGH":price<orb.low?"▼ BELOW LOW":"inside range"}
+            </span>
+            <span style={{color:C.bull,fontSize:9}}>${orb.high?.toFixed(2)}</span>
+          </div>
+        </div>}
+      </div>
+
+      {/* Indicator grid */}
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:1,background:C.border}}>
+        {[
+          {k:"SPY PRICE", v:"$"+price?.toFixed(2), c:C.text},
+          {k:"VWAP",      v:vwap?"$"+vwap.toFixed(2):"—", c:aboveVWAP?C.bull:C.bear,
+           sub:vwap?(aboveVWAP?"above ✓":"below ✗"):null},
+          {k:"RSI (14)",  v:rsi?rsi.toFixed(1):"—", c:rsiColor,
+           sub:rsi?(rsi>70?"overbought":rsi<30?"oversold":"neutral"):null},
+          {k:"EMA 9",     v:ema9?"$"+ema9.toFixed(2):"—", c:C.text},
+          {k:"EMA 21",    v:ema21?"$"+ema21.toFixed(2):"—", c:C.text},
+          {k:"EMA CROSS", v:ema9&&ema21?(ema9>ema21?"BULLISH":"BEARISH"):"—", c:emaColor},
+        ].map(({k,v,c,sub})=>(
+          <div key={k} style={{background:C.panel,padding:"8px 10px"}}>
+            <div style={{color:C.dim,fontSize:8,letterSpacing:1,marginBottom:2}}>{k}</div>
+            <div style={{color:c,fontSize:12,fontWeight:700}}>{v}</div>
+            {sub&&<div style={{color:c,fontSize:8,marginTop:1,opacity:0.8}}>{sub}</div>}
+          </div>
+        ))}
+      </div>
+
+      {/* Signal condition check */}
+      {orb?.locked&&price&&<div style={{padding:"8px 14px",borderTop:`1px solid ${C.border}`}}>
+        <div style={{color:C.muted,fontSize:8,letterSpacing:1,marginBottom:6}}>SIGNAL CONDITIONS ({(signalMode||"moderate").toUpperCase()})</div>
+        <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+          {[
+            {k:"ORB",  ok:price>orb.high||price<orb.low, v:price>orb.high?"Breakout UP":price<orb.low?"Breakout DOWN":"No breakout"},
+            {k:"VWAP", ok:vwap&&(price>orb.high?price>vwap:price<vwap), v:vwap?(price>vwap?"Above":"Below"):"N/A"},
+            {k:"RSI",  ok:rsi&&rsi>30&&rsi<70, v:rsi?rsi.toFixed(0):"N/A"},
+            ...(signalMode==="strict"?[{k:"EMA", ok:ema9&&ema21&&(price>orb.high?ema9>ema21:ema9<ema21), v:ema9&&ema21?(ema9>ema21?"Bull":"Bear"):"N/A"}]:[]),
+          ].map(({k,ok,v})=>(
+            <div key={k} style={{background:ok?C.bull+"18":C.bear+"18",
+              border:`1px solid ${ok?C.bull:C.bear}33`,borderRadius:4,padding:"4px 8px"}}>
+              <span style={{color:ok?C.bull:C.bear,fontSize:9,fontWeight:700}}>{k} {ok?"✓":"✗"}</span>
+              <span style={{color:C.muted,fontSize:9,marginLeft:4}}>{v}</span>
+            </div>
+          ))}
+        </div>
+      </div>}
+    </div>
+  );
 }
 
+// ── GEX panel ─────────────────────────────────────────────────────────────────
 function GEXPanel({gex}){
-  if(!gex) return <div style={{background:C.panel,border:`1px solid ${C.border}`,
-    borderRadius:10,padding:"24px 16px",textAlign:"center"}}>
-    <div style={{color:C.muted,fontSize:11,marginBottom:6}}>GEX calculates at 9:25 AM ET</div>
-    <div style={{color:C.dim,fontSize:10}}>Alpaca option chain · self-calculated · free</div>
-  </div>;
-
+  if (!gex) return (
+    <div style={{background:C.panel,border:`1px solid ${C.border}`,borderRadius:10,padding:"24px 16px",textAlign:"center"}}>
+      <div style={{color:C.muted,fontSize:11,marginBottom:6}}>GEX calculates at 9:25 AM ET</div>
+      <div style={{color:C.dim,fontSize:10}}>Alpaca chain · self-calculated · free</div>
+    </div>
+  );
   const isPos=gex.regime==="positive", rc=isPos?C.bull:C.bear, spot=gex.spotPrice||0;
   const walls=[...(gex.callWalls||[]).map(w=>({...w,type:"call"})),
     ...(gex.putWalls||[]).map(w=>({...w,type:"put"}))].sort((a,b)=>b.price-a.price);
   const maxG=Math.max(...walls.map(w=>w.gex),1);
-
-  return <div style={{background:C.panel,border:`1px solid ${C.border}`,borderRadius:10,overflow:"hidden"}}>
-    <div style={{padding:"11px 15px",borderBottom:`1px solid ${C.border}`,
-      display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-      <div style={{display:"flex",alignItems:"center",gap:8}}>
-        <Pip on color={rc}/>
-        <span style={{color:C.text,fontSize:12,fontWeight:700}}>GEX · {(gex.regime||"").toUpperCase()}</span>
-      </div>
-      <div style={{display:"flex",gap:14}}>
-        {[{k:"NET",v:fg(gex.netGex),c:rc},{k:"FLIP",v:"$"+(gex.gammaFlip||0),c:C.yellow},
-          {k:"SPY",v:"$"+spot.toFixed(2),c:C.text}].map(({k,v,c})=>(
-          <div key={k} style={{textAlign:"right"}}>
-            <div style={{color:C.muted,fontSize:8,letterSpacing:1}}>{k}</div>
-            <div style={{color:c,fontSize:12,fontWeight:700}}>{v}</div>
-          </div>
-        ))}
-      </div>
-    </div>
-    <div style={{padding:"6px 15px",background:rc+"08",borderBottom:`1px solid ${C.border}`}}>
-      <span style={{color:rc,fontSize:10}}>
-        {isPos?"▲ POSITIVE — range bound · price pulls to walls":"▼ NEGATIVE — trending · moves amplified"}
-      </span>
-    </div>
-    <div style={{padding:"11px 15px"}}>
-      {walls.map((w,i)=>{
-        const isCall=w.type==="call", color=isCall?C.bull:C.bear;
-        const isFirst=(isCall&&!walls.slice(0,i).some(x=>x.type==="call"&&x.price>spot))||
-                      (!isCall&&!walls.slice(0,i).some(x=>x.type==="put"&&x.price<spot));
-        return <React.Fragment key={i}>
-          <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:5}}>
-            <span style={{width:46,textAlign:"right",color:isFirst?color:C.muted,
-              fontSize:11,fontWeight:isFirst?700:400,flexShrink:0}}>${w.price}</span>
-            <span style={{width:32,background:color+"18",border:`1px solid ${color}33`,
-              borderRadius:3,padding:"1px 3px",color,fontSize:8,textAlign:"center",flexShrink:0}}>
-              {isCall?"CALL":"PUT"}
-            </span>
-            <div style={{flex:1,height:12,background:C.dim,borderRadius:2,overflow:"hidden"}}>
-              <div style={{width:(w.gex/maxG*100)+"%",height:"100%",background:isFirst?color:color+"55"}}/>
+  return (
+    <div style={{background:C.panel,border:`1px solid ${C.border}`,borderRadius:10,overflow:"hidden"}}>
+      <div style={{padding:"10px 14px",borderBottom:`1px solid ${C.border}`,
+        display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          <Pip on color={rc}/>
+          <span style={{color:C.text,fontSize:12,fontWeight:700}}>GEX · {(gex.regime||"").toUpperCase()}</span>
+        </div>
+        <div style={{display:"flex",gap:12}}>
+          {[{k:"NET",v:fg(gex.netGex),c:rc},{k:"FLIP",v:"$"+(gex.gammaFlip||0),c:C.yellow},{k:"SPY",v:"$"+spot.toFixed(2),c:C.text}].map(({k,v,c})=>(
+            <div key={k} style={{textAlign:"right"}}>
+              <div style={{color:C.muted,fontSize:8,letterSpacing:1}}>{k}</div>
+              <div style={{color:c,fontSize:11,fontWeight:700}}>{v}</div>
             </div>
-            <span style={{width:44,color:C.muted,fontSize:9,flexShrink:0}}>${(w.gex/1e6).toFixed(1)}M</span>
-            {isFirst&&<span style={{color,fontSize:9,flexShrink:0}}>{isCall?"▲":"▼"}</span>}
-          </div>
-          {i<walls.length-1&&walls[i].price>spot&&walls[i+1].price<=spot&&(
-            <div style={{display:"flex",alignItems:"center",gap:6,margin:"6px 0"}}>
-              <div style={{width:46}}/><div style={{width:32}}/>
-              <div style={{flex:1,display:"flex",alignItems:"center",gap:5}}>
-                <div style={{flex:1,height:1,background:C.yellow+"33"}}/>
-                <span style={{color:C.yellow,fontSize:9,whiteSpace:"nowrap"}}>SPY ${spot.toFixed(2)}</span>
-                <div style={{flex:1,height:1,background:C.yellow+"33"}}/>
+          ))}
+        </div>
+      </div>
+      <div style={{padding:"6px 14px",background:rc+"08",borderBottom:`1px solid ${C.border}`}}>
+        <span style={{color:rc,fontSize:10}}>{isPos?"▲ POSITIVE — range bound":"▼ NEGATIVE — trending"}</span>
+      </div>
+      <div style={{padding:"10px 14px"}}>
+        {walls.map((w,i)=>{
+          const isCall=w.type==="call", color=isCall?C.bull:C.bear;
+          const isFirst=(isCall&&!walls.slice(0,i).some(x=>x.type==="call"&&x.price>spot))||
+                        (!isCall&&!walls.slice(0,i).some(x=>x.type==="put"&&x.price<spot));
+          return <React.Fragment key={i}>
+            <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:5}}>
+              <span style={{width:46,textAlign:"right",color:isFirst?color:C.muted,fontSize:11,fontWeight:isFirst?700:400,flexShrink:0}}>${w.price}</span>
+              <span style={{width:32,background:color+"18",border:`1px solid ${color}33`,borderRadius:3,padding:"1px 3px",color,fontSize:8,textAlign:"center",flexShrink:0}}>{isCall?"CALL":"PUT"}</span>
+              <div style={{flex:1,height:10,background:C.dim,borderRadius:2,overflow:"hidden"}}>
+                <div style={{width:(w.gex/maxG*100)+"%",height:"100%",background:isFirst?color:color+"55"}}/>
               </div>
+              <span style={{width:40,color:C.muted,fontSize:9,flexShrink:0}}>${(w.gex/1e6).toFixed(1)}M</span>
             </div>
-          )}
-        </React.Fragment>;
-      })}
+            {i<walls.length-1&&walls[i].price>spot&&walls[i+1].price<=spot&&(
+              <div style={{display:"flex",alignItems:"center",gap:6,margin:"5px 0"}}>
+                <div style={{width:46}}/><div style={{width:32}}/>
+                <div style={{flex:1,display:"flex",alignItems:"center",gap:5}}>
+                  <div style={{flex:1,height:1,background:C.yellow+"33"}}/>
+                  <span style={{color:C.yellow,fontSize:9,whiteSpace:"nowrap"}}>SPY ${spot.toFixed(2)}</span>
+                  <div style={{flex:1,height:1,background:C.yellow+"33"}}/>
+                </div>
+              </div>
+            )}
+          </React.Fragment>;
+        })}
+      </div>
+      <div style={{padding:"6px 14px",borderTop:`1px solid ${C.border}`,display:"flex",justifyContent:"space-between"}}>
+        <span style={{color:C.dim,fontSize:9}}>Alpaca chain</span>
+        <span style={{color:C.muted,fontSize:9}}>Compare → TradeEcho · Unusual Whales</span>
+        <span style={{color:C.dim,fontSize:9}}>{gex.updatedAt?new Date(gex.updatedAt).toLocaleTimeString("en-US",{hour12:false,timeZone:"America/New_York"})+" ET":"—"}</span>
+      </div>
     </div>
-    <div style={{padding:"6px 15px",borderTop:`1px solid ${C.border}`,display:"flex",justifyContent:"space-between"}}>
-      <span style={{color:C.dim,fontSize:9}}>Alpaca chain · self-calc</span>
-      <span style={{color:C.muted,fontSize:9}}>Compare → TradeEcho · Unusual Whales</span>
-      <span style={{color:C.dim,fontSize:9}}>
-        {gex.updatedAt?new Date(gex.updatedAt).toLocaleTimeString("en-US",{hour12:false,timeZone:"America/New_York"})+" ET":"—"}
-      </span>
-    </div>
-  </div>;
+  );
 }
 
+// ── Signal card ───────────────────────────────────────────────────────────────
 function SignalCard({signal}){
   const [busy,setBusy]=useState(false);
   const iL=signal.direction==="LONG", dc=iL?C.bull:C.bear;
   const isClosed=["STOPPED","EOD_CLOSED","CANCELLED","TP1_HIT"].includes(signal.status);
-  const isActive=["FILLED","TP1_HIT"].includes(signal.status);
+  const isActive=["FILLED"].includes(signal.status);
   const SC={PENDING:C.yellow,EXECUTING:C.blue,SENT:C.purple,FILLED:C.bull,
     TP1_HIT:C.bull,STOPPED:C.bear,EOD_CLOSED:C.muted,CANCELLED:C.dim};
   const SL={PENDING:"PENDING",EXECUTING:"PLACING...",SENT:"SENT",FILLED:"LIVE",
     TP1_HIT:"TP1 ✓",STOPPED:"STOPPED ✗",EOD_CLOSED:"EOD",CANCELLED:"CANCELLED"};
   const sc=SC[signal.status]||C.muted, pnl=signal.closePnl;
-  const close=async()=>{setBusy(true);try{await fetch(SERVER+"/cancel/"+signal.id,{method:"POST"});}finally{setBusy(false);}};
+  const doClose=async()=>{setBusy(true);try{await fetch(SERVER+"/cancel/"+signal.id,{method:"POST"});}finally{setBusy(false);}};
 
   return <div style={{background:C.panel,border:`1px solid ${isClosed?C.dim:dc+"33"}`,
     borderLeft:`3px solid ${isClosed?C.dim:dc}`,borderRadius:9,padding:"12px 14px",
-    opacity:isClosed?0.6:1,animation:"fin 0.25s ease",marginBottom:8}}>
-    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:9}}>
+    opacity:isClosed?0.65:1,animation:"fin 0.25s ease",marginBottom:8}}>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8}}>
       <div>
         <div style={{display:"flex",alignItems:"center",gap:6,flexWrap:"wrap",marginBottom:3}}>
           <span style={{fontSize:14,fontWeight:700,color:C.text,letterSpacing:2}}>SPY</span>
           <Tag label={signal.direction} color={dc}/>
           <span style={{color:C.textDim,fontSize:11}}>${signal.strike} {signal.right==="C"?"CALL":"PUT"}</span>
+          <Tag label={signal.signalMode||"moderate"} color={C.blue} sm/>
           {pnl!=null&&<Tag label={fp(pnl)} color={pnl>=0?C.bull:C.bear}/>}
         </div>
         <div style={{color:C.textDim,fontSize:9}}>{signal.trigger} · {signal.time} ET</div>
@@ -171,51 +258,69 @@ function SignalCard({signal}){
         {SL[signal.status]||signal.status}
       </div>
     </div>
-    {signal.optionSymbol&&<div style={{marginBottom:8,padding:"4px 9px",background:C.bg,
+
+    {/* Contract */}
+    {signal.optionSymbol&&<div style={{marginBottom:7,padding:"4px 9px",background:C.bg,
       borderRadius:4,border:`1px solid ${C.border}`}}>
       <span style={{color:C.muted,fontSize:8}}>CONTRACT </span>
       <span style={{color:C.purple,fontSize:10}}>{signal.optionSymbol}</span>
       {signal.contracts&&<span style={{color:C.text,fontSize:10}}> ×{signal.contracts}</span>}
       {signal.totalCost&&<span style={{color:C.yellow,fontSize:10}}> · ${signal.totalCost} cost</span>}
     </div>}
-    <Grid4 items={[
-      {k:"ENTRY",v:signal.spyEntry?"$"+signal.spyEntry?.toFixed(2):"—",c:C.text},
-      {k:"STOP", v:signal.stop?"$"+signal.stop?.toFixed(2):"—",c:C.bear},
-      {k:"TP1",  v:signal.tp1?"$"+signal.tp1?.toFixed(2):"—",c:C.blue},
-      {k:"TP2",  v:signal.tp2?"$"+signal.tp2?.toFixed(2):"—",c:C.purple},
-    ]}/>
-    <Grid4 items={[
-      {k:"PREM PAID",v:signal.fillPrice?"$"+signal.fillPrice?.toFixed(2):signal.midPrice?"$"+signal.midPrice?.toFixed(2):"—",c:C.text,dash:true},
-      {k:"PREM STOP",v:signal.stopPrice?"$"+signal.stopPrice?.toFixed(2):"—",c:C.bear,dash:true},
-      {k:"PREM TP1", v:signal.tp1Price?"$"+signal.tp1Price?.toFixed(2):"—",c:C.blue,dash:true},
-      {k:"R:R",      v:signal.rr||"—",c:C.yellow,dash:true},
-    ]}/>
-    {signal.strikeReason&&<div style={{padding:"4px 8px",marginBottom:5,background:C.purple+"08",
-      borderRadius:4,border:`1px solid ${C.purple}20`}}>
-      <span style={{color:C.purple,fontSize:8,fontWeight:700}}>STRIKE </span>
-      <span style={{color:C.textDim,fontSize:9}}>{signal.strikeReason}</span>
+
+    {/* Price grid */}
+    <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:3,marginBottom:4}}>
+      {[{k:"ENTRY",v:signal.spyEntry?"$"+signal.spyEntry?.toFixed(2):"—",c:C.text},
+        {k:"STOP", v:signal.stop?"$"+signal.stop?.toFixed(2):"—",c:C.bear},
+        {k:"TP1",  v:signal.tp1?"$"+signal.tp1?.toFixed(2):"—",c:C.blue},
+        {k:"GEX TP",v:signal.gexTarget?"$"+signal.gexTarget?.toFixed(2):"—",c:C.purple}
+      ].map(({k,v,c})=>(
+        <div key={k} style={{background:C.bg,borderRadius:4,padding:"5px 7px",border:`1px solid ${C.border}`}}>
+          <div style={{color:C.dim,fontSize:7,letterSpacing:1,marginBottom:2}}>{k}</div>
+          <div style={{color:c,fontSize:11,fontWeight:600}}>{v}</div>
+        </div>
+      ))}
+    </div>
+    <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:3,marginBottom:7}}>
+      {[{k:"PREM PAID",v:signal.fillPrice?"$"+signal.fillPrice?.toFixed(2):signal.midPrice?"$"+signal.midPrice?.toFixed(2):"—",c:C.text},
+        {k:"PREM STOP",v:signal.stopPrice?"$"+signal.stopPrice?.toFixed(2):"—",c:C.bear},
+        {k:"PREM TP1", v:signal.tp1Price?"$"+signal.tp1Price?.toFixed(2):"—",c:C.blue},
+        {k:"ORB",      v:signal.orbHigh?"$"+signal.orbHigh?.toFixed(2)+"/"+signal.orbLow?.toFixed(2):"—",c:C.yellow}
+      ].map(({k,v,c})=>(
+        <div key={k} style={{background:C.bg,borderRadius:4,padding:"5px 7px",border:`1px dashed ${C.border}`}}>
+          <div style={{color:C.dim,fontSize:7,letterSpacing:1,marginBottom:2}}>{k}</div>
+          <div style={{color:c,fontSize:11,fontWeight:600}}>{v}</div>
+        </div>
+      ))}
+    </div>
+
+    {/* Indicators at entry */}
+    {(signal.vwapAtEntry||signal.rsiAtEntry)&&<div style={{padding:"4px 8px",marginBottom:6,
+      background:C.dim+"44",borderRadius:4,border:`1px solid ${C.dim}`,
+      display:"flex",gap:12}}>
+      {signal.vwapAtEntry&&<span style={{color:C.muted,fontSize:9}}>VWAP ${signal.vwapAtEntry?.toFixed(2)}</span>}
+      {signal.rsiAtEntry&&<span style={{color:C.muted,fontSize:9}}>RSI {signal.rsiAtEntry?.toFixed(1)}</span>}
+      {signal.emaCross&&<span style={{color:signal.emaCross==="bullish"?C.bull:C.bear,fontSize:9}}>EMA {signal.emaCross}</span>}
     </div>}
-    {signal.gexReason&&<div style={{padding:"4px 8px",marginBottom:8,background:C.dim+"44",
+
+    {signal.gexReason&&<div style={{padding:"4px 8px",marginBottom:7,background:C.dim+"44",
       borderRadius:4,border:`1px solid ${C.dim}`}}>
       <span style={{color:C.muted,fontSize:8}}>GEX </span>
       <span style={{color:C.textDim,fontSize:9}}>{signal.gexReason}</span>
     </div>}
-    {signal.trailedToBreakeven&&<div style={{padding:"4px 8px",marginBottom:8,
-      background:C.bull+"08",border:`1px solid ${C.bull}20`,borderRadius:4}}>
-      <span style={{color:C.bull,fontSize:9}}>✓ Stop trailed to breakeven</span>
-    </div>}
+
     {isActive&&<div style={{display:"flex",alignItems:"center",justifyContent:"space-between",
       padding:"7px 10px",background:C.bull+"08",border:`1px solid ${C.bull}20`,borderRadius:5}}>
       <div style={{display:"flex",alignItems:"center",gap:5}}>
-        <Pip on color={C.bull} sz={5}/><span style={{color:C.bull,fontSize:9}}>Live · stop + TP1 active</span>
+        <Pip on color={C.bull} sz={5}/>
+        <span style={{color:C.bull,fontSize:9}}>Live · price monitor active</span>
       </div>
-      <button onClick={close} disabled={busy} style={{background:C.bear+"0f",
+      <button onClick={doClose} disabled={busy} style={{background:C.bear+"0f",
         border:`1px solid ${C.bear}30`,borderRadius:4,color:C.bear,padding:"2px 8px",fontSize:9}}>
         {busy?"...":"CLOSE"}
       </button>
     </div>}
-    {isClosed&&<div style={{padding:"6px 9px",background:sc+"08",border:`1px solid ${sc}20`,
-      borderRadius:5,color:sc,fontSize:9}}>
+    {isClosed&&<div style={{padding:"6px 9px",background:sc+"08",border:`1px solid ${sc}20`,borderRadius:5,color:sc,fontSize:9}}>
       {signal.status==="TP1_HIT"&&"✓ Target hit · closed"}
       {signal.status==="STOPPED"&&"✗ Stop hit · closed"}
       {signal.status==="EOD_CLOSED"&&"⏱ Force closed 3:45 PM ET"}
@@ -224,57 +329,61 @@ function SignalCard({signal}){
   </div>;
 }
 
+// ── Journal ───────────────────────────────────────────────────────────────────
 function JournalTable({trades,stats}){
-  if(!trades.length) return <div style={{textAlign:"center",padding:"40px 20px",
-    border:`1px dashed ${C.border}`,borderRadius:10,color:C.dim,fontSize:11}}>
-    No trades yet · records here after each trade closes
-  </div>;
+  if (!trades||!trades.length) return (
+    <div style={{textAlign:"center",padding:"40px 20px",border:`1px dashed ${C.border}`,borderRadius:10,color:C.dim,fontSize:11}}>
+      No trades yet · recorded after each trade closes · stored in SQLite
+    </div>
+  );
   return <div>
     <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",
-      background:C.panel,border:`1px solid ${C.border}`,borderRadius:10,overflow:"hidden",marginBottom:12}}>
-      {[{k:"TOTAL",v:stats.totalTrades,c:C.text},{k:"WINS",v:stats.wins,c:C.bull},
-        {k:"LOSSES",v:stats.losses,c:C.bear},{k:"WIN%",v:(stats.winRate||0)+"%",c:C.yellow},
-        {k:"TOTAL P&L",v:fp(stats.totalPnL),c:(stats.totalPnL||0)>=0?C.bull:C.bear},
-        {k:"AVG WIN",v:"$"+(stats.avgWin||0).toFixed(0),c:C.bull},
-        {k:"AVG LOSS",v:"$"+Math.abs(stats.avgLoss||0).toFixed(0),c:C.bear}
-      ].map(({k,v,c},i)=><Cell key={k} k={k} v={v} c={c} br={i<6}/>)}
+      background:C.panel,border:`1px solid ${C.border}`,borderRadius:10,overflow:"hidden",marginBottom:10}}>
+      {[{k:"TOTAL",v:stats.total||0,c:C.text},{k:"WINS",v:stats.wins||0,c:C.bull},
+        {k:"LOSSES",v:stats.losses||0,c:C.bear},{k:"WIN%",v:(stats.win_rate||0)+"%",c:C.yellow},
+        {k:"TOTAL P&L",v:fp(stats.total_pnl),c:(stats.total_pnl||0)>=0?C.bull:C.bear},
+        {k:"AVG WIN",v:"$"+(stats.avg_win||0).toFixed(0),c:C.bull},
+        {k:"AVG LOSS",v:"$"+Math.abs(stats.avg_loss||0).toFixed(0),c:C.bear}
+      ].map(({k,v,c},i)=><Stat key={k} k={k} v={v} c={c} br={i<6}/>)}
     </div>
     <div style={{display:"flex",justifyContent:"flex-end",marginBottom:8}}>
-      <a href={SERVER+"/journal/csv"} download style={{background:C.blue+"15",
-        border:`1px solid ${C.blue}33`,borderRadius:5,color:C.blue,
-        padding:"4px 12px",fontSize:9,textDecoration:"none"}}>⬇ EXPORT CSV</a>
+      <a href={SERVER+"/journal/csv"} download style={{background:C.blue+"15",border:`1px solid ${C.blue}33`,
+        borderRadius:5,color:C.blue,padding:"4px 12px",fontSize:9,textDecoration:"none"}}>⬇ EXPORT CSV</a>
     </div>
     {trades.map((t,i)=>{
       const c=t.outcome==="WIN"?C.bull:t.outcome==="LOSS"?C.bear:C.muted;
       return <div key={i} style={{background:C.panel,border:`1px solid ${C.border}`,
-        borderLeft:`3px solid ${c}`,borderRadius:7,padding:"9px 12px",marginBottom:6,
-        display:"grid",gridTemplateColumns:"80px 110px 70px 70px 70px 70px 1fr",gap:8,alignItems:"center"}}>
-        <div><div style={{color:C.dim,fontSize:8,marginBottom:2}}>{t.date}</div>
+        borderLeft:`3px solid ${c}`,borderRadius:7,padding:"8px 12px",marginBottom:5,
+        display:"grid",gridTemplateColumns:"80px 110px 60px 60px 70px 70px 1fr",gap:8,alignItems:"center"}}>
+        <div><div style={{color:C.dim,fontSize:8,marginBottom:1}}>{t.date}</div>
           <div style={{color:C.muted,fontSize:9}}>{t.time}</div></div>
-        <div><div style={{color:C.purple,fontSize:10,marginBottom:2}}>{t.symbol}</div>
+        <div><div style={{color:C.purple,fontSize:10,marginBottom:1}}>{t.symbol}</div>
           <div style={{color:C.muted,fontSize:9}}>{t.direction} ${t.strike}</div></div>
-        <div><div style={{color:C.dim,fontSize:8,marginBottom:2}}>FILL</div>
-          <div style={{color:C.text,fontSize:10}}>${t.fillPrice?.toFixed(2)||"—"}</div></div>
-        <div><div style={{color:C.dim,fontSize:8,marginBottom:2}}>QTY</div>
+        <div><div style={{color:C.dim,fontSize:8,marginBottom:1}}>FILL</div>
+          <div style={{color:C.text,fontSize:10}}>${t.fill_price?.toFixed(2)||"—"}</div></div>
+        <div><div style={{color:C.dim,fontSize:8,marginBottom:1}}>QTY</div>
           <div style={{color:C.text,fontSize:10}}>×{t.contracts}</div></div>
-        <div><div style={{color:C.dim,fontSize:8,marginBottom:2}}>P&L</div>
-          <div style={{color:c,fontSize:11,fontWeight:700}}>{fp(t.closePnl)}</div></div>
-        <div><div style={{color:C.dim,fontSize:8,marginBottom:2}}>P&L%</div>
-          <div style={{color:c,fontSize:11,fontWeight:700}}>{t.pnlPct!=null?(t.pnlPct>=0?"+":"")+t.pnlPct+"%":"—"}</div></div>
-        <div><div style={{color:c,fontSize:9,fontWeight:700,marginBottom:2}}>{t.outcome}</div>
-          <div style={{color:C.dim,fontSize:8}}>{t.closeReason} · {t.trigger}</div></div>
+        <div><div style={{color:C.dim,fontSize:8,marginBottom:1}}>P&L</div>
+          <div style={{color:c,fontSize:11,fontWeight:700}}>{fp(t.pnl)}</div></div>
+        <div><div style={{color:C.dim,fontSize:8,marginBottom:1}}>P&L%</div>
+          <div style={{color:c,fontSize:11,fontWeight:700}}>{t.pnl_pct!=null?(t.pnl_pct>=0?"+":"")+t.pnl_pct+"%":"—"}</div></div>
+        <div>
+          <div style={{color:c,fontSize:9,fontWeight:700,marginBottom:1}}>{t.outcome}</div>
+          <div style={{color:C.dim,fontSize:8}}>{t.close_reason} · {t.signal_mode} · {t.duration_min?t.duration_min+"min":""}</div>
+        </div>
       </div>;
     })}
   </div>;
 }
 
+// ── Log feed ──────────────────────────────────────────────────────────────────
 function LogFeed({logs,height=180}){
   const ref=useRef();
   useEffect(()=>{if(ref.current)ref.current.scrollTop=ref.current.scrollHeight;},[logs]);
   const TC={GEX:C.bull,"GEX ERR":C.bear,ALPACA:C.blue,WEBHOOK:C.yellow,SIGNAL:C.bull,
-    AUTO:C.purple,FILL:C.bull,EXIT:C.blue,TRAIL:C.bull,STOP:C.bear,TP1:C.bull,
-    EOD:C.yellow,ERROR:C.bear,CANCEL:C.bear,STRIKE:C.purple,JOURNAL:C.blue,
-    PRICE:C.blue,GUARD:C.bear,TP1:C.bull};
+    ENGINE:C.blue,SCAN:C.textDim,AUTO:C.purple,FILL:C.bull,EXIT:C.blue,
+    STOP:C.bear,TP1:C.bull,EOD:C.yellow,ERROR:C.bear,MONITOR:C.muted,
+    STRIKE:C.purple,ORB:C.yellow,SAFETY:C.bull,DB:C.muted};
   return <div style={{background:C.panel,border:`1px solid ${C.border}`,borderRadius:10,padding:12}}>
     <div style={{display:"flex",justifyContent:"space-between",marginBottom:7}}>
       <span style={{color:C.muted,fontSize:9,letterSpacing:2}}>LIVE LOG</span>
@@ -285,7 +394,7 @@ function LogFeed({logs,height=180}){
         :[...logs].reverse().map((l,i)=>(
           <div key={i} style={{fontSize:10,marginBottom:3,display:"flex",gap:7}}>
             <span style={{color:C.dim,flexShrink:0,minWidth:55}}>{l.time}</span>
-            <span style={{color:TC[l.tag]||C.muted,flexShrink:0,minWidth:55,fontWeight:700}}>[{l.tag}]</span>
+            <span style={{color:TC[l.tag]||C.muted,flexShrink:0,minWidth:60,fontWeight:700}}>[{l.tag}]</span>
             <span style={{color:C.textDim}}>{l.msg}</span>
           </div>
         ))}
@@ -293,10 +402,13 @@ function LogFeed({logs,height=180}){
   </div>;
 }
 
+// ── Main App ──────────────────────────────────────────────────────────────────
 function App(){
   const [signals,   setSignals]  =useState([]);
   const [logs,      setLogs]     =useState([]);
   const [gex,       setGex]      =useState(null);
+  const [ind,       setInd]      =useState({});
+  const [orb,       setOrb]      =useState({});
   const [alpacaOk,  setAlpacaOk] =useState(false);
   const [sseOk,     setSseOk]    =useState(false);
   const [pnl,       setPnl]      =useState(0);
@@ -304,6 +416,7 @@ function App(){
   const [risk,      setRisk]     =useState(2000);
   const [tp1Cfg,    setTp1Cfg]   =useState({value:"3x premium"});
   const [journal,   setJournal]  =useState({trades:[],stats:{}});
+  const [sigMode,   setSigMode]  =useState("moderate");
   const [clock,     setClock]    =useState("");
   const [tab,       setTab]      =useState("signals");
   const esRef=useRef(null);
@@ -317,7 +430,10 @@ function App(){
     fetch(SERVER+"/journal").then(r=>r.json()).then(j=>{if(j.trades)setJournal(j);}).catch(()=>{});
     fetch(SERVER+"/status").then(r=>r.json()).then(s=>{
       if(s.tp1Config)setTp1Cfg(s.tp1Config);
-      if(s.riskBudget)setRisk(parseFloat(s.riskBudget.replace("$",""))||2000);
+      if(s.riskMode)setRisk(parseFloat((s.riskMode||"").replace(/[^0-9.]/g,""))||2000);
+      if(s.signalMode)setSigMode(s.signalMode);
+      if(s.indicators)setInd(s.indicators);
+      if(s.orb)setOrb(s.orb);
     }).catch(()=>{});
   },[]);
 
@@ -333,18 +449,20 @@ function App(){
           if(ev.signals)setSignals(ev.signals);
           if(ev.gex)setGex(ev.gex);
           if(ev.riskBudget)setRisk(ev.riskBudget);
+          if(ev.signalMode)setSigMode(ev.signalMode);
+          if(ev.indicators)setInd(ev.indicators);
+          if(ev.orbState)setOrb(ev.orbState);
+          if(ev.logs&&ev.logs.length)setLogs(ev.logs);
           setPnl(parseFloat(ev.sessionPnL)||0);
           setLoss(parseFloat(ev.dailyLoss)||0);
-          if(ev.logs && ev.logs.length>0) setLogs(ev.logs); // restore logs on reconnect
         }else if(ev.type==="alpaca_status")setAlpacaOk(ev.connected);
         else if(ev.type==="gex_update")setGex(ev);
+        else if(ev.type==="indicators_update")setInd(ev);
+        else if(ev.type==="orb_locked")setOrb(p=>({...p,high:ev.high,low:ev.low,locked:true}));
         else if(ev.type==="new_signal")setSignals(p=>[ev.signal,...p]);
-        else if(ev.type==="signal_update"){
-          setSignals(p=>p.map(s=>s.id===ev.id?{...s,...ev}:s));
-          if(ev.pnl!=null){setPnl(p=>p+ev.pnl);if(ev.pnl<0)setLoss(p=>p+Math.abs(ev.pnl));}
-        }else if(ev.type==="journal_update"){
-          setJournal(prev=>({trades:[ev.trade,...(prev.trades||[])],stats:ev.stats}));
-        }else if(ev.type==="log")setLogs(p=>[...p.slice(-499),ev]);
+        else if(ev.type==="signal_update")setSignals(p=>p.map(s=>s.id===ev.id?{...s,...ev}:s));
+        else if(ev.type==="journal_update")setJournal(prev=>({trades:[ev.trade,...(prev.trades||[])],stats:ev.stats||prev.stats}));
+        else if(ev.type==="log")setLogs(p=>[...p.slice(-499),ev]);
       }catch(_){}
     };
     es.onerror=()=>{es.close();setTimeout(connect,3000);};
@@ -353,12 +471,19 @@ function App(){
   useEffect(()=>{connect();return()=>{if(esRef.current)esRef.current.close();};},[connect]);
 
   const pending=signals.filter(s=>s.status==="PENDING").length;
-  const active =signals.filter(s=>["SENT","FILLED","TP1_HIT","EXECUTING"].includes(s.status)).length;
+  const active =signals.filter(s=>["SENT","FILLED","EXECUTING"].includes(s.status)).length;
   const pc=pnl>=0?C.bull:C.bear;
-  const tabs=[["signals","SIGNALS"],["gex","GEX"],["journal","JOURNAL "+((journal.trades||[]).length||"")],["logs","LOGS"]];
+
+  const tabs=[
+    ["signals","SIGNALS"],
+    ["indicators","INDICATORS"],
+    ["gex","GEX"],
+    ["journal","JOURNAL"+(journal.trades?.length?" "+journal.trades.length:"")],
+    ["logs","LOGS"],
+  ];
 
   return <div style={{minHeight:"100vh",background:C.bg}}>
-    {/* Topbar */}
+    {/* Top bar */}
     <div style={{background:C.panel,borderBottom:`1px solid ${C.border}`,
       padding:"9px 18px",position:"sticky",top:0,zIndex:100,
       display:"flex",alignItems:"center",justifyContent:"space-between"}}>
@@ -367,22 +492,20 @@ function App(){
           <div style={{fontSize:15,fontWeight:700,color:C.text,letterSpacing:0.5}}>
             <span style={{color:C.bull}}>SPX</span> COMMAND
           </div>
-          <div style={{color:C.dim,fontSize:8,letterSpacing:1.5}}>SPY 0DTE · PAPER · v7.1</div>
+          <div style={{color:C.dim,fontSize:8,letterSpacing:1.5}}>SPY 0DTE · AUTONOMOUS · v9</div>
         </div>
-        <div style={{display:"flex",background:C.bg,border:`1px solid ${C.border}`,
-          borderRadius:6,overflow:"hidden"}}>
+        <div style={{display:"flex",background:C.bg,border:`1px solid ${C.border}`,borderRadius:6,overflow:"hidden"}}>
           {tabs.map(([k,l])=>(
-            <button key={k} onClick={()=>setTab(k)} style={{padding:"4px 11px",fontSize:9,
+            <button key={k} onClick={()=>setTab(k)} style={{padding:"4px 10px",fontSize:9,
               background:tab===k?C.dim:"transparent",color:tab===k?C.text:C.muted,
               border:"none",fontFamily:"monospace"}}>{l}</button>
           ))}
         </div>
       </div>
       <div style={{display:"flex",alignItems:"center",gap:8}}>
-        <div style={{display:"flex",gap:5}}>
-          {pending>0&&<Tag label={pending+" PENDING"} color={C.yellow} sm/>}
-          {active>0&&<Tag label={active+" ACTIVE"} color={C.bull} sm/>}
-        </div>
+        <Tag label={(sigMode||"moderate").toUpperCase()} color={C.blue} sm/>
+        {pending>0&&<Tag label={pending+" PENDING"} color={C.yellow} sm/>}
+        {active >0&&<Tag label={active+" ACTIVE"}  color={C.bull}   sm/>}
         <div style={{display:"flex",alignItems:"center",gap:6,
           background:alpacaOk?C.bull+"0f":C.bear+"0f",
           border:`1px solid ${alpacaOk?C.bull:C.bear}25`,borderRadius:6,padding:"4px 10px"}}>
@@ -398,17 +521,17 @@ function App(){
       </div>
     </div>
 
-    <div style={{padding:"13px 18px",maxWidth:1100,margin:"0 auto"}}>
+    <div style={{padding:"12px 18px",maxWidth:1120,margin:"0 auto"}}>
       {/* Stats bar */}
       <div style={{display:"grid",gridTemplateColumns:"repeat(6,1fr)",
         background:C.panel,border:`1px solid ${C.border}`,
         borderRadius:10,overflow:"hidden",marginBottom:12}}>
-        <Cell k="SESSION P&L" v={(pnl>=0?"+":"")+"$"+Math.abs(pnl).toFixed(0)} c={pc} br/>
-        <Cell k="DAILY LOSS"  v={"$"+loss.toFixed(0)} c={loss>0?C.bear:C.dim} br/>
-        <Cell k="LOSS LIMIT"  v="$6,000 (6%)" c={C.muted} br/>
-        <Cell k="RISK/TRADE"  v={"$"+risk} c={C.yellow} br/>
-        <Cell k="WIN RATE"    v={journal.stats.winRate!=null?journal.stats.winRate+"%":"—"} c={C.blue} br/>
-        <Cell k="ALL-TIME P&L" v={fp(journal.stats.totalPnL||0)} c={(journal.stats.totalPnL||0)>=0?C.bull:C.bear}/>
+        <Stat k="SESSION P&L" v={(pnl>=0?"+":"")+"$"+Math.abs(pnl).toFixed(0)} c={pc} br/>
+        <Stat k="DAILY LOSS"  v={"$"+loss.toFixed(0)} c={loss>0?C.bear:C.dim} br/>
+        <Stat k="LOSS LIMIT"  v="$6,000 (6%)" c={C.muted} br/>
+        <Stat k="RISK/TRADE"  v={"$"+risk} c={C.yellow} br/>
+        <Stat k="WIN RATE"    v={(journal.stats?.win_rate||0)+"%"} c={C.blue} br/>
+        <Stat k="ALL-TIME P&L" v={fp(journal.stats?.total_pnl||0)} c={(journal.stats?.total_pnl||0)>=0?C.bull:C.bear}/>
       </div>
 
       {/* Two column */}
@@ -417,30 +540,43 @@ function App(){
           {tab==="signals"&&<>
             <div style={{display:"flex",justifyContent:"space-between",marginBottom:8}}>
               <span style={{color:C.muted,fontSize:9,letterSpacing:2}}>LIVE SIGNALS</span>
-              <span style={{color:C.dim,fontSize:9}}>{signals.length} today · close 3:45 PM ET</span>
+              <span style={{color:C.dim,fontSize:9}}>{signals.length} today · 3:45 PM ET close</span>
             </div>
             {signals.length===0
               ?<div style={{textAlign:"center",padding:"44px 20px",
                 border:`1px dashed ${C.border}`,borderRadius:10,color:C.dim,fontSize:11}}>
-                Waiting for TradingView ORB breakout...
+                Engine scans every 5-min bar close · waiting for ORB breakout...
               </div>
-              :signals.map(s=><SignalCard key={s.id} signal={s}/>)
-            }
+              :signals.map(s=><SignalCard key={s.id} signal={s}/>)}
           </>}
+
+          {tab==="indicators"&&<>
+            <div style={{marginBottom:8,display:"flex",justifyContent:"space-between"}}>
+              <span style={{color:C.muted,fontSize:9,letterSpacing:2}}>LIVE INDICATORS</span>
+              <div style={{display:"flex",gap:6}}>
+                <Tag label={"ORB: "+ORB_MINUTES+"min"} color={C.yellow} sm/>
+                <Tag label={"MODE: "+(sigMode||"moderate").toUpperCase()} color={C.blue} sm/>
+              </div>
+            </div>
+            <IndicatorsPanel ind={ind} orb={orb} signalMode={sigMode}/>
+          </>}
+
           {tab==="gex"&&<>
-            <div style={{display:"flex",justifyContent:"space-between",marginBottom:8}}>
+            <div style={{marginBottom:8,display:"flex",justifyContent:"space-between"}}>
               <span style={{color:C.muted,fontSize:9,letterSpacing:2}}>GEX LEVELS</span>
               <span style={{color:C.dim,fontSize:9}}>Compare → TradeEcho / Unusual Whales</span>
             </div>
             <GEXPanel gex={gex}/>
           </>}
+
           {tab==="journal"&&<>
             <div style={{display:"flex",justifyContent:"space-between",marginBottom:8}}>
               <span style={{color:C.muted,fontSize:9,letterSpacing:2}}>TRADE JOURNAL</span>
-              <span style={{color:C.dim,fontSize:9}}>Bot trades only · exportable CSV</span>
+              <span style={{color:C.dim,fontSize:9}}>SQLite · persistent · exportable</span>
             </div>
             <JournalTable trades={journal.trades||[]} stats={journal.stats||{}}/>
           </>}
+
           {tab==="logs"&&<>
             <div style={{marginBottom:8,display:"flex",justifyContent:"space-between"}}>
               <span style={{color:C.muted,fontSize:9,letterSpacing:2}}>SERVER LOGS</span>
@@ -450,13 +586,13 @@ function App(){
               <div style={{overflowY:"auto",height:500}}>
                 {logs.length===0?<div style={{color:C.dim,fontSize:10}}>No logs yet...</div>
                   :[...logs].reverse().map((l,i)=>{
-                    const TC={GEX:C.bull,"GEX ERR":C.bear,ALPACA:C.blue,WEBHOOK:C.yellow,
-                      SIGNAL:C.bull,AUTO:C.purple,FILL:C.bull,EXIT:C.blue,STOP:C.bear,
-                      TP1:C.bull,EOD:C.yellow,ERROR:C.bear,STRIKE:C.purple,JOURNAL:C.blue};
-                    return <div key={i} style={{fontSize:10,marginBottom:4,display:"flex",gap:7,
-                      borderBottom:`1px solid ${C.dim}44`,paddingBottom:3}}>
-                      <span style={{color:C.dim,flexShrink:0,minWidth:60}}>{l.time}</span>
-                      <span style={{color:TC[l.tag]||C.muted,flexShrink:0,minWidth:65,fontWeight:700}}>[{l.tag}]</span>
+                    const TC={GEX:C.bull,"GEX ERR":C.bear,ALPACA:C.blue,SIGNAL:C.bull,
+                      ENGINE:C.blue,SCAN:C.textDim,FILL:C.bull,STOP:C.bear,TP1:C.bull,
+                      EOD:C.yellow,ERROR:C.bear,MONITOR:C.muted,ORB:C.yellow,SAFETY:C.bull,DB:C.muted};
+                    return <div key={i} style={{fontSize:10,marginBottom:3,display:"flex",gap:7,
+                      borderBottom:`1px solid ${C.dim}33`,paddingBottom:3}}>
+                      <span style={{color:C.dim,flexShrink:0,minWidth:55}}>{l.time}</span>
+                      <span style={{color:TC[l.tag]||C.muted,flexShrink:0,minWidth:60,fontWeight:700}}>[{l.tag}]</span>
                       <span style={{color:C.textDim}}>{l.msg}</span>
                     </div>;
                   })}
@@ -501,19 +637,27 @@ function App(){
                 ))}
               </>}
           </div>
+
           {/* Config */}
           <div style={{background:C.panel,border:`1px solid ${C.border}`,borderRadius:10,padding:"12px 14px"}}>
             <div style={{color:C.muted,fontSize:9,letterSpacing:2,marginBottom:9}}>CONFIG</div>
-            {[["Risk/trade","$"+risk+" fixed"],["Stop","25% of premium"],
-              ["TP1",tp1Cfg.value],["Trail","Breakeven after TP1"],
-              ["Force close","3:45 PM ET"],["Journal","/journal/csv"]
+            {[["Signal mode",  (sigMode||"moderate").toUpperCase()],
+              ["ORB period",   "15 min (9:30–9:45)"],
+              ["Scan interval","5-min bar close"],
+              ["Risk/trade",   "$"+risk+" fixed"],
+              ["Stop",         "25% of premium"],
+              ["TP1",          tp1Cfg.value],
+              ["Trail",        "Breakeven after TP1"],
+              ["Force close",  "3:45 PM ET"],
+              ["Database",     "SQLite (persistent)"],
             ].map(([k,v])=>(
               <div key={k} style={{display:"flex",justifyContent:"space-between",marginBottom:5}}>
                 <span style={{color:C.dim,fontSize:9}}>{k}</span>
-                <span style={{color:C.muted,fontSize:9}}>{v}</span>
+                <span style={{color:C.muted,fontSize:9,textAlign:"right",maxWidth:160}}>{v}</span>
               </div>
             ))}
           </div>
+
           <LogFeed logs={logs}/>
         </div>
       </div>
