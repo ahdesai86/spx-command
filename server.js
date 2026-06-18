@@ -475,9 +475,11 @@ async function calcGEX() {
       if(!strike||!oi) continue;
 
       // Moneyness-based gamma proxy (peaks at ATM, falls off with distance)
-      const moneyness   = Math.abs(strike - spot) / spot;
-      const gammaProxy  = 0.05 * Math.exp(-0.5 * Math.pow(moneyness / 0.01, 2));
-      if(gammaProxy < 0.0001) continue; // too far OTM
+      // Width = 5% of spot price (~$36 on $725 SPY) covers realistic 0DTE range
+      const dist        = Math.abs(strike - spot);
+      const width       = spot * 0.05; // 5% width
+      const gammaProxy  = 0.05 * Math.exp(-0.5 * Math.pow(dist / width, 2));
+      if(gammaProxy < 0.0001) continue; // too far OTM (>3 sigma)
 
       const gex = gammaProxy * oi * 100 * spot;
       if(!strikeMap[strike]) strikeMap[strike]={call:0,put:0};
@@ -852,7 +854,7 @@ app.options("*",cors());
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"9.3-oi-gex",status:"running",
+  service:"SPX COMMAND",version:"9.4-gex-fixed",status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -973,7 +975,7 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"9.3-oi-gex", mode:IS_PAPER?"PAPER":"LIVE",
+    version:"9.4-gex-fixed", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, noTradingView:true,
     exitStrategy:"price-monitor + DELETE /v2/positions",
     riskBudget:"$"+getRiskBudget(),
