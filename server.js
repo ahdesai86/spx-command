@@ -882,7 +882,7 @@ app.options("*",cors());
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"9.1-gex-debug",status:"running",
+  service:"SPX COMMAND",version:"9.2-chain-greeks",status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -1003,7 +1003,7 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"9.1-gex-debug", mode:IS_PAPER?"PAPER":"LIVE",
+    version:"9.2-chain-greeks", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, noTradingView:true,
     exitStrategy:"price-monitor + DELETE /v2/positions",
     riskBudget:"$"+getRiskBudget(),
