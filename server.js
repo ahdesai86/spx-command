@@ -453,69 +453,39 @@ async function calcGEX() {
     }
     log("GEX","Got "+contractList.length+" contracts — fetching greeks...");
 
-    // Step 2: Fetch snapshots (greeks + quotes) in batches of 100
-    const contracts = [];
-    const symbols   = contractList.map(c=>c.symbol).filter(Boolean);
-    for (let i=0; i<symbols.length; i+=100) {
-      const batch = symbols.slice(i,i+100);
-      try {
-        const r = await fetch(
-          ALPACA_DATA+"/v1beta1/options/snapshots?symbols="+batch.join(",")+"&feed=indicative",
-          {headers:aH()}
-        );
-        if (!r.ok) { log("GEX ERR","Snapshots batch "+r.status); continue; }
-        const data  = await r.json();
-        const snaps = data.snapshots||{};
-        for (const [sym,snap] of Object.entries(snaps)) {
-          contracts.push({symbol:sym, ...snap});
-        }
-      } catch(e) { log("GEX ERR","Snapshot batch: "+e.message); }
-    }
-    log("GEX","Got greeks for "+contracts.length+"/"+symbols.length+" contracts");
+    // Step 2: Calculate GEX using OI from contractList + close_price as gamma proxy
+    // Alpaca paper snapshots don't return greeks — use OI × delta_proxy instead
+    // delta_proxy = 0.5 for ATM, scaled by moneyness
+    const contracts = contractList.filter(c=>parseFloat(c.open_interest||0)>0);
+    log("GEX","Using OI-based GEX — "+contracts.length+" contracts with OI > 0");
 
-    if (!contracts.length){log("GEX ERR","No 0DTE contracts for "+exp);return null;}
-    log("GEX","Got "+contracts.length+" contracts — fetching greeks...");
-
-    // Extract GEX from snapshots
-    // OCC symbol format: SPY260618C00746000
+    // Calculate GEX using OI × gamma_proxy
+    // gamma_proxy estimated from moneyness (distance from ATM)
+    // This is an approximation — real gamma requires live greeks feed
+    // Formula: gamma_proxy = 0.5 × exp(-0.5 × moneyness²) (bell curve)
     const strikeMap={};
-    let parsed=0, skippedGamma=0, skippedOI=0;
-
-    // Debug: log first contract structure to understand shape
-    if(contracts.length>0){
-      const sample=contracts[0];
-      log("GEX","Sample contract keys: "+Object.keys(sample).join(","));
-      log("GEX","Sample greeks: "+JSON.stringify(sample.greeks||sample.latestGreeks||"none").slice(0,100));
-      log("GEX","Sample OI: "+(sample.openInterest||sample.open_interest||"none"));
-    }
+    let parsed=0;
 
     for(const c of contracts){
-      const sym = c.symbol||"";
+      const sym    = c.symbol||"";
       if(sym.length<21) continue;
       const right  = sym[12];
       const strike = parseFloat(sym.slice(13,21))/1000;
+      const oi     = parseFloat(c.open_interest||c.openInterest||0);
+      if(!strike||!oi) continue;
 
-      // Try all possible greek field locations
-      const greeks = c.greeks || c.latestGreeks || c.latestQuote?.greeks || {};
-      const gamma  = parseFloat(greeks.gamma||0);
+      // Moneyness-based gamma proxy (peaks at ATM, falls off with distance)
+      const moneyness   = Math.abs(strike - spot) / spot;
+      const gammaProxy  = 0.05 * Math.exp(-0.5 * Math.pow(moneyness / 0.01, 2));
+      if(gammaProxy < 0.0001) continue; // too far OTM
 
-      // Try all possible OI field locations
-      const oi = parseFloat(
-        c.openInterest || c.open_interest ||
-        c.latestTrade?.size || 0
-      );
-
-      if(!strike) continue;
-      if(!gamma){ skippedGamma++; continue; }
-      if(!oi)   { skippedOI++;    continue; }
-
-      const gex = gamma*oi*100*spot;
+      const gex = gammaProxy * oi * 100 * spot;
       if(!strikeMap[strike]) strikeMap[strike]={call:0,put:0};
-      if(right==="C") strikeMap[strike].call+=gex;
-      if(right==="P") strikeMap[strike].put -=gex;
+      if(right==="C") strikeMap[strike].call += gex;
+      if(right==="P") strikeMap[strike].put  -= gex;
       parsed++;
     }
-    log("GEX","Parsed: "+parsed+" | Skipped no gamma: "+skippedGamma+" | Skipped no OI: "+skippedOI);
+    log("GEX","Parsed "+parsed+" contracts (OI×gamma_proxy method)");
 
     const strikes=Object.keys(strikeMap).map(Number).sort((a,b)=>a-b);
     if(!strikes.length){log("GEX ERR","No GEX data");return null;}
@@ -882,7 +852,7 @@ app.options("*",cors());
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"9.2-chain-greeks",status:"running",
+  service:"SPX COMMAND",version:"9.3-oi-gex",status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -1003,7 +973,7 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"9.2-chain-greeks", mode:IS_PAPER?"PAPER":"LIVE",
+    version:"9.3-oi-gex", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, noTradingView:true,
     exitStrategy:"price-monitor + DELETE /v2/positions",
     riskBudget:"$"+getRiskBudget(),
