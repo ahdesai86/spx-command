@@ -277,11 +277,7 @@ let tp1Config  = "3x premium";
 let signalMode = "MODERATE";
 let currentTab = "signals";
 
-// ── Clock ─────────────────────────────────────────────────────────────────────
-setInterval(()=>{
-  document.getElementById("clock").textContent =
-    new Date().toLocaleTimeString("en-US",{hour12:false,timeZone:"America/New_York"})+" ET";
-},1000);
+// ── Clock (initialized in DOMContentLoaded) ──────────────────────────────────
 
 // ── Tabs ──────────────────────────────────────────────────────────────────────
 function setTab(name) {
@@ -765,10 +761,16 @@ async function loadStatus() {
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────
-loadStatus();
-loadJournal();
-connect();
-setInterval(loadJournal, 60000); // refresh journal every minute
+document.addEventListener("DOMContentLoaded", () => {
+  loadStatus();
+  loadJournal();
+  connect();
+  setInterval(loadJournal, 60000);
+  setInterval(()=>{
+    document.getElementById("clock").textContent =
+      new Date().toLocaleTimeString("en-US",{hour12:false,timeZone:"America/New_York"})+" ET";
+  },1000);
+});
 </script>
 </body>
 </html>
