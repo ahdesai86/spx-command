@@ -478,22 +478,44 @@ async function calcGEX() {
 
     // Extract GEX from snapshots
     // OCC symbol format: SPY260618C00746000
-    // Position 12 = right (C/P), positions 13-20 = strike * 1000
     const strikeMap={};
+    let parsed=0, skippedGamma=0, skippedOI=0;
+
+    // Debug: log first contract structure to understand shape
+    if(contracts.length>0){
+      const sample=contracts[0];
+      log("GEX","Sample contract keys: "+Object.keys(sample).join(","));
+      log("GEX","Sample greeks: "+JSON.stringify(sample.greeks||sample.latestGreeks||"none").slice(0,100));
+      log("GEX","Sample OI: "+(sample.openInterest||sample.open_interest||"none"));
+    }
+
     for(const c of contracts){
       const sym = c.symbol||"";
       if(sym.length<21) continue;
       const right  = sym[12];
       const strike = parseFloat(sym.slice(13,21))/1000;
-      const greeks = c.greeks||{};
+
+      // Try all possible greek field locations
+      const greeks = c.greeks || c.latestGreeks || c.latestQuote?.greeks || {};
       const gamma  = parseFloat(greeks.gamma||0);
-      const oi     = parseFloat(c.openInterest||0);
-      if(!strike||!gamma||!oi) continue;
+
+      // Try all possible OI field locations
+      const oi = parseFloat(
+        c.openInterest || c.open_interest ||
+        c.latestTrade?.size || 0
+      );
+
+      if(!strike) continue;
+      if(!gamma){ skippedGamma++; continue; }
+      if(!oi)   { skippedOI++;    continue; }
+
       const gex = gamma*oi*100*spot;
       if(!strikeMap[strike]) strikeMap[strike]={call:0,put:0};
       if(right==="C") strikeMap[strike].call+=gex;
       if(right==="P") strikeMap[strike].put -=gex;
+      parsed++;
     }
+    log("GEX","Parsed: "+parsed+" | Skipped no gamma: "+skippedGamma+" | Skipped no OI: "+skippedOI);
 
     const strikes=Object.keys(strikeMap).map(Number).sort((a,b)=>a-b);
     if(!strikes.length){log("GEX ERR","No GEX data");return null;}
@@ -860,7 +882,7 @@ app.options("*",cors());
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"9.0-autonomous",status:"running",
+  service:"SPX COMMAND",version:"9.1-gex-debug",status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -981,7 +1003,7 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"9.0-autonomous", mode:IS_PAPER?"PAPER":"LIVE",
+    version:"9.1-gex-debug", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, noTradingView:true,
     exitStrategy:"price-monitor + DELETE /v2/positions",
     riskBudget:"$"+getRiskBudget(),
