@@ -80,167 +80,130 @@ const GEX_SCHEDULE  = [{h:9,m:25},{h:10,m:30},{h:12,m:0},{h:14,m:0}];
 // ── SQLite Database ───────────────────────────────────────────────────────────
 const DB_DIR  = fs.existsSync("/data") ? "/data" : __dirname;
 const DB_FILE = path.join(DB_DIR, "spx_command.db");
-let   db      = null;
+
+// ── JSON-based database (no native deps, persists to /data) ──────────────────
+// Stores trades, signals, gex_snapshots as JSON files
+// Compatible with Railway Volume — no SQLite compilation needed
+
+function loadDB(table) {
+  const file = path.join(DB_DIR, table+".json");
+  try {
+    if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file,"utf8"));
+  } catch(e) { log("DB ERR","Load "+table+": "+e.message); }
+  return [];
+}
+
+function saveDB(table, rows) {
+  const file = path.join(DB_DIR, table+".json");
+  try { fs.writeFileSync(file, JSON.stringify(rows, null, 2)); } catch(e) { log("DB ERR","Save "+table+": "+e.message); }
+}
+
+function insertDB(table, row) {
+  const rows = loadDB(table);
+  row.id = rows.length > 0 ? rows[rows.length-1].id + 1 : 1;
+  rows.push(row);
+  saveDB(table, rows);
+  return row;
+}
 
 function initDB() {
-  try {
-    const Database = require("better-sqlite3");
-    db = new Database(DB_FILE);
-    db.pragma("journal_mode = WAL");
-
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS signals (
-        id          INTEGER PRIMARY KEY AUTOINCREMENT,
-        timestamp   TEXT NOT NULL,
-        date        TEXT NOT NULL,
-        time        TEXT NOT NULL,
-        direction   TEXT,
-        spy_price   REAL,
-        orb_high    REAL,
-        orb_low     REAL,
-        vwap        REAL,
-        rsi         REAL,
-        ema9        REAL,
-        ema21       REAL,
-        gex_regime  TEXT,
-        gex_flip    REAL,
-        nearest_wall REAL,
-        signal_strength TEXT,
-        signal_mode TEXT,
-        fired       INTEGER DEFAULT 0,
-        blocked_reason TEXT
-      );
-
-      CREATE TABLE IF NOT EXISTS trades (
-        id              INTEGER PRIMARY KEY AUTOINCREMENT,
-        signal_id       INTEGER,
-        timestamp       TEXT NOT NULL,
-        date            TEXT NOT NULL,
-        time            TEXT NOT NULL,
-        bot             TEXT DEFAULT 'SPX-COMMAND-v9',
-        symbol          TEXT,
-        direction       TEXT,
-        right_type      TEXT,
-        strike          REAL,
-        expiry          TEXT,
-        contracts       INTEGER,
-        fill_price      REAL,
-        total_cost      REAL,
-        stop_price      REAL,
-        tp1_price       REAL,
-        close_price     REAL,
-        close_reason    TEXT,
-        pnl             REAL,
-        pnl_pct         REAL,
-        duration_min    REAL,
-        outcome         TEXT,
-        gex_regime      TEXT,
-        gex_flip        REAL,
-        orb_high        REAL,
-        orb_low         REAL,
-        vwap_at_entry   REAL,
-        rsi_at_entry    REAL,
-        ema9_at_entry   REAL,
-        ema21_at_entry  REAL,
-        tp1_mode        TEXT,
-        risk_budget     REAL,
-        signal_mode     TEXT
-      );
-
-      CREATE TABLE IF NOT EXISTS gex_snapshots (
-        id          INTEGER PRIMARY KEY AUTOINCREMENT,
-        timestamp   TEXT NOT NULL,
-        spot_price  REAL,
-        net_gex     REAL,
-        regime      TEXT,
-        gamma_flip  REAL,
-        call_wall_1 REAL,
-        call_wall_2 REAL,
-        call_wall_3 REAL,
-        put_wall_1  REAL,
-        put_wall_2  REAL,
-        put_wall_3  REAL
-      );
-    `);
-    log("DB", "SQLite initialized at "+DB_FILE);
-  } catch(e) {
-    log("DB ERR", "SQLite unavailable: "+e.message+" — using JSON fallback");
-    db = null;
-  }
+  // Ensure DB dir exists
+  if (!fs.existsSync(DB_DIR)) { try { fs.mkdirSync(DB_DIR, {recursive:true}); } catch(_){} }
+  // Create empty tables if missing
+  ["signals","trades","gex_snapshots"].forEach(t => {
+    const file = path.join(DB_DIR, t+".json");
+    if (!fs.existsSync(file)) saveDB(t, []);
+  });
+  log("DB", "JSON database initialized at "+DB_DIR);
 }
 
-function dbRun(sql, params) {
-  if (!db) return null;
-  try { return db.prepare(sql).run(...(params||[])); } catch(e) { log("DB ERR", e.message); return null; }
-}
-
-function dbAll(sql, params) {
-  if (!db) return [];
-  try { return db.prepare(sql).all(...(params||[])); } catch(e) { log("DB ERR", e.message); return []; }
-}
+// Shim for compatibility
+const db = true; // always "connected"
+function dbRun(sql, params) { return null; } // not used — insertDB used directly
+function dbAll(sql, params) { return []; }   // not used — loadDB used directly
 
 function saveSignalToDB(sig, indicators, fired, blockedReason) {
-  return dbRun(`INSERT INTO signals (
-    timestamp,date,time,direction,spy_price,orb_high,orb_low,
-    vwap,rsi,ema9,ema21,gex_regime,gex_flip,nearest_wall,
-    signal_strength,signal_mode,fired,blocked_reason
-  ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [
-    new Date().toISOString(),
-    new Date().toLocaleDateString("en-CA",{timeZone:"America/New_York"}),
-    new Date().toLocaleTimeString("en-US",{hour12:false,timeZone:"America/New_York"}),
-    sig.direction, sig.spyEntry,
-    indicators.orbHigh, indicators.orbLow,
-    indicators.vwap, indicators.rsi,
-    indicators.ema9, indicators.ema21,
-    gexCache?.regime||null, gexCache?.gammaFlip||null,
-    sig.gexTarget||null,
-    sig.strength||null, SIGNAL_MODE,
-    fired?1:0, blockedReason||null,
-  ]);
+  try {
+    return insertDB("signals", {
+      timestamp:      new Date().toISOString(),
+      date:           new Date().toLocaleDateString("en-CA",{timeZone:"America/New_York"}),
+      time:           new Date().toLocaleTimeString("en-US",{hour12:false,timeZone:"America/New_York"}),
+      direction:      sig.direction,
+      spy_price:      sig.spyEntry,
+      orb_high:       indicators.orbHigh||null,
+      orb_low:        indicators.orbLow||null,
+      vwap:           indicators.vwap||null,
+      rsi:            indicators.rsi||null,
+      ema9:           indicators.ema9||null,
+      ema21:          indicators.ema21||null,
+      gex_regime:     gexCache?.regime||null,
+      gex_flip:       gexCache?.gammaFlip||null,
+      nearest_wall:   sig.gexTarget||null,
+      signal_strength:sig.strength||null,
+      signal_mode:    SIGNAL_MODE,
+      fired:          fired?1:0,
+      blocked_reason: blockedReason||null,
+    });
+  } catch(e) { log("DB ERR","saveSignalToDB: "+e.message); return null; }
 }
 
 function saveTradeToDB(trade, signalDbId, indicators) {
-  return dbRun(`INSERT INTO trades (
-    signal_id,timestamp,date,time,bot,symbol,direction,right_type,
-    strike,expiry,contracts,fill_price,total_cost,stop_price,tp1_price,
-    close_price,close_reason,pnl,pnl_pct,duration_min,outcome,
-    gex_regime,gex_flip,orb_high,orb_low,vwap_at_entry,
-    rsi_at_entry,ema9_at_entry,ema21_at_entry,tp1_mode,risk_budget,signal_mode
-  ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [
-    signalDbId||null,
-    new Date().toISOString(),
-    new Date().toLocaleDateString("en-CA",{timeZone:"America/New_York"}),
-    new Date().toLocaleTimeString("en-US",{hour12:false,timeZone:"America/New_York"}),
-    "SPX-COMMAND-v9",
-    trade.optionSymbol, trade.direction, trade.right,
-    trade.strike, trade.expiry, trade.contracts,
-    trade.fillPrice, trade.totalCost,
-    trade.stopPrice, trade.tp1Price,
-    trade.closePrice||null, trade.closeReason||null,
-    trade.closePnl||null,
-    trade.closePnl&&trade.totalCost ? parseFloat(((trade.closePnl/trade.totalCost)*100).toFixed(1)) : null,
-    trade.durationMin||null,
-    trade.outcome||null,
-    gexCache?.regime||null, gexCache?.gammaFlip||null,
-    indicators?.orbHigh||null, indicators?.orbLow||null,
-    indicators?.vwap||null, indicators?.rsi||null,
-    indicators?.ema9||null, indicators?.ema21||null,
-    TP1_FIXED_MOVE>0?"fixed-$"+TP1_FIXED_MOVE:TP1_MULTIPLIER+"x",
-    getRiskBudget(), SIGNAL_MODE,
-  ]);
+  try {
+    const pnlPct = trade.closePnl&&trade.totalCost
+      ? parseFloat(((trade.closePnl/trade.totalCost)*100).toFixed(1)) : null;
+    return insertDB("trades", {
+      signal_id:      signalDbId||null,
+      timestamp:      new Date().toISOString(),
+      date:           new Date().toLocaleDateString("en-CA",{timeZone:"America/New_York"}),
+      time:           new Date().toLocaleTimeString("en-US",{hour12:false,timeZone:"America/New_York"}),
+      bot:            "SPX-COMMAND-v9",
+      symbol:         trade.optionSymbol,
+      direction:      trade.direction,
+      right_type:     trade.right,
+      strike:         trade.strike,
+      expiry:         trade.expiry,
+      contracts:      trade.contracts,
+      fill_price:     trade.fillPrice,
+      total_cost:     trade.totalCost,
+      stop_price:     trade.stopPrice,
+      tp1_price:      trade.tp1Price,
+      close_price:    trade.closePrice||null,
+      close_reason:   trade.closeReason||null,
+      pnl:            trade.closePnl||null,
+      pnl_pct:        pnlPct,
+      duration_min:   trade.durationMin||null,
+      outcome:        trade.outcome||null,
+      gex_regime:     gexCache?.regime||null,
+      gex_flip:       gexCache?.gammaFlip||null,
+      orb_high:       indicators?.orbHigh||null,
+      orb_low:        indicators?.orbLow||null,
+      vwap_at_entry:  indicators?.vwap||null,
+      rsi_at_entry:   indicators?.rsi||null,
+      ema9_at_entry:  indicators?.ema9||null,
+      ema21_at_entry: indicators?.ema21||null,
+      tp1_mode:       TP1_FIXED_MOVE>0?"fixed-$"+TP1_FIXED_MOVE:TP1_MULTIPLIER+"x",
+      risk_budget:    getRiskBudget(),
+      signal_mode:    SIGNAL_MODE,
+    });
+  } catch(e) { log("DB ERR","saveTradeToDB: "+e.message); return null; }
 }
 
 function saveGEXSnapshot(g) {
-  dbRun(`INSERT INTO gex_snapshots (
-    timestamp,spot_price,net_gex,regime,gamma_flip,
-    call_wall_1,call_wall_2,call_wall_3,
-    put_wall_1,put_wall_2,put_wall_3
-  ) VALUES (?,?,?,?,?,?,?,?,?,?,?)`, [
-    new Date().toISOString(),
-    g.spotPrice, g.netGex, g.regime, g.gammaFlip,
-    g.callWalls?.[0]?.price||null, g.callWalls?.[1]?.price||null, g.callWalls?.[2]?.price||null,
-    g.putWalls?.[0]?.price||null,  g.putWalls?.[1]?.price||null,  g.putWalls?.[2]?.price||null,
-  ]);
+  try {
+    insertDB("gex_snapshots", {
+      timestamp:   new Date().toISOString(),
+      spot_price:  g.spotPrice,
+      net_gex:     g.netGex,
+      regime:      g.regime,
+      gamma_flip:  g.gammaFlip,
+      call_wall_1: g.callWalls?.[0]?.price||null,
+      call_wall_2: g.callWalls?.[1]?.price||null,
+      call_wall_3: g.callWalls?.[2]?.price||null,
+      put_wall_1:  g.putWalls?.[0]?.price||null,
+      put_wall_2:  g.putWalls?.[1]?.price||null,
+      put_wall_3:  g.putWalls?.[2]?.price||null,
+    });
+  } catch(e) { log("DB ERR","saveGEXSnapshot: "+e.message); }
 }
 
 // ── Logging ───────────────────────────────────────────────────────────────────
@@ -986,8 +949,9 @@ app.get("/db/export",(req,res)=>{
 });
 
 app.get("/status",(req,res)=>{
-  const stats=dbAll("SELECT COUNT(*) as t,SUM(CASE WHEN outcome='WIN' THEN 1 ELSE 0 END) as w,ROUND(SUM(pnl),2) as p FROM trades WHERE close_reason IS NOT NULL",[]);
-  const s=stats[0]||{};
+  const allTrades=loadDB("trades").filter(t=>t.close_reason);
+  const wins=allTrades.filter(t=>t.outcome==="WIN");
+  const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
     version:"9.0-autonomous", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, noTradingView:true,
