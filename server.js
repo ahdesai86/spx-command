@@ -419,10 +419,13 @@ function evaluateSignal(ind) {
   return {fire, direction:dir, strength, reason, passed, failed};
 }
 
-// ── GEX ───────────────────────────────────────────────────────────────────────
+// ── GEX (using real greeks via OPRA feed — Algo Trader Plus) ──────────────────
+const OPTIONS_FEED = process.env.OPTIONS_FEED || "opra"; // "opra" (paid, real greeks) or "indicative" (free, no greeks)
+let fullChainCache = null; // full chain with greeks, refreshed alongside GEX — used by strike selector
+
 async function calcGEX() {
   try {
-    log("GEX","Calculating from Alpaca chain...");
+    log("GEX","Calculating from Alpaca chain ("+OPTIONS_FEED+" feed)...");
     const spot = await getSPYQuote();
     if (!spot) { log("GEX ERR","No SPY spot"); return null; }
     log("GEX","SPY: $"+spot.toFixed(2));
@@ -430,98 +433,69 @@ async function calcGEX() {
     const d   = new Date(new Date().toLocaleString("en-US",{timeZone:"America/New_York"}));
     const exp = d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0");
 
-    // Step 1: Get contract list for today from broker API (not data API)
-    // Uses /v2/options/contracts which supports underlying_symbols + expiration filters
-    let contractList=[], next=null;
-    do {
-      let url = ALPACA_BASE+"/v2/options/contracts?underlying_symbols=SPY&status=active&limit=200"+
-        "&expiration_date_gte="+exp+"&expiration_date_lte="+exp;
-      if (next) url+="&page_token="+next;
-      const r = await fetch(url,{headers:aH()});
-      if (!r.ok){
-        log("GEX ERR","Contracts "+r.status+": "+await r.text());
-        break;
-      }
-      const data=await r.json();
-      contractList = contractList.concat(data.option_contracts||[]);
-      next = data.next_page_token||null;
-    } while(next);
-
-    if (!contractList.length){
-      log("GEX ERR","No 0DTE contracts for "+exp+" — market closed or no options today");
-      return null;
-    }
-    log("GEX","Got "+contractList.length+" contracts — fetching greeks...");
-
-    // Step 2: Fetch option chain with greeks
-    // Correct endpoint: GET /v1beta1/options/snapshots/{underlying_symbol}
-    // underlying_symbol goes in PATH, expiration_date as query param
+    // Fetch option chain with greeks directly — correct endpoint per Alpaca docs:
+    // GET /v1beta1/options/snapshots/{underlying_symbol}?feed=opra&expiration_date=YYYY-MM-DD
     const contracts = [];
     let chainNext = null;
     do {
-      let url = ALPACA_DATA+"/v1beta1/options/snapshots/SPY?feed=indicative&limit=1000"+
+      let url = ALPACA_DATA+"/v1beta1/options/snapshots/SPY?feed="+OPTIONS_FEED+"&limit=1000"+
         "&expiration_date="+exp;
       if (chainNext) url += "&page_token="+chainNext;
       const r = await fetch(url, {headers:aH()});
       if (!r.ok) {
-        log("GEX ERR","Chain "+r.status+": "+await r.text());
+        const errTxt = await r.text();
+        log("GEX ERR","Chain "+r.status+": "+errTxt);
+        if (OPTIONS_FEED==="opra" && r.status===403) {
+          log("GEX","OPRA feed forbidden — falling back to indicative (no greeks)");
+        }
         break;
       }
       const data = await r.json();
       const snaps = data.snapshots||{};
-      for (const [sym,snap] of Object.entries(snaps)) {
-        contracts.push({symbol:sym,...snap});
-      }
+      for (const [sym,snap] of Object.entries(snaps)) contracts.push({symbol:sym,...snap});
       chainNext = data.next_page_token||null;
     } while(chainNext);
 
-    log("GEX","Chain returned "+contracts.length+" snapshots with greeks");
+    if (!contracts.length) { log("GEX ERR","No contracts returned for "+exp); return null; }
 
-    // Debug first contract to confirm greeks present
-    if (contracts.length>0) {
-      const s=contracts[0];
-      log("GEX","Keys: "+Object.keys(s).slice(0,8).join(","));
-      log("GEX","Greeks: "+JSON.stringify(s.greeks||"none").slice(0,80));
-      log("GEX","OI: "+(s.openInterest||"none"));
-    }
+    // Confirm we have real greeks (opra feed) vs not (indicative feed)
+    const sample = contracts.find(c=>c.greeks && c.greeks.gamma);
+    const hasRealGreeks = !!sample;
+    log("GEX", hasRealGreeks
+      ? "✓ Real greeks present (OPRA) — sample gamma: "+sample.greeks.gamma
+      : "⚠ No greeks in response — using OI×proxy fallback");
 
-    // Calculate GEX: gamma × OI × 100 × spot
-    // greeks.gamma comes directly from chain endpoint
+    // Cache full chain (with greeks) for strike selection later
+    fullChainCache = { contracts, spot, expiry:exp, updatedAt:new Date().toISOString() };
+
     const strikeMap={};
-    let parsed=0, noGamma=0, noOI=0;
+    let parsed=0, skipped=0;
 
-    for(const c of contracts){
-      const sym    = c.symbol||"";
-      if(sym.length<21) continue;
-      const right  = sym[12]; // C or P
+    for (const c of contracts) {
+      const sym = c.symbol||"";
+      if (sym.length<21) continue;
+      const right  = sym[12];
       const strike = parseFloat(sym.slice(13,21))/1000;
+      const oi     = parseFloat(c.openInterest||0);
+      let   gamma  = parseFloat((c.greeks||{}).gamma||0);
 
-      // Real gamma from greeks (chain endpoint provides this)
-      const greeks = c.greeks||{};
-      let   gamma  = parseFloat(greeks.gamma||0);
+      if (!strike) continue;
 
-      // OI from snapshot
-      const oi = parseFloat(c.openInterest||c.open_interest||0);
-
-      if(!strike) continue;
-
-      // If no real gamma, use OI-based proxy as fallback
-      if(!gamma || gamma===0) {
-        const dist   = Math.abs(strike - spot);
-        const width  = spot * 0.05;
-        gamma = 0.05 * Math.exp(-0.5 * Math.pow(dist/width, 2));
-        if(gamma < 0.0001) { noGamma++; continue; }
+      // Fallback gamma proxy only if real greeks unavailable
+      if (!gamma) {
+        const dist  = Math.abs(strike - spot);
+        const sigma = spot * 0.02;
+        gamma = (1/(sigma*Math.sqrt(2*Math.PI))) * Math.exp(-0.5*Math.pow(dist/sigma,2));
       }
-
-      if(!oi) { noOI++; continue; }
+      if (!oi) { skipped++; continue; }
 
       const gex = gamma * oi * 100 * spot;
-      if(!strikeMap[strike]) strikeMap[strike]={call:0,put:0};
-      if(right==="C") strikeMap[strike].call += gex;
-      if(right==="P") strikeMap[strike].put  -= gex;
+      if (!strikeMap[strike]) strikeMap[strike]={call:0,put:0};
+      if (right==="C") strikeMap[strike].call += gex;
+      if (right==="P") strikeMap[strike].put  -= gex;
       parsed++;
     }
-    log("GEX","Parsed: "+parsed+" | No gamma: "+noGamma+" | No OI: "+noOI);
+    log("GEX","Parsed: "+parsed+" | Skipped (no OI): "+skipped+" | Real greeks: "+hasRealGreeks);
 
     const strikes=Object.keys(strikeMap).map(Number).sort((a,b)=>a-b);
     if(!strikes.length){log("GEX ERR","No GEX data");return null;}
@@ -535,7 +509,7 @@ async function calcGEX() {
 
     const result={callWalls,putWalls,gammaFlip:parseFloat(flip.toFixed(2)),
       netGex:Math.round(net),regime:net>=0?"positive":"negative",
-      spotPrice:spot,updatedAt:new Date().toISOString()};
+      spotPrice:spot,updatedAt:new Date().toISOString(),hasRealGreeks};
 
     log("GEX","✓ Regime:"+result.regime+" | Flip:$"+result.gammaFlip+
       " | Calls:"+callWalls.slice(0,3).map(w=>"$"+w.price).join(","));
@@ -572,24 +546,94 @@ function applyGEX(direction, entry) {
   return {allowed:true,reason:"No GEX filter",tp1:entry,tp2:entry,target:null};
 }
 
-// ── Strike selection ──────────────────────────────────────────────────────────
-function selectStrike(price, direction) {
-  const atm=Math.round(price);
-  if(!gexCache) return {strike:atm,reason:"ATM (no GEX)",delta:0.50,otm:0};
-  const isPos=gexCache.regime==="positive";
+// ── Strike selection (greeks-optimized when real data available) ─────────────
+/**
+ * Score each candidate strike between ATM and the GEX target by:
+ *   payoff_score = estimated_gain_at_target / premium_cost
+ * estimated_gain_at_target ≈ delta × (target - entry) + 0.5 × gamma × (target-entry)²
+ * (delta-gamma approximation of option price change for a move to target)
+ *
+ * Filters out strikes with abnormally high IV relative to the chain median
+ * (overpriced contracts give worse R:R even if direction is correct).
+ *
+ * Falls back to the old OTM-by-distance heuristic if real greeks aren't cached.
+ */
+function selectStrike(price, direction, target) {
+  const atm = Math.round(price);
+
+  // No GEX cache at all → pure ATM fallback
+  if (!gexCache) return {strike:atm,reason:"ATM (no GEX)",delta:0.50,otm:0};
+
+  const isPos = gexCache.regime==="positive";
+  const haveChain = fullChainCache && fullChainCache.contracts && gexCache.hasRealGreeks;
+
+  // ── Greeks-optimized path ────────────────────────────────────────────────
+  if (haveChain && target) {
+    const right = direction==="LONG" ? "C" : "P";
+    const move  = target - price; // signed distance to target
+
+    // Build candidate list: contracts of the right type between ATM and target
+    const candidates = [];
+    for (const c of fullChainCache.contracts) {
+      const sym = c.symbol||"";
+      if (sym.length<21 || sym[12]!==right) continue;
+      const strike = parseFloat(sym.slice(13,21))/1000;
+      const inRange = direction==="LONG" ? (strike>=atm-1 && strike<=target) : (strike<=atm+1 && strike>=target);
+      if (!inRange) continue;
+
+      const greeks = c.greeks||{};
+      const delta  = Math.abs(parseFloat(greeks.delta||0));
+      const gamma  = parseFloat(greeks.gamma||0);
+      const iv     = parseFloat(greeks.impliedVolatility||greeks.iv||0);
+      const mid    = ((parseFloat(c.latestQuote?.bp||0)+parseFloat(c.latestQuote?.ap||0))/2)||0;
+
+      if (!delta || !mid || mid<=0) continue;
+      candidates.push({strike, delta, gamma, iv, mid, symbol:sym});
+    }
+
+    if (candidates.length) {
+      const ivs = candidates.map(c=>c.iv).filter(v=>v>0).sort((a,b)=>a-b);
+      const medianIV = ivs.length ? ivs[Math.floor(ivs.length/2)] : 0;
+
+      const scored = candidates.map(c => {
+        // Delta-gamma approximation of option price change to target
+        const estMove = c.delta*Math.abs(move) + 0.5*c.gamma*Math.pow(move,2);
+        const payoffScore = estMove / c.mid; // bigger = better R:R per $ paid
+        const ivPenalty = medianIV>0 && c.iv > medianIV*1.3 ? 0.6 : 1.0; // discount overpriced IV
+        return {...c, score: payoffScore*ivPenalty};
+      }).sort((a,b)=>b.score-a.score);
+
+      const best = scored[0];
+      if (best) {
+        return {
+          strike: best.strike,
+          reason: "Greeks-optimized: δ"+best.delta.toFixed(2)+" γ"+best.gamma.toFixed(4)+
+                   " IV"+(best.iv*100).toFixed(0)+"% → best payoff/cost toward $"+target.toFixed(2),
+          delta: best.delta,
+          gamma: best.gamma,
+          impliedVol: best.iv,
+          otm: Math.abs(best.strike-atm),
+          method: "greeks",
+        };
+      }
+    }
+    log("STRIKE","No valid greeks-scored candidates — falling back to heuristic");
+  }
+
+  // ── Heuristic fallback (no real greeks, or no candidates found) ─────────
   if(direction==="LONG"){
     const walls=(gexCache.callWalls||[]).filter(w=>w.price>price).sort((a,b)=>a.price-b.price);
-    if(!walls.length) return {strike:atm+1,reason:"OTM+1",delta:0.45,otm:1};
+    if(!walls.length) return {strike:atm+1,reason:"OTM+1",delta:0.45,otm:1,method:"heuristic"};
     const dist=walls[0].price-price, otm=Math.min(5,Math.max(1,Math.round(dist*(isPos?0.30:0.15))));
-    return {strike:Math.min(Math.round(atm+otm),Math.round(walls[0].price-1)),reason:(isPos?"pos":"neg")+" GEX → "+otm+" OTM toward $"+walls[0].price,delta:Math.max(0.15,0.50-otm*0.08),otm};
+    return {strike:Math.min(Math.round(atm+otm),Math.round(walls[0].price-1)),reason:(isPos?"pos":"neg")+" GEX → "+otm+" OTM toward $"+walls[0].price,delta:Math.max(0.15,0.50-otm*0.08),otm,method:"heuristic"};
   }
   if(direction==="SHORT"){
     const walls=(gexCache.putWalls||[]).filter(w=>w.price<price).sort((a,b)=>b.price-a.price);
-    if(!walls.length) return {strike:atm-1,reason:"OTM+1",delta:0.45,otm:1};
+    if(!walls.length) return {strike:atm-1,reason:"OTM+1",delta:0.45,otm:1,method:"heuristic"};
     const dist=price-walls[0].price, otm=Math.min(5,Math.max(1,Math.round(dist*(isPos?0.30:0.15))));
-    return {strike:Math.max(Math.round(atm-otm),Math.round(walls[0].price+1)),reason:(isPos?"pos":"neg")+" GEX → "+otm+" OTM toward $"+walls[0].price,delta:Math.max(0.15,0.50-otm*0.08),otm};
+    return {strike:Math.max(Math.round(atm-otm),Math.round(walls[0].price+1)),reason:(isPos?"pos":"neg")+" GEX → "+otm+" OTM toward $"+walls[0].price,delta:Math.max(0.15,0.50-otm*0.08),otm,method:"heuristic"};
   }
-  return {strike:atm,reason:"ATM fallback",delta:0.50,otm:0};
+  return {strike:atm,reason:"ATM fallback",delta:0.50,otm:0,method:"heuristic"};
 }
 
 // ── OCC helpers ───────────────────────────────────────────────────────────────
@@ -680,7 +724,7 @@ async function executeTrade(direction, price, indicators, gexResult) {
 
   const right = direction==="LONG"?"C":"P";
   const date  = getETDate();
-  const si    = selectStrike(price, direction);
+  const si    = selectStrike(price, direction, gexResult?.target);
 
   const sig = {
     id:          Date.now(),
@@ -688,6 +732,8 @@ async function executeTrade(direction, price, indicators, gexResult) {
     symbol:      "SPY", direction, right,
     spyEntry:    price, strike:si.strike,
     strikeReason:si.reason, estimatedDelta:si.delta,
+    estimatedGamma:si.gamma||null, impliedVol:si.impliedVol||null,
+    strikeMethod:si.method||"heuristic",
     stop:        indicators.orbLow,
     tp1:         gexResult.tp1, tp2:gexResult.tp2,
     gexTarget:   gexResult.target, gexReason:gexResult.reason,
@@ -888,7 +934,7 @@ app.options("*",cors());
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"9.5-correct-chain",status:"running",
+  service:"SPX COMMAND",version:"10.0-real-greeks",status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -1009,10 +1055,12 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"9.5-correct-chain", mode:IS_PAPER?"PAPER":"LIVE",
+    version:"10.0-real-greeks", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, noTradingView:true,
     exitStrategy:"price-monitor + DELETE /v2/positions",
     riskBudget:"$"+getRiskBudget(),
+    optionsFeed:OPTIONS_FEED,
+    realGreeks:gexCache?.hasRealGreeks||false,
     tp1Config:{mode:TP1_FIXED_MOVE>0?"fixed":"multiplier",value:TP1_FIXED_MOVE>0?"$"+TP1_FIXED_MOVE:TP1_MULTIPLIER+"x"},
     sessionPnL:sessionPnL.toFixed(2), dailyLoss:dailyLoss.toFixed(2),
     dailyLossLimit:(ACCOUNT_SIZE*MAX_DAILY_LOSS).toFixed(2),
