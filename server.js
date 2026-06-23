@@ -169,6 +169,10 @@ function saveTradeToDB(trade, signalDbId, indicators) {
       tp1_price:      trade.tp1Price,
       close_price:    trade.closePrice||null,
       close_reason:   trade.closeReason||null,
+      max_price:      trade.maxPrice!=null?trade.maxPrice:null,
+      min_price:      trade.minPrice!=null?trade.minPrice:null,
+      max_pnl_pct:    trade.maxPnlPct!=null?trade.maxPnlPct:null,
+      min_pnl_pct:    trade.minPnlPct!=null?trade.minPnlPct:null,
       pnl:            trade.closePnl||null,
       pnl_pct:        pnlPct,
       duration_min:   trade.durationMin||null,
@@ -216,9 +220,45 @@ function log(tag, msg) {
   broadcast(e);
 }
 
+/**
+ * Recursively strip non-serializable / internal fields before broadcasting.
+ * Specifically targets signal._monitorInterval (a live setInterval Timeout handle)
+ * which previously caused "Converting circular structure to JSON" on EVERY
+ * broadcast that carried a signal object — silently breaking the dashboard
+ * and flooding Railway logs with ~1 crash per 4 seconds all session.
+ */
+function sanitizeForBroadcast(obj, seen) {
+  seen = seen || new WeakSet();
+  if (obj === null || typeof obj !== "object") return obj;
+  if (seen.has(obj)) return undefined; // break circular refs defensively
+  seen.add(obj);
+
+  if (Array.isArray(obj)) {
+    return obj.map(v => sanitizeForBroadcast(v, seen));
+  }
+
+  const out = {};
+  for (const key of Object.keys(obj)) {
+    if (key.startsWith("_")) continue; // drop _monitorInterval, _dbId-style internals
+    const val = obj[key];
+    // Timeout/Interval handles are objects with no enumerable own props that matter to us —
+    // detect by duck-typing (has _idleTimeout / _onTimeout, Node's internal Timeout shape)
+    if (val && typeof val === "object" && ("_idleTimeout" in val || "_onTimeout" in val)) continue;
+    if (typeof val === "function") continue;
+    out[key] = (val && typeof val === "object") ? sanitizeForBroadcast(val, seen) : val;
+  }
+  return out;
+}
+
 function broadcast(p) {
-  const d = "data: "+JSON.stringify(p)+"\n\n";
-  sseClients.forEach(c=>{ try{c.write(d);}catch(_){} });
+  try {
+    const safe = sanitizeForBroadcast(p);
+    const d = "data: "+JSON.stringify(safe)+"\n\n";
+    sseClients.forEach(c=>{ try{c.write(d);}catch(_){} });
+  } catch(e) {
+    // Use console.error directly, NOT log() — log() calls broadcast(), which would recurse
+    console.error("[BROADCAST ERR] "+e.message);
+  }
 }
 
 // ── Alpaca helpers ─────────────────────────────────────────────────────────────
@@ -469,17 +509,18 @@ async function calcGEX() {
     fullChainCache = { contracts, spot, expiry:exp, updatedAt:new Date().toISOString() };
 
     const strikeMap={};
-    let parsed=0, skipped=0;
+    let parsed=0, skipped=0, oiAvailableCount=0;
 
     for (const c of contracts) {
       const sym = c.symbol||"";
       if (sym.length<21) continue;
       const right  = sym[12];
       const strike = parseFloat(sym.slice(13,21))/1000;
-      const oi     = parseFloat(c.openInterest||0);
+      let   oi      = parseFloat(c.openInterest||0);
       let   gamma  = parseFloat((c.greeks||{}).gamma||0);
 
       if (!strike) continue;
+      if (oi > 0) oiAvailableCount++;
 
       // Fallback gamma proxy only if real greeks unavailable
       if (!gamma) {
@@ -487,7 +528,14 @@ async function calcGEX() {
         const sigma = spot * 0.02;
         gamma = (1/(sigma*Math.sqrt(2*Math.PI))) * Math.exp(-0.5*Math.pow(dist/sigma,2));
       }
-      if (!oi) { skipped++; continue; }
+
+      // FIX: Alpaca's options snapshots endpoint does not return openInterest at all
+      // (confirmed empirically — every contract had oi=0, so the old `if(!oi) continue`
+      // line silently discarded ALL contracts every single time, producing "No GEX data"
+      // on every run regardless of feed tier). When OI is genuinely missing, fall back to
+      // a flat assumed weight of 1 so relative GEX between strikes (driven by gamma) still
+      // produces a usable wall ranking, rather than zeroing out the whole calculation.
+      if (!oi) oi = 1;
 
       const gex = gamma * oi * 100 * spot;
       if (!strikeMap[strike]) strikeMap[strike]={call:0,put:0};
@@ -495,7 +543,8 @@ async function calcGEX() {
       if (right==="P") strikeMap[strike].put  -= gex;
       parsed++;
     }
-    log("GEX","Parsed: "+parsed+" | Skipped (no OI): "+skipped+" | Real greeks: "+hasRealGreeks);
+    log("GEX","Parsed: "+parsed+" | OI available on "+oiAvailableCount+"/"+contracts.length+" contracts (0 expected — Alpaca snapshots endpoint doesn't return OI) | Real greeks: "+hasRealGreeks);
+
 
     const strikes=Object.keys(strikeMap).map(Number).sort((a,b)=>a-b);
     if(!strikes.length){log("GEX ERR","No GEX data");return null;}
@@ -662,18 +711,29 @@ async function closePosition(symbol){
 
 // ── Price monitor ─────────────────────────────────────────────────────────────
 function startMonitor(signal, indicators) {
-  log("MONITOR","Watching "+signal.optionSymbol+" | stop $"+signal.stopPrice+" | tp1 $"+signal.tp1Price);
+  log("MONITOR","Watching "+signal.optionSymbol+" | stop $"+signal.stopPrice+" | tp1 $"+signal.tp1Price+" | poll: 60s");
   const entryTime=Date.now();
+  let consecutiveErrors = 0;
+  const MAX_CONSECUTIVE_ERRORS = 5; // ~5 minutes of failures before giving up and flagging
 
   const iv=setInterval(async()=>{
     if(!["FILLED"].includes(signal.status)){clearInterval(iv);return;}
     try{
       const pos=await aGet("/v2/positions/"+encodeURIComponent(signal.optionSymbol));
+      consecutiveErrors = 0; // reset on any successful poll
       const price=parseFloat(pos.current_price||0);
       if(!price) return;
       const entry=signal.fillPrice||signal.midPrice;
       const pct=((price-entry)/entry*100).toFixed(1);
-      log("MONITOR",signal.optionSymbol+" $"+price+" | P&L "+pct+"% | stop $"+signal.stopPrice+" | tp1 $"+signal.tp1Price);
+
+      // Track max/min price seen while position is open (for dashboard + journal)
+      signal.maxPrice = signal.maxPrice!=null ? Math.max(signal.maxPrice, price) : price;
+      signal.minPrice = signal.minPrice!=null ? Math.min(signal.minPrice, price) : price;
+      signal.maxPnlPct = signal.maxPrice!=null ? parseFloat((((signal.maxPrice-entry)/entry)*100).toFixed(1)) : null;
+      signal.minPnlPct = signal.minPrice!=null ? parseFloat((((signal.minPrice-entry)/entry)*100).toFixed(1)) : null;
+
+      log("MONITOR",signal.optionSymbol+" $"+price+" | P&L "+pct+"% | stop $"+signal.stopPrice+" | tp1 $"+signal.tp1Price+" | max $"+signal.maxPrice+" | min $"+signal.minPrice);
+      broadcast({type:"signal_update",id:signal.id,currentPrice:price,maxPrice:signal.maxPrice,minPrice:signal.minPrice,maxPnlPct:signal.maxPnlPct,minPnlPct:signal.minPnlPct});
 
       if(price>=signal.tp1Price){
         clearInterval(iv);
@@ -710,11 +770,23 @@ function startMonitor(signal, indicators) {
         signal.outcome="LOSS";
         broadcast({type:"signal_update",id:signal.id,status:"EOD_CLOSED"});
         saveTradeToDB(signal,signal._dbId,indicators);
+        return;
+      }
+      // FIX: previously any non-404 error was silently swallowed here, which could
+      // leave a position monitored-in-name-only forever with zero trace in the logs.
+      consecutiveErrors++;
+      log("MONITOR ERR", signal.optionSymbol+" poll failed ("+consecutiveErrors+"/"+MAX_CONSECUTIVE_ERRORS+"): "+e.message);
+      if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+        clearInterval(iv);
+        log("MONITOR ERR", signal.optionSymbol+" — "+MAX_CONSECUTIVE_ERRORS+" consecutive poll failures, giving up. POSITION MAY STILL BE OPEN — CHECK ALPACA MANUALLY.");
+        signal.status = "MONITOR_FAILED";
+        broadcast({type:"signal_update",id:signal.id,status:"MONITOR_FAILED"});
       }
     }
-  },30000);
+  },60000); // 60s = 1 minute poll, per request (was 30s)
   signal._monitorInterval=iv;
 }
+
 
 // ── Execute trade ─────────────────────────────────────────────────────────────
 async function executeTrade(direction, price, indicators, gexResult) {
@@ -934,7 +1006,7 @@ app.options("*",cors());
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"10.0-real-greeks",status:"running",
+  service:"SPX COMMAND",version:"10.1-monitor-broadcast-fix",status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -1055,7 +1127,7 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"10.0-real-greeks", mode:IS_PAPER?"PAPER":"LIVE",
+    version:"10.1-monitor-broadcast-fix", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, noTradingView:true,
     exitStrategy:"price-monitor + DELETE /v2/positions",
     riskBudget:"$"+getRiskBudget(),
