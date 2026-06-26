@@ -15,8 +15,8 @@
  *   Price monitor (30s) + DELETE /v2/positions — no sell orders
  *
  * DATABASE:
- *   SQLite on /data/spx_command.db (Railway Volume)
- *   Tables: signals, trades, gex_snapshots
+ *   JSON files on /data (Railway Volume)
+ *   Files: signals.json, trades.json, gex_snapshots.json
  *
  * ENV VARIABLES:
  *   ALPACA_KEY, ALPACA_SECRET, ALPACA_BASE_URL
@@ -77,9 +77,8 @@ let tradesDay       = 0;
 const MAX_LOGS      = 500;
 const GEX_SCHEDULE  = [{h:9,m:25},{h:10,m:30},{h:12,m:0},{h:14,m:0}];
 
-// ── SQLite Database ───────────────────────────────────────────────────────────
+// ── JSON File Database ────────────────────────────────────────────────────────
 const DB_DIR  = fs.existsSync("/data") ? "/data" : __dirname;
-const DB_FILE = path.join(DB_DIR, "spx_command.db");
 
 // ── JSON-based database (no native deps, persists to /data) ──────────────────
 // Stores trades, signals, gex_snapshots as JSON files
@@ -117,10 +116,6 @@ function initDB() {
   log("DB", "JSON database initialized at "+DB_DIR);
 }
 
-// Shim for compatibility
-const db = true; // always "connected"
-function dbRun(sql, params) { return null; } // not used — insertDB used directly
-function dbAll(sql, params) { return []; }   // not used — loadDB used directly
 
 function saveSignalToDB(sig, indicators, fired, blockedReason) {
   try {
@@ -711,10 +706,10 @@ async function closePosition(symbol){
 
 // ── Price monitor ─────────────────────────────────────────────────────────────
 function startMonitor(signal, indicators) {
-  log("MONITOR","Watching "+signal.optionSymbol+" | stop $"+signal.stopPrice+" | tp1 $"+signal.tp1Price+" | poll: 60s");
+  log("MONITOR","Watching "+signal.optionSymbol+" | stop $"+signal.stopPrice+" | tp1 $"+signal.tp1Price+" | poll: 30s");
   const entryTime=Date.now();
   let consecutiveErrors = 0;
-  const MAX_CONSECUTIVE_ERRORS = 5; // ~5 minutes of failures before giving up and flagging
+  const MAX_CONSECUTIVE_ERRORS = 5; // ~2.5 minutes of failures at 30s poll before giving up
 
   const iv=setInterval(async()=>{
     if(!["FILLED"].includes(signal.status)){clearInterval(iv);return;}
@@ -737,7 +732,7 @@ function startMonitor(signal, indicators) {
 
       if(price>=signal.tp1Price){
         clearInterval(iv);
-        log("TP1","Hit $"+price+" >= $"+signal.tp1Price);
+        log("TP1","Hit $"+price+" >= $"+signal.tp1Price+" | peak $"+signal.maxPrice+" ("+signal.maxPnlPct+"%)");
         await closePosition(signal.optionSymbol);
         const pnl=(price-entry)*100*signal.contracts;
         signal.status="TP1_HIT"; signal.closePnl=pnl; signal.closePrice=price;
@@ -750,7 +745,7 @@ function startMonitor(signal, indicators) {
       }
       if(price<=signal.stopPrice){
         clearInterval(iv);
-        log("STOP","Hit $"+price+" <= $"+signal.stopPrice);
+        log("STOP","Hit $"+price+" <= $"+signal.stopPrice+" | peak $"+signal.maxPrice+" ("+signal.maxPnlPct+"%) | trough $"+signal.minPrice+" ("+signal.minPnlPct+"%)");
         await closePosition(signal.optionSymbol);
         const pnl=(price-entry)*100*signal.contracts;
         signal.status="STOPPED"; signal.closePnl=pnl; signal.closePrice=price;
@@ -783,7 +778,7 @@ function startMonitor(signal, indicators) {
         broadcast({type:"signal_update",id:signal.id,status:"MONITOR_FAILED"});
       }
     }
-  },60000); // 60s = 1 minute poll, per request (was 30s)
+  },30000); // 30s poll
   signal._monitorInterval=iv;
 }
 
@@ -828,7 +823,7 @@ async function executeTrade(direction, price, indicators, gexResult) {
 
   // Save to DB
   const dbResult = saveSignalToDB(sig, indicators, true, null);
-  sig._dbId = dbResult?.lastInsertRowid||null;
+  sig._dbId = dbResult?.id||null;
 
   sig.status="EXECUTING";
   broadcast({type:"signal_update",id:sig.id,status:"EXECUTING"});
@@ -1006,7 +1001,7 @@ app.options("*",cors());
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"10.1-monitor-broadcast-fix",status:"running",
+  service:"SPX COMMAND",version:"10.3-30s-poll-peak-tracking",status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -1077,43 +1072,52 @@ app.post("/closeposition/:symbol",async(req,res)=>{
 // DB query endpoints for data mining
 app.get("/db/trades",(req,res)=>{
   const limit=parseInt(req.query.limit||"100");
-  const rows=dbAll("SELECT * FROM trades ORDER BY id DESC LIMIT ?",[ limit]);
+  const rows=loadDB("trades").reverse().slice(0,limit);
   res.json({count:rows.length,trades:rows});
 });
 
 app.get("/db/signals",(req,res)=>{
   const limit=parseInt(req.query.limit||"100");
-  const rows=dbAll("SELECT * FROM signals ORDER BY id DESC LIMIT ?",[limit]);
+  const rows=loadDB("signals").reverse().slice(0,limit);
   res.json({count:rows.length,signals:rows});
 });
 
 app.get("/db/gex",(req,res)=>{
-  const rows=dbAll("SELECT * FROM gex_snapshots ORDER BY id DESC LIMIT 50",[]);
+  const rows=loadDB("gex_snapshots").reverse().slice(0,50);
   res.json({count:rows.length,snapshots:rows});
 });
 
 app.get("/db/stats",(req,res)=>{
-  const stats=dbAll(`
-    SELECT
-      COUNT(*) as total_trades,
-      SUM(CASE WHEN outcome='WIN' THEN 1 ELSE 0 END) as wins,
-      SUM(CASE WHEN outcome='LOSS' THEN 1 ELSE 0 END) as losses,
-      ROUND(AVG(CASE WHEN outcome='WIN' THEN pnl END),2) as avg_win,
-      ROUND(AVG(CASE WHEN outcome='LOSS' THEN pnl END),2) as avg_loss,
-      ROUND(SUM(pnl),2) as total_pnl,
-      ROUND(AVG(pnl_pct),2) as avg_pnl_pct,
-      ROUND(AVG(duration_min),1) as avg_duration_min,
-      MAX(pnl) as best_trade,
-      MIN(pnl) as worst_trade
-    FROM trades WHERE close_reason IS NOT NULL
-  `,[]);
-  const byMode=dbAll("SELECT signal_mode,outcome,COUNT(*) as count FROM trades GROUP BY signal_mode,outcome",[]);
-  const byReason=dbAll("SELECT close_reason,COUNT(*) as count,ROUND(SUM(pnl),2) as total_pnl FROM trades GROUP BY close_reason",[]);
-  res.json({stats:stats[0]||{},byMode,byReason});
+  const allTrades=loadDB("trades").filter(t=>t.close_reason);
+  const wins=allTrades.filter(t=>t.outcome==="WIN");
+  const losses=allTrades.filter(t=>t.outcome==="LOSS");
+  const winPnls=wins.map(t=>t.pnl||0);
+  const lossPnls=losses.map(t=>t.pnl||0);
+  const totalPnl=allTrades.reduce((a,t)=>a+(t.pnl||0),0);
+  const stats={
+    total_trades:allTrades.length,
+    wins:wins.length,
+    losses:losses.length,
+    win_rate:allTrades.length>0?parseFloat(((wins.length/allTrades.length)*100).toFixed(1)):0,
+    avg_win:winPnls.length?parseFloat((winPnls.reduce((a,b)=>a+b,0)/winPnls.length).toFixed(2)):0,
+    avg_loss:lossPnls.length?parseFloat((lossPnls.reduce((a,b)=>a+b,0)/lossPnls.length).toFixed(2)):0,
+    total_pnl:parseFloat(totalPnl.toFixed(2)),
+    avg_pnl_pct:allTrades.length?parseFloat((allTrades.reduce((a,t)=>a+(t.pnl_pct||0),0)/allTrades.length).toFixed(2)):0,
+    avg_duration_min:allTrades.length?parseFloat((allTrades.reduce((a,t)=>a+parseFloat(t.duration_min||0),0)/allTrades.length).toFixed(1)):0,
+    best_trade:allTrades.length?Math.max(...allTrades.map(t=>t.pnl||0)):0,
+    worst_trade:allTrades.length?Math.min(...allTrades.map(t=>t.pnl||0)):0,
+  };
+  const byMode={};
+  allTrades.forEach(t=>{const k=(t.signal_mode||"UNKNOWN")+"_"+(t.outcome||"UNKNOWN");byMode[k]=(byMode[k]||0)+1;});
+  const byModeArr=Object.entries(byMode).map(([k,count])=>{const [signal_mode,outcome]=k.split("_");return{signal_mode,outcome,count};});
+  const byReason={};
+  allTrades.forEach(t=>{const k=t.close_reason||"UNKNOWN";if(!byReason[k])byReason[k]={count:0,total_pnl:0};byReason[k].count++;byReason[k].total_pnl+=(t.pnl||0);});
+  const byReasonArr=Object.entries(byReason).map(([close_reason,v])=>({close_reason,count:v.count,total_pnl:parseFloat(v.total_pnl.toFixed(2))}));
+  res.json({stats,byMode:byModeArr,byReason:byReasonArr});
 });
 
 app.get("/db/export",(req,res)=>{
-  const trades=dbAll("SELECT * FROM trades ORDER BY id DESC",[]);
+  const trades=loadDB("trades").reverse();
   if(!trades.length) return res.json({error:"No trades"});
   const h=Object.keys(trades[0]).join(",");
   const r=trades.map(t=>Object.values(t).map(v=>typeof v==="string"&&v.includes(",")?"\""+v+"\"":v||"").join(",")).join("\n");
@@ -1127,7 +1131,7 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"10.1-monitor-broadcast-fix", mode:IS_PAPER?"PAPER":"LIVE",
+    version:"10.3-30s-poll-peak-tracking", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, noTradingView:true,
     exitStrategy:"price-monitor + DELETE /v2/positions",
     riskBudget:"$"+getRiskBudget(),
@@ -1196,7 +1200,7 @@ app.listen(PORT,async()=>{
  ║  Indicators    : ORB(15m) + VWAP + RSI + EMA        ║
  ║  Signal mode   : ${SIGNAL_MODE.padEnd(35)}║
  ║  Exit          : Price monitor + DELETE position     ║
- ║  Database      : SQLite ${DB_FILE.slice(-30).padEnd(27)}║
+ ║  Database      : JSON files at ${DB_DIR.slice(-22).padEnd(22)}║
  ╠══════════════════════════════════════════════════════╣
  ║  GET  /              Health check                   ║
  ║  GET  /dashboard     Trading dashboard              ║
