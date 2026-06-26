@@ -6,7 +6,7 @@
   <title>SPX COMMAND v9</title>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
-    body{background:#07090c;color:#d4e4f4;font-family:'Courier New',monospace;font-size:13px}
+    body{background:#07090c;color:#d4e4f4;font-family:'Courier New',monospace;font-size:14px}
     @keyframes pip{0%,100%{opacity:1}50%{opacity:0.2}}
     @keyframes fin{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
     ::-webkit-scrollbar{width:3px}
@@ -29,23 +29,23 @@
       overflow:hidden;margin-bottom:12px}
     .stat-cell{padding:10px 12px;border-right:1px solid #151d28}
     .stat-cell:last-child{border-right:none}
-    .stat-k{color:#1a2535;font-size:7px;letter-spacing:1.2px;margin-bottom:3px}
-    .stat-v{font-size:13px;font-weight:700}
+    .stat-k{color:#5a7a94;font-size:9px;letter-spacing:1.2px;margin-bottom:3px}
+    .stat-v{font-size:14px;font-weight:700}
 
     /* Tabs */
     .tabs{display:flex;background:#07090c;border:1px solid #151d28;border-radius:6px;overflow:hidden}
-    .tab{padding:5px 12px;font-size:9px;background:transparent;color:#4a5e74;
+    .tab{padding:6px 14px;font-size:11px;background:transparent;color:#6a8a9f;
       border:none;font-family:inherit;letter-spacing:.5px}
-    .tab.active{background:#1a2535;color:#d4e4f4}
+    .tab.active{background:#1a2535;color:#e8f0f8}
 
     /* Signal cards */
     .signal-card{border-radius:9px;padding:12px 14px;margin-bottom:8px;animation:fin .25s ease}
     .grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:3px;margin-bottom:4px}
-    .cell{background:#07090c;border-radius:4px;padding:5px 7px}
-    .cell-k{color:#1a2535;font-size:7px;letter-spacing:1px;margin-bottom:2px}
-    .cell-v{font-size:11px;font-weight:600}
+    .cell{background:#07090c;border-radius:4px;padding:6px 8px}
+    .cell-k{color:#5a7a94;font-size:9px;letter-spacing:1px;margin-bottom:2px}
+    .cell-v{font-size:12px;font-weight:600}
     .cell.dash{border-style:dashed}
-    .badge{border-radius:3px;padding:1px 7px;font-size:10px;font-weight:700;display:inline-block}
+    .badge{border-radius:3px;padding:2px 8px;font-size:11px;font-weight:700;display:inline-block}
     .status-bar{display:flex;align-items:center;justify-content:space-between;
       padding:7px 10px;border-radius:5px;margin-top:6px}
     .pip{width:6px;height:6px;border-radius:50%;display:inline-block;animation:pip 2s infinite;flex-shrink:0}
@@ -57,31 +57,31 @@
     .gex-bar{height:100%;border-radius:2px;transition:width .5s}
 
     /* Log */
-    #log-area{overflow-y:auto;height:200px;font-size:10px}
-    #log-full{overflow-y:auto;height:500px;font-size:10px}
+    #log-area{overflow-y:auto;height:200px;font-size:11px}
+    #log-full{overflow-y:auto;height:500px;font-size:11px}
     .log-row{display:flex;gap:7px;margin-bottom:3px;border-bottom:1px solid #1a253544;padding-bottom:2px}
-    .log-time{color:#1a2535;flex-shrink:0;min-width:55px}
+    .log-time{color:#6a8a9f;flex-shrink:0;min-width:55px}
     .log-tag{flex-shrink:0;min-width:60px;font-weight:700}
-    .log-msg{color:#5a7a94;word-break:break-all}
+    .log-msg{color:#8aa4b8;word-break:break-all}
 
     /* Journal */
     .j-row{background:#0c1017;border:1px solid #151d28;border-radius:7px;
       padding:9px 12px;margin-bottom:6px;display:grid;
       grid-template-columns:80px 110px 70px 70px 70px 70px 1fr;gap:8px;align-items:center}
-    .j-k{color:#1a2535;font-size:8px;margin-bottom:2px}
-    .j-v{font-size:10px}
+    .j-k{color:#5a7a94;font-size:9px;margin-bottom:2px}
+    .j-v{font-size:11px}
 
     /* Config */
     .cfg-row{display:flex;justify-content:space-between;margin-bottom:5px}
-    .cfg-k{color:#1a2535;font-size:9px}
-    .cfg-v{color:#4a5e74;font-size:9px}
+    .cfg-k{color:#6a8a9f;font-size:10px}
+    .cfg-v{color:#8aa4b8;font-size:10px}
 
     /* GEX summary mini */
     .wall-row{display:flex;align-items:center;gap:5px;margin-bottom:3px}
 
     /* Empty state */
-    .empty{text-align:center;padding:44px 20px;border:1px dashed #151d28;
-      border-radius:10px;color:#1a2535;font-size:11px}
+    .empty{text-align:center;padding:44px 20px;border:1px dashed #2a3a4a;
+      border-radius:10px;color:#6a8a9f;font-size:12px}
 
     /* Responsive */
     @media(max-width:700px){
@@ -251,9 +251,9 @@ const SERVER = window.location.origin;
 // ── Colors ────────────────────────────────────────────────────────────────────
 const C = {
   bull:"#2dd4a0", bear:"#f05b6d", yellow:"#f5c842",
-  purple:"#9d7ff5", blue:"#4db8ff", dim:"#1a2535",
-  muted:"#4a5e74", text:"#d4e4f4", textDim:"#5a7a94",
-  panel:"#0c1017", border:"#151d28"
+  purple:"#9d7ff5", blue:"#4db8ff", dim:"#3a4f65",
+  muted:"#6a8a9f", text:"#d4e4f4", textDim:"#8aa4b8",
+  panel:"#0c1017", border:"#1e2a38"
 };
 
 const TAG_COLORS = {
