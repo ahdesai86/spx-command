@@ -1001,7 +1001,7 @@ app.options("*",cors());
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"10.3-30s-poll-peak-tracking",status:"running",
+  service:"SPX COMMAND",version:"10.4-sse-init-fix",status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -1020,11 +1020,16 @@ app.get("/events",(req,res)=>{
   res.setHeader("Access-Control-Allow-Origin","*");
   res.flushHeaders();
   sseClients.push(res);
-  res.write("data: "+JSON.stringify({
-    type:"init",sessionPnL,dailyLoss,signals:signalHistory,
-    gex:gexCache,expiry:getExpiry(),riskBudget:getRiskBudget(),
-    logs:logHistory,orb:orbState,signalMode:SIGNAL_MODE,
-  })+"\n\n");
+  try {
+    const initPayload = sanitizeForBroadcast({
+      type:"init",sessionPnL,dailyLoss,signals:signalHistory,
+      gex:gexCache,expiry:getExpiry(),riskBudget:getRiskBudget(),
+      logs:logHistory,orb:orbState,signalMode:SIGNAL_MODE,
+    });
+    res.write("data: "+JSON.stringify(initPayload)+"\n\n");
+  } catch(e) {
+    console.error("[SSE INIT ERR] "+e.message);
+  }
   const ping=setInterval(()=>{try{res.write(": ping\n\n");}catch(_){clearInterval(ping);}},30000);
   req.on("close",()=>{clearInterval(ping);sseClients=sseClients.filter(c=>c!==res);});
 });
@@ -1131,7 +1136,7 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"10.3-30s-poll-peak-tracking", mode:IS_PAPER?"PAPER":"LIVE",
+    version:"10.4-sse-init-fix", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, noTradingView:true,
     exitStrategy:"price-monitor + DELETE /v2/positions",
     riskBudget:"$"+getRiskBudget(),
