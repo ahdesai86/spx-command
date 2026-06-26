@@ -52,6 +52,8 @@ const PORT             = parseInt(process.env.PORT               || "3001");
 const IS_PAPER         = ALPACA_BASE.includes("paper");
 const ORB_MINUTES      = 15; // 9:30–9:45 ET
 const MAX_TRADES_DAY   = parseInt(process.env.MAX_TRADES_DAY || "3");
+const FLASHALPHA_KEY   = process.env.FLASHALPHA_API_KEY || "";
+const FLASHALPHA_BASE  = "https://lab.flashalpha.com";
 
 function getRiskBudget() { return RISK_DOLLARS > 0 ? RISK_DOLLARS : ACCOUNT_SIZE * RISK_PER_TRADE; }
 function calcContracts(p) { return !p||p<=0 ? 1 : Math.max(1, Math.floor(getRiskBudget()/(p*100))); }
@@ -75,7 +77,12 @@ let lastBarTime     = null;   // last processed 5-min bar timestamp
 let scanActive      = false;
 let tradesDay       = 0;
 const MAX_LOGS      = 500;
-const GEX_SCHEDULE  = [{h:9,m:25},{h:10,m:30},{h:12,m:0},{h:14,m:0}];
+const GEX_SCHEDULE  = [{h:9,m:25},{h:10,m:0},{h:10,m:30},{h:11,m:0},{h:11,m:30},{h:12,m:0},{h:13,m:0},{h:14,m:0},{h:15,m:0}];
+let faLevelsCache   = null;
+let faZeroDteCache  = null;
+let faSummaryCache  = null;
+let faMaxPainCache  = null;
+let faCacheTime     = 0;
 
 // ── JSON File Database ────────────────────────────────────────────────────────
 const DB_DIR  = fs.existsSync("/data") ? "/data" : __dirname;
@@ -201,6 +208,15 @@ function saveGEXSnapshot(g) {
       put_wall_1:  g.putWalls?.[0]?.price||null,
       put_wall_2:  g.putWalls?.[1]?.price||null,
       put_wall_3:  g.putWalls?.[2]?.price||null,
+      source:      g.source||"Alpaca",
+      call_wall:   g.callWall||null,
+      put_wall:    g.putWall||null,
+      max_pain:    g.maxPain||null,
+      zero_dte_magnet: g.zeroDteMagnet||null,
+      pin_risk:    g.pinRisk||null,
+      dex:         g.dex||null,
+      vex:         g.vex||null,
+      chex:        g.chex||null,
     });
   } catch(e) { log("DB ERR","saveGEXSnapshot: "+e.message); }
 }
@@ -454,140 +470,171 @@ function evaluateSignal(ind) {
   return {fire, direction:dir, strength, reason, passed, failed};
 }
 
-// ── GEX (using real greeks via OPRA feed — Algo Trader Plus) ──────────────────
-const OPTIONS_FEED = process.env.OPTIONS_FEED || "opra"; // "opra" (paid, real greeks) or "indicative" (free, no greeks)
-let fullChainCache = null; // full chain with greeks, refreshed alongside GEX — used by strike selector
+// ── FlashAlpha API helper ─────────────────────────────────────────────────────
+const OPTIONS_FEED = process.env.OPTIONS_FEED || "opra";
+let fullChainCache = null;
 
+async function faGet(endpoint) {
+  if (!FLASHALPHA_KEY) return null;
+  const url = FLASHALPHA_BASE + endpoint;
+  const r = await fetch(url, { headers: { "X-Api-Key": FLASHALPHA_KEY, "Accept": "application/json" } });
+  if (!r.ok) {
+    const txt = await r.text();
+    log("FA ERR", "GET " + endpoint + " " + r.status + ": " + txt.slice(0, 200));
+    return null;
+  }
+  return r.json();
+}
+
+// ── FlashAlpha-powered GEX + exposure analytics ──────────────────────────────
 async function calcGEX() {
+  if (!FLASHALPHA_KEY) {
+    log("GEX", "No FLASHALPHA_API_KEY — GEX disabled");
+    return null;
+  }
   try {
-    log("GEX","Calculating from Alpaca chain ("+OPTIONS_FEED+" feed)...");
-    const spot = await getSPYQuote();
-    if (!spot) { log("GEX ERR","No SPY spot"); return null; }
-    log("GEX","SPY: $"+spot.toFixed(2));
+    log("GEX", "Fetching from FlashAlpha API...");
+    const today = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
 
-    const d   = new Date(new Date().toLocaleString("en-US",{timeZone:"America/New_York"}));
-    const exp = d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0");
+    const [gexData, levelsData, zeroDteData, summaryData, maxPainData] = await Promise.all([
+      faGet("/v1/exposure/gex/SPY?expiration=" + today),
+      faGet("/v1/exposure/levels/SPY"),
+      faGet("/v1/exposure/zero-dte/SPY"),
+      faGet("/v1/exposure/summary/SPY"),
+      faGet("/v1/maxpain/SPY?expiration=" + today),
+    ]);
 
-    // Fetch option chain with greeks directly — correct endpoint per Alpaca docs:
-    // GET /v1beta1/options/snapshots/{underlying_symbol}?feed=opra&expiration_date=YYYY-MM-DD
-    const contracts = [];
-    let chainNext = null;
-    do {
-      let url = ALPACA_DATA+"/v1beta1/options/snapshots/SPY?feed="+OPTIONS_FEED+"&limit=1000"+
-        "&expiration_date="+exp;
-      if (chainNext) url += "&page_token="+chainNext;
-      const r = await fetch(url, {headers:aH()});
-      if (!r.ok) {
-        const errTxt = await r.text();
-        log("GEX ERR","Chain "+r.status+": "+errTxt);
-        if (OPTIONS_FEED==="opra" && r.status===403) {
-          log("GEX","OPRA feed forbidden — falling back to indicative (no greeks)");
-        }
-        break;
-      }
-      const data = await r.json();
-      const snaps = data.snapshots||{};
-      for (const [sym,snap] of Object.entries(snaps)) contracts.push({symbol:sym,...snap});
-      chainNext = data.next_page_token||null;
-    } while(chainNext);
+    if (!gexData) { log("GEX ERR", "FlashAlpha GEX endpoint returned no data"); return null; }
 
-    if (!contracts.length) { log("GEX ERR","No contracts returned for "+exp); return null; }
+    const spot = gexData.underlying_price || (await getSPYQuote()) || 0;
+    if (!spot) { log("GEX ERR", "No SPY spot"); return null; }
 
-    // Confirm we have real greeks (opra feed) vs not (indicative feed)
-    const sample = contracts.find(c=>c.greeks && c.greeks.gamma);
-    const hasRealGreeks = !!sample;
-    log("GEX", hasRealGreeks
-      ? "✓ Real greeks present (OPRA) — sample gamma: "+sample.greeks.gamma
-      : "⚠ No greeks in response — using OI×proxy fallback");
+    // Cache FlashAlpha auxiliary data for signal filtering
+    faLevelsCache = levelsData;
+    faZeroDteCache = zeroDteData;
+    faSummaryCache = summaryData;
+    faMaxPainCache = maxPainData;
+    faCacheTime = Date.now();
 
-    // Cache full chain (with greeks) for strike selection later
-    fullChainCache = { contracts, spot, expiry:exp, updatedAt:new Date().toISOString() };
+    // Build call/put walls from FlashAlpha strike-level GEX data
+    const strikes = gexData.strikes || [];
+    const callWalls = strikes
+      .filter(s => s.strike > spot && s.call_gex > 0)
+      .sort((a, b) => b.call_gex - a.call_gex)
+      .slice(0, 5)
+      .map(s => ({ price: s.strike, gex: Math.round(s.call_gex), oi: s.call_oi || 0 }));
+    const putWalls = strikes
+      .filter(s => s.strike < spot && s.put_gex < 0)
+      .sort((a, b) => a.put_gex - b.put_gex)
+      .slice(0, 5)
+      .map(s => ({ price: s.strike, gex: Math.round(Math.abs(s.put_gex)), oi: s.put_oi || 0 }));
 
-    const strikeMap={};
-    let parsed=0, skipped=0, oiAvailableCount=0;
+    const gammaFlip = gexData.gamma_flip || (levelsData?.levels?.gamma_flip) || spot;
+    const regime = (gexData.net_gex_label || (gexData.net_gex >= 0 ? "positive" : "negative"));
 
-    for (const c of contracts) {
-      const sym = c.symbol||"";
-      if (sym.length<21) continue;
-      const right  = sym[12];
-      const strike = parseFloat(sym.slice(13,21))/1000;
-      let   oi      = parseFloat(c.openInterest||0);
-      let   gamma  = parseFloat((c.greeks||{}).gamma||0);
+    // Extract key levels
+    const levels = levelsData?.levels || {};
+    const zeroDte = zeroDteData || {};
+    const maxPain = maxPainData?.max_pain || null;
 
-      if (!strike) continue;
-      if (oi > 0) oiAvailableCount++;
+    const result = {
+      callWalls, putWalls,
+      gammaFlip: parseFloat(gammaFlip.toFixed ? gammaFlip.toFixed(2) : gammaFlip),
+      netGex: Math.round(gexData.net_gex || 0),
+      regime,
+      spotPrice: spot,
+      updatedAt: gexData.as_of || new Date().toISOString(),
+      hasRealGreeks: true,
+      source: "FlashAlpha",
+      callWall: levels.call_wall || (callWalls[0]?.price) || null,
+      putWall: levels.put_wall || (putWalls[0]?.price) || null,
+      zeroDteMagnet: levels.zero_dte_magnet || null,
+      maxPain,
+      pinRisk: zeroDte.pin_risk_score || null,
+      expectedMove: zeroDte.expected_move || null,
+      dex: summaryData?.exposures?.net_dex || null,
+      vex: summaryData?.exposures?.net_vex || null,
+      chex: summaryData?.exposures?.net_chex || null,
+      dealerBias: summaryData?.hedging_estimate || null,
+      zeroDtePctOfTotal: zeroDte.zero_dte?.pct_of_total_gex || summaryData?.zero_dte?.pct_of_total_gex || null,
+    };
 
-      // Fallback gamma proxy only if real greeks unavailable
-      if (!gamma) {
-        const dist  = Math.abs(strike - spot);
-        const sigma = spot * 0.02;
-        gamma = (1/(sigma*Math.sqrt(2*Math.PI))) * Math.exp(-0.5*Math.pow(dist/sigma,2));
-      }
+    log("GEX", "FlashAlpha -- Regime:" + result.regime +
+      " | Flip:$" + result.gammaFlip +
+      " | Net:" + (result.netGex / 1e9).toFixed(2) + "B" +
+      " | CallWall:$" + (result.callWall || "—") +
+      " | PutWall:$" + (result.putWall || "—") +
+      " | MaxPain:$" + (result.maxPain || "—") +
+      " | PinRisk:" + (result.pinRisk || "—") +
+      " | 0DTE magnet:$" + (result.zeroDteMagnet || "—"));
 
-      // FIX: Alpaca's options snapshots endpoint does not return openInterest at all
-      // (confirmed empirically — every contract had oi=0, so the old `if(!oi) continue`
-      // line silently discarded ALL contracts every single time, producing "No GEX data"
-      // on every run regardless of feed tier). When OI is genuinely missing, fall back to
-      // a flat assumed weight of 1 so relative GEX between strikes (driven by gamma) still
-      // produces a usable wall ranking, rather than zeroing out the whole calculation.
-      if (!oi) oi = 1;
-
-      const gex = gamma * oi * 100 * spot;
-      if (!strikeMap[strike]) strikeMap[strike]={call:0,put:0};
-      if (right==="C") strikeMap[strike].call += gex;
-      if (right==="P") strikeMap[strike].put  -= gex;
-      parsed++;
+    if (result.vex != null || result.dex != null) {
+      log("GEX", "DEX:" + ((result.dex || 0) / 1e6).toFixed(1) + "M" +
+        " | VEX:" + ((result.vex || 0) / 1e6).toFixed(1) + "M" +
+        " | CHEX:" + ((result.chex || 0) / 1e6).toFixed(1) + "M");
     }
-    log("GEX","Parsed: "+parsed+" | OI available on "+oiAvailableCount+"/"+contracts.length+" contracts (0 expected — Alpaca snapshots endpoint doesn't return OI) | Real greeks: "+hasRealGreeks);
 
-
-    const strikes=Object.keys(strikeMap).map(Number).sort((a,b)=>a-b);
-    if(!strikes.length){log("GEX ERR","No GEX data");return null;}
-
-    let net=0,cum=0,flip=spot;
-    const levels=strikes.map(s=>{const n=strikeMap[s].call+strikeMap[s].put;net+=n;return{strike:s,...strikeMap[s],net:n};});
-    for(const l of levels){const p=cum;cum+=l.net;if((p<0&&cum>=0)||(p>=0&&cum<0)){flip=l.strike;break;}}
-
-    const callWalls=levels.filter(l=>l.strike>spot&&l.call>0).sort((a,b)=>b.call-a.call).slice(0,5).map(l=>({price:l.strike,gex:Math.round(l.call)}));
-    const putWalls =levels.filter(l=>l.strike<spot&&l.put<0).sort((a,b)=>a.put-b.put).slice(0,5).map(l=>({price:l.strike,gex:Math.round(Math.abs(l.put))}));
-
-    const result={callWalls,putWalls,gammaFlip:parseFloat(flip.toFixed(2)),
-      netGex:Math.round(net),regime:net>=0?"positive":"negative",
-      spotPrice:spot,updatedAt:new Date().toISOString(),hasRealGreeks};
-
-    log("GEX","✓ Regime:"+result.regime+" | Flip:$"+result.gammaFlip+
-      " | Calls:"+callWalls.slice(0,3).map(w=>"$"+w.price).join(","));
-    broadcast({type:"gex_update",...result});
+    broadcast({ type: "gex_update", ...result });
     saveGEXSnapshot(result);
     return result;
-  } catch(e){log("GEX ERR","calcGEX: "+e.message);return null;}
+  } catch (e) { log("GEX ERR", "calcGEX: " + e.message); return null; }
 }
 
 async function getGEX(force) {
-  const now=Date.now();
-  const today=new Date().toLocaleDateString("en-CA",{timeZone:"America/New_York"});
-  if(today!==gexLastDate){gexFired=new Set();gexLastDate=today;gexCache=null;gexCacheTime=0;}
-  if(!force&&gexCache&&(now-gexCacheTime)<7200000) return gexCache;
-  const r=await calcGEX();
-  if(r){gexCache=r;gexCacheTime=now;}
+  const now = Date.now();
+  const today = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+  if (today !== gexLastDate) { gexFired = new Set(); gexLastDate = today; gexCache = null; gexCacheTime = 0; }
+  if (!force && gexCache && (now - gexCacheTime) < 300000) return gexCache; // 5 min cache (FlashAlpha data is fresher)
+  const r = await calcGEX();
+  if (r) { gexCache = r; gexCacheTime = now; }
   return gexCache;
 }
 
 function applyGEX(direction, entry) {
-  if(!gexCache) return {allowed:true,reason:"No GEX",tp1:entry*(direction==="LONG"?1.005:0.995),tp2:entry*(direction==="LONG"?1.01:0.99),target:null};
-  if(direction==="LONG"){
-    const walls=(gexCache.callWalls||[]).filter(w=>w.price>entry+GEX_BUFFER).sort((a,b)=>a.price-b.price);
-    if(!walls.length) return {allowed:true,reason:"No call wall above",tp1:entry+2,tp2:entry+4,target:null};
-    if(walls[0].price-entry<GEX_BUFFER) return {allowed:false,reason:"LONG blocked — at call wall $"+walls[0].price,tp1:walls[0].price,tp2:walls[0].price,target:walls[0].price};
-    return {allowed:true,reason:"LONG → call wall $"+walls[0].price,tp1:walls[0].price,tp2:(walls[1]||walls[0]).price,target:walls[0].price};
+  if (!gexCache) return { allowed: true, reason: "No GEX", tp1: entry * (direction === "LONG" ? 1.005 : 0.995), tp2: entry * (direction === "LONG" ? 1.01 : 0.99), target: null };
+
+  const gc = gexCache;
+
+  // Block trades with high pin risk (price likely stuck near current level)
+  if (gc.pinRisk != null && gc.pinRisk > 70) {
+    return { allowed: false, reason: "Pin risk " + gc.pinRisk + "/100 — price likely pinned, skip 0DTE", tp1: entry, tp2: entry, target: null };
   }
-  if(direction==="SHORT"){
-    const walls=(gexCache.putWalls||[]).filter(w=>w.price<entry-GEX_BUFFER).sort((a,b)=>b.price-a.price);
-    if(!walls.length) return {allowed:true,reason:"No put wall below",tp1:entry-2,tp2:entry-4,target:null};
-    if(entry-walls[0].price<GEX_BUFFER) return {allowed:false,reason:"SHORT blocked — at put wall $"+walls[0].price,tp1:walls[0].price,tp2:walls[0].price,target:walls[0].price};
-    return {allowed:true,reason:"SHORT → put wall $"+walls[0].price,tp1:walls[0].price,tp2:(walls[1]||walls[0]).price,target:walls[0].price};
+
+  // Use DEX to validate direction — if strong opposing flow, block
+  if (gc.dex != null) {
+    const dexBullish = gc.dex > 0;
+    if (direction === "LONG" && !dexBullish && Math.abs(gc.dex) > 1e8) {
+      return { allowed: false, reason: "DEX bearish (" + (gc.dex / 1e6).toFixed(0) + "M) — conflicts with LONG", tp1: entry, tp2: entry, target: null };
+    }
+    if (direction === "SHORT" && dexBullish && Math.abs(gc.dex) > 1e8) {
+      return { allowed: false, reason: "DEX bullish (+" + (gc.dex / 1e6).toFixed(0) + "M) — conflicts with SHORT", tp1: entry, tp2: entry, target: null };
+    }
   }
-  return {allowed:true,reason:"No GEX filter",tp1:entry,tp2:entry,target:null};
+
+  // Use max pain + 0DTE magnet as TP targets when available
+  const magnet = gc.zeroDteMagnet || gc.maxPain || null;
+
+  if (direction === "LONG") {
+    const walls = (gc.callWalls || []).filter(w => w.price > entry + GEX_BUFFER).sort((a, b) => a.price - b.price);
+    const callWall = gc.callWall && gc.callWall > entry + GEX_BUFFER ? gc.callWall : (walls[0]?.price || null);
+    if (!callWall) return { allowed: true, reason: "No call wall above", tp1: magnet && magnet > entry ? magnet : entry + 2, tp2: entry + 4, target: magnet };
+    if (callWall - entry < GEX_BUFFER) return { allowed: false, reason: "LONG blocked — at call wall $" + callWall, tp1: callWall, tp2: callWall, target: callWall };
+    const tp1 = magnet && magnet > entry && magnet < callWall ? magnet : callWall;
+    const tp2 = callWall > tp1 ? callWall : (walls[1]?.price || callWall);
+    return { allowed: true, reason: "LONG → wall $" + callWall + (magnet ? " | magnet $" + magnet : ""), tp1, tp2, target: callWall };
+  }
+
+  if (direction === "SHORT") {
+    const walls = (gc.putWalls || []).filter(w => w.price < entry - GEX_BUFFER).sort((a, b) => b.price - a.price);
+    const putWall = gc.putWall && gc.putWall < entry - GEX_BUFFER ? gc.putWall : (walls[0]?.price || null);
+    if (!putWall) return { allowed: true, reason: "No put wall below", tp1: magnet && magnet < entry ? magnet : entry - 2, tp2: entry - 4, target: magnet };
+    if (entry - putWall < GEX_BUFFER) return { allowed: false, reason: "SHORT blocked — at put wall $" + putWall, tp1: putWall, tp2: putWall, target: putWall };
+    const tp1 = magnet && magnet < entry && magnet > putWall ? magnet : putWall;
+    const tp2 = putWall < tp1 ? putWall : (walls[1]?.price || putWall);
+    return { allowed: true, reason: "SHORT → wall $" + putWall + (magnet ? " | magnet $" + magnet : ""), tp1, tp2, target: putWall };
+  }
+
+  return { allowed: true, reason: "No GEX filter", tp1: entry, tp2: entry, target: null };
 }
 
 // ── Strike selection (greeks-optimized when real data available) ─────────────
@@ -916,7 +963,7 @@ async function runSignalEngine() {
 
     // Get latest bar
     const latestBar=bars[bars.length-1];
-    if(lastBarTime===latestBar.t){scanActive=false;return;} // already processed this bar
+    if(lastBarTime===latestBar.t){scanActive=false;return;}
     lastBarTime=latestBar.t;
 
     // Get live quote
@@ -1011,7 +1058,7 @@ app.options("*",cors());
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"10.6-cooldown-contrast",status:"running",
+  service:"SPX COMMAND",version:"11.0-flashalpha-integration",status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -1146,7 +1193,7 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"10.6-cooldown-contrast", mode:IS_PAPER?"PAPER":"LIVE",
+    version:"11.0-flashalpha-integration", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, noTradingView:true,
     exitStrategy:"price-monitor + DELETE /v2/positions",
     riskBudget:"$"+getRiskBudget(),
@@ -1157,7 +1204,8 @@ app.get("/status",(req,res)=>{
     dailyLossLimit:(ACCOUNT_SIZE*MAX_DAILY_LOSS).toFixed(2),
     tradesDay:tradesDay+"/"+MAX_TRADES_DAY,
     orb:orbState,
-    gex:gexCache?{regime:gexCache.regime,gammaFlip:gexCache.gammaFlip,callWalls:(gexCache.callWalls||[]).slice(0,3).map(w=>"$"+w.price),putWalls:(gexCache.putWalls||[]).slice(0,3).map(w=>"$"+w.price)}:null,
+    flashAlpha:!!FLASHALPHA_KEY,
+    gex:gexCache?{regime:gexCache.regime,gammaFlip:gexCache.gammaFlip,source:gexCache.source||"Alpaca",callWall:gexCache.callWall||null,putWall:gexCache.putWall||null,callWalls:(gexCache.callWalls||[]).slice(0,3).map(w=>"$"+w.price),putWalls:(gexCache.putWalls||[]).slice(0,3).map(w=>"$"+w.price),maxPain:gexCache.maxPain||null,zeroDteMagnet:gexCache.zeroDteMagnet||null,pinRisk:gexCache.pinRisk||null,dex:gexCache.dex||null,vex:gexCache.vex||null}:null,
     signals:{today:signalHistory.length,active:signalHistory.filter(s=>["FILLED","SENT"].includes(s.status)).length},
     db:{totalTrades:s.t||0,wins:s.w||0,totalPnL:s.p||0,winRate:s.t>0?((s.w/s.t)*100).toFixed(1)+"%":"—"},
   });
@@ -1209,10 +1257,11 @@ setInterval(async()=>{
 app.listen(PORT,async()=>{
   console.log(`
  ╔══════════════════════════════════════════════════════╗
- ║   SPX COMMAND v9 · Autonomous · No TradingView      ║
+ ║   SPX COMMAND v11 · FlashAlpha · Autonomous         ║
  ╠══════════════════════════════════════════════════════╣
  ║  Signal engine : 5-min bar close scan               ║
  ║  Indicators    : ORB(15m) + VWAP + RSI + EMA        ║
+ ║  GEX source    : ${(FLASHALPHA_KEY?"FlashAlpha API":"DISABLED").padEnd(35)}║
  ║  Signal mode   : ${SIGNAL_MODE.padEnd(35)}║
  ║  Exit          : Price monitor + DELETE position     ║
  ║  Database      : JSON files at ${DB_DIR.slice(-22).padEnd(22)}║
