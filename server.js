@@ -751,6 +751,7 @@ function startMonitor(signal, indicators) {
         signal.status="STOPPED"; signal.closePnl=pnl; signal.closePrice=price;
         signal.closeReason="STOP_HIT"; signal.durationMin=((Date.now()-entryTime)/60000).toFixed(1);
         signal.outcome=pnl>=0?"WIN":"LOSS";
+        lastStopTime=Date.now();
         sessionPnL+=pnl; dailyLoss+=Math.abs(Math.min(0,pnl));
         broadcast({type:"signal_update",id:signal.id,status:"STOPPED",pnl});
         saveTradeToDB(signal,signal._dbId,indicators);
@@ -892,7 +893,9 @@ async function pollFill(orderId,maxMs){
 }
 
 // ── Signal Engine ─────────────────────────────────────────────────────────────
-let lastSignalBar = null; // prevent duplicate signals on same bar
+let lastSignalBar = null;
+let lastStopTime  = 0;
+const COOLDOWN_MS = 600000; // 10 min cooldown after stop before re-entering
 
 async function runSignalEngine() {
   if(scanActive) return;
@@ -925,6 +928,13 @@ async function runSignalEngine() {
     const activeTrades=signalHistory.filter(s=>["FILLED","SENT","EXECUTING"].includes(s.status));
     if(activeTrades.length>0){
       log("SCAN","Bar "+latestBar.t.slice(11,16)+" | SPY $"+currentPrice.toFixed(2)+" | Position open — skipping");
+      scanActive=false;return;
+    }
+
+    // Cooldown after stop-loss
+    if(lastStopTime && (Date.now()-lastStopTime)<COOLDOWN_MS){
+      const remain=Math.ceil((COOLDOWN_MS-(Date.now()-lastStopTime))/60000);
+      log("SCAN","Cooldown active — "+remain+" min remaining after last stop");
       scanActive=false;return;
     }
 
@@ -1001,7 +1011,7 @@ app.options("*",cors());
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"10.4-sse-init-fix",status:"running",
+  service:"SPX COMMAND",version:"10.6-cooldown-contrast",status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -1136,7 +1146,7 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"10.4-sse-init-fix", mode:IS_PAPER?"PAPER":"LIVE",
+    version:"10.6-cooldown-contrast", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, noTradingView:true,
     exitStrategy:"price-monitor + DELETE /v2/positions",
     riskBudget:"$"+getRiskBudget(),
