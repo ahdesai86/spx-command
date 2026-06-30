@@ -914,6 +914,7 @@ async function executeTrade(direction, price, indicators, gexResult) {
     const stop=parseFloat((sig.fillPrice*(1-PREMIUM_STOP_PCT)).toFixed(2));
     const tp1=calcTP1(sig.fillPrice,si.delta);
     sig.stopPrice=stop; sig.tp1Price=tp1; sig.status="FILLED";
+    sig.entryTime=Date.now();
     tradesDay++;
 
     broadcast({type:"signal_update",id:sig.id,status:"FILLED",fillPrice:sig.fillPrice,stopPrice:stop,tp1Price:tp1});
@@ -1028,11 +1029,41 @@ async function forceCloseAll(){
   for(const sig of active){
     if(sig._monitorInterval) clearInterval(sig._monitorInterval);
     try{
+      // Capture last known position price before closing, as a PnL fallback
+      // in case the closing order's fill price can't be read in time.
+      let lastKnownPrice=null;
+      try{
+        const pos=await aGet("/v2/positions/"+encodeURIComponent(sig.optionSymbol));
+        lastKnownPrice=parseFloat(pos.current_price||0)||null;
+      }catch(_){}
+
       const r=await closePosition(sig.optionSymbol);
       log("EOD","Closed "+sig.optionSymbol+" → "+r.status);
       if(r.ok){
-        sig.status="EOD_CLOSED"; sig.closeReason="EOD_FORCE_CLOSE"; sig.outcome="UNKNOWN";
-        broadcast({type:"signal_update",id:sig.id,status:"EOD_CLOSED"});
+        const entry=sig.fillPrice||sig.midPrice;
+        let closePrice=null;
+
+        // Closing order rarely fills synchronously on DELETE — try the response first,
+        // then poll briefly for the fill, then fall back to last known position price.
+        if(r.data&&r.data.filled_avg_price) closePrice=parseFloat(r.data.filled_avg_price);
+        if(!closePrice&&r.data&&r.data.id){
+          const filled=await pollFill(r.data.id,15000).catch(()=>null);
+          if(filled&&filled.filled_avg_price) closePrice=parseFloat(filled.filled_avg_price);
+        }
+        if(!closePrice) closePrice=lastKnownPrice;
+
+        const pnl=(closePrice!=null&&entry)?(closePrice-entry)*100*sig.contracts:null;
+
+        sig.status="EOD_CLOSED"; sig.closeReason="EOD_FORCE_CLOSE";
+        sig.closePrice=closePrice; sig.closePnl=pnl;
+        sig.durationMin=sig.entryTime?((Date.now()-sig.entryTime)/60000).toFixed(1):null;
+        sig.outcome=pnl==null?"UNKNOWN":(pnl>=0?"WIN":"LOSS");
+        if(pnl!=null){ sessionPnL+=pnl; if(pnl<0) dailyLoss+=Math.abs(pnl); }
+
+        log("EOD",sig.optionSymbol+" closed @ "+(closePrice!=null?"$"+closePrice:"unknown price")+
+          (pnl!=null?" | PnL $"+pnl.toFixed(2):" | PnL unknown — could not determine close price")+
+          " | peak $"+sig.maxPrice+" ("+sig.maxPnlPct+"%)");
+        broadcast({type:"signal_update",id:sig.id,status:"EOD_CLOSED",pnl});
         saveTradeToDB(sig,sig._dbId,sig.indicators||{});
       }
     }catch(e){log("EOD ERR",sig.optionSymbol+": "+e.message);}
@@ -1058,7 +1089,7 @@ app.options("*",cors());
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"11.0-flashalpha-integration",status:"running",
+  service:"SPX COMMAND",version:"11.1-eod-pnl-weekday-gate",status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -1193,7 +1224,7 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"11.0-flashalpha-integration", mode:IS_PAPER?"PAPER":"LIVE",
+    version:"11.1-eod-pnl-weekday-gate", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, noTradingView:true,
     exitStrategy:"price-monitor + DELETE /v2/positions",
     riskBudget:"$"+getRiskBudget(),
@@ -1212,10 +1243,16 @@ app.get("/status",(req,res)=>{
 });
 
 // ── Schedulers ────────────────────────────────────────────────────────────────
+// All scheduler intervals fire every minute regardless of day; without a weekday
+// gate they'd hit FlashAlpha/Alpaca with weekend dates (markets closed Sat/Sun),
+// burning API quota and producing confusing 404 log noise that lingers in the
+// rolling logHistory buffer into the next trading day.
+function isWeekday(etDate){ const d=etDate.getDay(); return d>=1&&d<=5; }
 
 // Signal engine: runs on 5-min bar close (every minute, fires when new bar available)
 setInterval(async()=>{
   const now=new Date(new Date().toLocaleString("en-US",{timeZone:"America/New_York"}));
+  if(!isWeekday(now)) return;
   const h=now.getHours(),m=now.getMinutes();
   // 5-min bars close at :00, :05, :10, :15, :20, :25, :30, :35, :40, :45, :50, :55
   if(m%5===0){
@@ -1232,6 +1269,7 @@ setInterval(async()=>{
 // GEX scheduler
 setInterval(async()=>{
   const now=new Date(new Date().toLocaleString("en-US",{timeZone:"America/New_York"}));
+  if(!isWeekday(now)) return;
   const h=now.getHours(),m=now.getMinutes();
   const today=now.toLocaleDateString("en-CA");
   if(!((h>9||(h===9&&m>=25))&&h<16)) return;
@@ -1246,6 +1284,7 @@ setInterval(async()=>{
 // EOD 3:45 PM
 setInterval(async()=>{
   const now=new Date(new Date().toLocaleString("en-US",{timeZone:"America/New_York"}));
+  if(!isWeekday(now)) return;
   const h=now.getHours(),m=now.getMinutes();
   if(h===15&&m===45){
     const key=now.toLocaleDateString("en-CA")+"_eod";
