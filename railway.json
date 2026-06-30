@@ -8,9 +8,7 @@
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 10,
     "healthcheckPath": "/",
-    "healthcheckTimeout": 10,
-    "volumes": {
-      "/data": {}
-    }
-  }
+    "healthcheckTimeout": 10
+  },
+  "_comment": "Volumes cannot be created via railway.json — Railway does not support declaring them in config-as-code. Create one manually: Railway dashboard -> this service -> Settings -> Volumes -> New Volume (any mount path works, e.g. /data). Railway auto-injects RAILWAY_VOLUME_MOUNT_PATH at runtime once attached; server.js reads that env var automatically, no code change needed after attaching."
 }

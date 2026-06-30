@@ -109,11 +109,15 @@ let faMaxPainCache  = null;
 let faCacheTime     = 0;
 
 // ── JSON File Database ────────────────────────────────────────────────────────
-const DB_DIR  = fs.existsSync("/data") ? "/data" : __dirname;
+// Railway auto-injects RAILWAY_VOLUME_MOUNT_PATH at runtime once a volume is
+// attached to the service (regardless of the mount path chosen in the dashboard).
+// Falls back to /data (legacy assumption), then to __dirname (ephemeral — wiped
+// on every redeploy) if no volume is attached at all.
+const RAILWAY_VOLUME = process.env.RAILWAY_VOLUME_MOUNT_PATH || null;
+const DB_DIR  = RAILWAY_VOLUME || (fs.existsSync("/data") ? "/data" : __dirname);
 
-// ── JSON-based database (no native deps, persists to /data) ──────────────────
+// ── JSON-based database (no native deps, persists to Railway Volume) ─────────
 // Stores trades, signals, gex_snapshots as JSON files
-// Compatible with Railway Volume — no SQLite compilation needed
 
 function loadDB(table) {
   const file = path.join(DB_DIR, table+".json");
@@ -144,7 +148,11 @@ function initDB() {
     const file = path.join(DB_DIR, t+".json");
     if (!fs.existsSync(file)) saveDB(t, []);
   });
-  log("DB", "JSON database initialized at "+DB_DIR);
+  if (RAILWAY_VOLUME) {
+    log("DB", "JSON database initialized at "+DB_DIR+" (Railway Volume — persists across deploys)");
+  } else {
+    log("DB ERR", "No Railway Volume attached — DB at "+DB_DIR+" is EPHEMERAL and will be WIPED on next deploy/restart. Attach a volume in Railway dashboard (Settings -> Volumes) to persist trade history.");
+  }
 }
 
 
@@ -1135,7 +1143,7 @@ app.options("*",cors());
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"11.2-gex-tp1-trailing-stop",status:"running",
+  service:"SPX COMMAND",version:"11.3-volume-detection",status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -1270,7 +1278,7 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"11.2-gex-tp1-trailing-stop", mode:IS_PAPER?"PAPER":"LIVE",
+    version:"11.3-volume-detection", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, noTradingView:true,
     exitStrategy:"price-monitor + DELETE /v2/positions",
     riskBudget:"$"+getRiskBudget(),
@@ -1285,7 +1293,7 @@ app.get("/status",(req,res)=>{
     flashAlpha:!!FLASHALPHA_KEY,
     gex:gexCache?{regime:gexCache.regime,gammaFlip:gexCache.gammaFlip,source:gexCache.source||"Alpaca",callWall:gexCache.callWall||null,putWall:gexCache.putWall||null,callWalls:(gexCache.callWalls||[]).slice(0,3).map(w=>"$"+w.price),putWalls:(gexCache.putWalls||[]).slice(0,3).map(w=>"$"+w.price),maxPain:gexCache.maxPain||null,zeroDteMagnet:gexCache.zeroDteMagnet||null,pinRisk:gexCache.pinRisk||null,dex:gexCache.dex||null,vex:gexCache.vex||null}:null,
     signals:{today:signalHistory.length,active:signalHistory.filter(s=>["FILLED","SENT"].includes(s.status)).length},
-    db:{totalTrades:s.t||0,wins:s.w||0,totalPnL:s.p||0,winRate:s.t>0?((s.w/s.t)*100).toFixed(1)+"%":"—"},
+    db:{totalTrades:s.t||0,wins:s.w||0,totalPnL:s.p||0,winRate:s.t>0?((s.w/s.t)*100).toFixed(1)+"%":"—",persistent:!!RAILWAY_VOLUME,dir:DB_DIR},
   });
 });
 
