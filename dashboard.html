@@ -361,6 +361,7 @@ function renderSignals() {
     return;
   }
 
+  const isTrailWin = sig => sig.closeReason==="TRAIL_STOP_HIT" && sig.closePnl>=0;
   const SC = {PENDING:C.yellow,EXECUTING:C.blue,SENT:C.purple,FILLED:C.bull,
     TP1_HIT:C.bull,STOPPED:C.bear,EOD_CLOSED:C.muted,CANCELLED:C.dim};
   const SL = {PENDING:"PENDING",EXECUTING:"PLACING...",SENT:"SENT",FILLED:"LIVE",
@@ -370,7 +371,8 @@ function renderSignals() {
     const isLong=sig.direction==="LONG", dc=isLong?C.bull:C.bear;
     const isClosed=["STOPPED","EOD_CLOSED","CANCELLED","TP1_HIT"].includes(sig.status);
     const isActive=["FILLED","TP1_HIT"].includes(sig.status);
-    const sc=SC[sig.status]||C.muted;
+    const trailWin=sig.status==="STOPPED"&&isTrailWin(sig);
+    const sc=trailWin?C.bull:(SC[sig.status]||C.muted);
     const pnl=sig.closePnl;
 
     return `<div class="signal-card" style="background:${C.panel};
@@ -388,7 +390,7 @@ function renderSignals() {
         <div style="background:${sc}15;color:${sc};border:1px solid ${sc}30;
           border-radius:4px;padding:3px 9px;font-size:9px;display:flex;align-items:center;gap:5px">
           ${isActive?`<span class="pip" style="background:${sc};width:5px;height:5px"></span>`:""}
-          ${SL[sig.status]||sig.status}
+          ${trailWin?"TRAIL ✓":(SL[sig.status]||sig.status)}
         </div>
       </div>
 
@@ -475,8 +477,9 @@ function renderSignals() {
       ${isClosed?`<div style="padding:6px 9px;background:${sc}08;border:1px solid ${sc}20;
         border-radius:5px;color:${sc};font-size:9px">
         ${sig.status==="TP1_HIT"?"✓ Target hit · closed":""}
-        ${sig.status==="STOPPED"?"✗ Stop hit · closed":""}
-        ${sig.status==="EOD_CLOSED"?"⏱ Force closed 3:45 PM ET":""}
+        ${sig.status==="STOPPED"&&trailWin?"✓ Trailing stop · locked in gain":""}
+        ${sig.status==="STOPPED"&&!trailWin?"✗ Stop hit · closed":""}
+        ${sig.status==="EOD_CLOSED"?"⏱ Force closed 3:45 PM ET"+(sig.closePnl==null?" · close price unavailable":""):""}
         ${sig.status==="CANCELLED"?"— Cancelled":""}
       </div>`:""}
     </div>`;

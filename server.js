@@ -46,6 +46,10 @@ const MAX_DAILY_LOSS   = parseFloat(process.env.MAX_DAILY_LOSS   || "0.06");
 const PREMIUM_STOP_PCT = parseFloat(process.env.PREMIUM_STOP_PCT || "0.25");
 const TP1_MULTIPLIER   = parseFloat(process.env.TP1_MULTIPLIER   || "3.0");
 const TP1_FIXED_MOVE   = parseFloat(process.env.TP1_FIXED_MOVE   || "0");
+const TP1_MIN_MULT     = parseFloat(process.env.TP1_MIN_MULTIPLIER || "1.4");  // floor on GEX-derived TP1
+const TP1_MAX_MULT     = parseFloat(process.env.TP1_MAX_MULTIPLIER || "4.0");  // ceiling on GEX-derived TP1
+const TRAIL_TRIGGER_PCT= parseFloat(process.env.TRAIL_TRIGGER_PCT  || "0.50"); // gain % that activates trailing stop
+const TRAIL_DISTANCE_PCT=parseFloat(process.env.TRAIL_DISTANCE_PCT || "0.20"); // trail this far below peak
 const GEX_BUFFER       = parseFloat(process.env.GEX_BUFFER       || "1.0");
 const SIGNAL_MODE      = (process.env.SIGNAL_MODE || "MODERATE").toUpperCase().split(" ")[0]; // MODERATE or STRICT
 const PORT             = parseInt(process.env.PORT               || "3001");
@@ -57,8 +61,28 @@ const FLASHALPHA_BASE  = "https://lab.flashalpha.com";
 
 function getRiskBudget() { return RISK_DOLLARS > 0 ? RISK_DOLLARS : ACCOUNT_SIZE * RISK_PER_TRADE; }
 function calcContracts(p) { return !p||p<=0 ? 1 : Math.max(1, Math.floor(getRiskBudget()/(p*100))); }
-function calcTP1(entry, delta) {
+/**
+ * TP1 target selection, in priority order:
+ *   1. Fixed-$-move mode (TP1_FIXED_MOVE env override), if set.
+ *   2. GEX-derived: translate the SPY-level wall/magnet target into an estimated
+ *      option premium using the delta-gamma approximation (same method used by
+ *      selectStrike's payoff scoring), bounded between TP1_MIN_MULT and
+ *      TP1_MAX_MULT of entry premium so a too-close or too-far wall doesn't
+ *      produce a degenerate target.
+ *   3. Flat TP1_MULTIPLIER fallback when no GEX target is available.
+ * Replaces the old flat-3x-only target, which two confirmed trades (June 26
+ * +86.2% peak, June 29 +103.5% peak) showed is rarely reachable intraday on 0DTE.
+ */
+function calcTP1(entry, delta, spyEntry, gexTarget, gamma) {
   if (TP1_FIXED_MOVE > 0) return parseFloat((entry + TP1_FIXED_MOVE*(delta||0.35)).toFixed(2));
+
+  if (gexTarget!=null && spyEntry!=null && delta) {
+    const move = Math.abs(gexTarget - spyEntry);
+    const estGain = delta*move + 0.5*(gamma||0)*move*move;
+    const lo = entry*TP1_MIN_MULT, hi = entry*TP1_MAX_MULT;
+    const target = Math.min(Math.max(entry+estGain, lo), hi);
+    return parseFloat(target.toFixed(2));
+  }
   return parseFloat((entry * TP1_MULTIPLIER).toFixed(2));
 }
 
@@ -774,7 +798,24 @@ function startMonitor(signal, indicators) {
       signal.maxPnlPct = signal.maxPrice!=null ? parseFloat((((signal.maxPrice-entry)/entry)*100).toFixed(1)) : null;
       signal.minPnlPct = signal.minPrice!=null ? parseFloat((((signal.minPrice-entry)/entry)*100).toFixed(1)) : null;
 
-      log("MONITOR",signal.optionSymbol+" $"+price+" | P&L "+pct+"% | stop $"+signal.stopPrice+" | tp1 $"+signal.tp1Price+" | max $"+signal.maxPrice+" | min $"+signal.minPrice);
+      // Trailing stop: once a position is up TRAIL_TRIGGER_PCT, ratchet the stop up to
+      // trail TRAIL_DISTANCE_PCT below the peak (never below breakeven once active, and
+      // only ever moves up). Catches large moves that fall short of the TP1 target instead
+      // of riding them back down to a fixed-% loss — confirmed twice now (June 26 +86.2%
+      // peak, June 29 +103.5% peak) that 0DTE often reverses well before TP1.
+      const gainPct=(signal.maxPrice-entry)/entry;
+      if(gainPct>=TRAIL_TRIGGER_PCT){
+        const trailStop=signal.maxPrice*(1-TRAIL_DISTANCE_PCT);
+        const newStop=Math.max(trailStop,entry,signal.stopPrice);
+        if(newStop>signal.stopPrice){
+          signal.stopPrice=parseFloat(newStop.toFixed(2));
+          signal.trailingActive=true;
+          log("TRAIL",signal.optionSymbol+" stop raised to $"+signal.stopPrice+" (peak $"+signal.maxPrice+", "+signal.maxPnlPct+"%)");
+          broadcast({type:"signal_update",id:signal.id,stopPrice:signal.stopPrice,trailingActive:true});
+        }
+      }
+
+      log("MONITOR",signal.optionSymbol+" $"+price+" | P&L "+pct+"% | stop $"+signal.stopPrice+(signal.trailingActive?" (trailing)":"")+" | tp1 $"+signal.tp1Price+" | max $"+signal.maxPrice+" | min $"+signal.minPrice);
       broadcast({type:"signal_update",id:signal.id,currentPrice:price,maxPrice:signal.maxPrice,minPrice:signal.minPrice,maxPnlPct:signal.maxPnlPct,minPnlPct:signal.minPnlPct});
 
       if(price>=signal.tp1Price){
@@ -792,15 +833,20 @@ function startMonitor(signal, indicators) {
       }
       if(price<=signal.stopPrice){
         clearInterval(iv);
-        log("STOP","Hit $"+price+" <= $"+signal.stopPrice+" | peak $"+signal.maxPrice+" ("+signal.maxPnlPct+"%) | trough $"+signal.minPrice+" ("+signal.minPnlPct+"%)");
+        const reason=signal.trailingActive?"TRAIL_STOP_HIT":"STOP_HIT";
+        log(signal.trailingActive?"TRAIL":"STOP",
+          (signal.trailingActive?"Trailing stop":"Stop")+" hit $"+price+" <= $"+signal.stopPrice+
+          " | peak $"+signal.maxPrice+" ("+signal.maxPnlPct+"%) | trough $"+signal.minPrice+" ("+signal.minPnlPct+"%)");
         await closePosition(signal.optionSymbol);
         const pnl=(price-entry)*100*signal.contracts;
         signal.status="STOPPED"; signal.closePnl=pnl; signal.closePrice=price;
-        signal.closeReason="STOP_HIT"; signal.durationMin=((Date.now()-entryTime)/60000).toFixed(1);
+        signal.closeReason=reason; signal.durationMin=((Date.now()-entryTime)/60000).toFixed(1);
         signal.outcome=pnl>=0?"WIN":"LOSS";
-        lastStopTime=Date.now();
+        // Cooldown only applies to genuine losses on the initial fixed stop — a trailing
+        // stop exit in profit isn't evidence the thesis failed, so don't block re-entry.
+        if(!signal.trailingActive) lastStopTime=Date.now();
         sessionPnL+=pnl; dailyLoss+=Math.abs(Math.min(0,pnl));
-        broadcast({type:"signal_update",id:signal.id,status:"STOPPED",pnl});
+        broadcast({type:"signal_update",id:signal.id,status:"STOPPED",closeReason:reason,pnl});
         saveTradeToDB(signal,signal._dbId,indicators);
         return;
       }
@@ -912,7 +958,7 @@ async function executeTrade(direction, price, indicators, gexResult) {
 
     sig.fillPrice=parseFloat(filled.filled_avg_price||mid);
     const stop=parseFloat((sig.fillPrice*(1-PREMIUM_STOP_PCT)).toFixed(2));
-    const tp1=calcTP1(sig.fillPrice,si.delta);
+    const tp1=calcTP1(sig.fillPrice,si.delta,price,gexResult?.target,si.gamma);
     sig.stopPrice=stop; sig.tp1Price=tp1; sig.status="FILLED";
     sig.entryTime=Date.now();
     tradesDay++;
@@ -1089,7 +1135,7 @@ app.options("*",cors());
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"11.1-eod-pnl-weekday-gate",status:"running",
+  service:"SPX COMMAND",version:"11.2-gex-tp1-trailing-stop",status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -1224,13 +1270,14 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"11.1-eod-pnl-weekday-gate", mode:IS_PAPER?"PAPER":"LIVE",
+    version:"11.2-gex-tp1-trailing-stop", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, noTradingView:true,
     exitStrategy:"price-monitor + DELETE /v2/positions",
     riskBudget:"$"+getRiskBudget(),
     optionsFeed:OPTIONS_FEED,
     realGreeks:gexCache?.hasRealGreeks||false,
-    tp1Config:{mode:TP1_FIXED_MOVE>0?"fixed":"multiplier",value:TP1_FIXED_MOVE>0?"$"+TP1_FIXED_MOVE:TP1_MULTIPLIER+"x"},
+    tp1Config:{mode:TP1_FIXED_MOVE>0?"fixed":"gex-adaptive",value:TP1_FIXED_MOVE>0?"$"+TP1_FIXED_MOVE:"GEX wall ("+TP1_MIN_MULT+"x-"+TP1_MAX_MULT+"x bounds, "+TP1_MULTIPLIER+"x fallback)"},
+    trailingStop:{triggerPct:(TRAIL_TRIGGER_PCT*100)+"%",trailDistance:(TRAIL_DISTANCE_PCT*100)+"%"},
     sessionPnL:sessionPnL.toFixed(2), dailyLoss:dailyLoss.toFixed(2),
     dailyLossLimit:(ACCOUNT_SIZE*MAX_DAILY_LOSS).toFixed(2),
     tradesDay:tradesDay+"/"+MAX_TRADES_DAY,
