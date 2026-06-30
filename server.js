@@ -40,24 +40,54 @@ const ALPACA_SECRET    = process.env.ALPACA_SECRET    || "";
 const ALPACA_BASE      = (process.env.ALPACA_BASE_URL || "https://paper-api.alpaca.markets").replace(/\/$/, "");
 const ALPACA_DATA      = "https://data.alpaca.markets";
 const ACCOUNT_SIZE     = parseFloat(process.env.ACCOUNT_SIZE     || "100000");
-const RISK_DOLLARS     = parseFloat(process.env.RISK_DOLLARS     || "2000");
-const RISK_PER_TRADE   = parseFloat(process.env.RISK_PER_TRADE   || "0.02");
-const MAX_DAILY_LOSS   = parseFloat(process.env.MAX_DAILY_LOSS   || "0.06");
-const PREMIUM_STOP_PCT = parseFloat(process.env.PREMIUM_STOP_PCT || "0.25");
-const TP1_MULTIPLIER   = parseFloat(process.env.TP1_MULTIPLIER   || "3.0");
-const TP1_FIXED_MOVE   = parseFloat(process.env.TP1_FIXED_MOVE   || "0");
-const TP1_MIN_MULT     = parseFloat(process.env.TP1_MIN_MULTIPLIER || "1.4");  // floor on GEX-derived TP1
-const TP1_MAX_MULT     = parseFloat(process.env.TP1_MAX_MULTIPLIER || "4.0");  // ceiling on GEX-derived TP1
-const TRAIL_TRIGGER_PCT= parseFloat(process.env.TRAIL_TRIGGER_PCT  || "0.50"); // gain % that activates trailing stop
-const TRAIL_DISTANCE_PCT=parseFloat(process.env.TRAIL_DISTANCE_PCT || "0.20"); // trail this far below peak
-const GEX_BUFFER       = parseFloat(process.env.GEX_BUFFER       || "1.0");
-const SIGNAL_MODE      = (process.env.SIGNAL_MODE || "MODERATE").toUpperCase().split(" ")[0]; // MODERATE or STRICT
 const PORT             = parseInt(process.env.PORT               || "3001");
 const IS_PAPER         = ALPACA_BASE.includes("paper");
 const ORB_MINUTES      = 15; // 9:30–9:45 ET
-const MAX_TRADES_DAY   = parseInt(process.env.MAX_TRADES_DAY || "3");
+const TP1_FIXED_MOVE   = parseFloat(process.env.TP1_FIXED_MOVE   || "0");
 const FLASHALPHA_KEY   = process.env.FLASHALPHA_API_KEY || "";
 const FLASHALPHA_BASE  = "https://lab.flashalpha.com";
+
+// ── Runtime-tunable settings ───────────────────────────────────────────────────
+// These start from env vars but can be changed live via GET/POST /settings (and
+// the dashboard Settings tab) without a redeploy. Held in `let`, not `const`, so
+// every function that reads them picks up the live value.
+let RISK_DOLLARS      = parseFloat(process.env.RISK_DOLLARS     || "2000");
+let RISK_PER_TRADE    = parseFloat(process.env.RISK_PER_TRADE   || "0.02");
+let MAX_DAILY_LOSS    = parseFloat(process.env.MAX_DAILY_LOSS   || "0.06");
+let PREMIUM_STOP_PCT  = parseFloat(process.env.PREMIUM_STOP_PCT || "0.25");
+let TP1_MULTIPLIER    = parseFloat(process.env.TP1_MULTIPLIER   || "3.0");
+let TP1_MIN_MULT      = parseFloat(process.env.TP1_MIN_MULTIPLIER || "1.4");  // floor on GEX-derived TP1
+let TP1_MAX_MULT      = parseFloat(process.env.TP1_MAX_MULTIPLIER || "4.0");  // ceiling on GEX-derived TP1
+let TRAIL_TRIGGER_PCT = parseFloat(process.env.TRAIL_TRIGGER_PCT  || "0.50"); // gain % that activates trailing stop
+let TRAIL_DISTANCE_PCT= parseFloat(process.env.TRAIL_DISTANCE_PCT || "0.20"); // trail this far below peak
+let GEX_BUFFER         = parseFloat(process.env.GEX_BUFFER       || "1.0");
+let SIGNAL_MODE        = (process.env.SIGNAL_MODE || "MODERATE").toUpperCase().split(" ")[0]; // MODERATE or STRICT
+let MAX_TRADES_DAY     = parseInt(process.env.MAX_TRADES_DAY || "3");
+
+// Definitions used to validate/clamp incoming POST /settings updates
+const SETTINGS_SCHEMA = {
+  RISK_DOLLARS:      { type:"number", min:0,    max:50000,  set:v=>RISK_DOLLARS=v },
+  RISK_PER_TRADE:    { type:"number", min:0,    max:1,      set:v=>RISK_PER_TRADE=v },
+  MAX_DAILY_LOSS:    { type:"number", min:0.01, max:1,      set:v=>MAX_DAILY_LOSS=v },
+  PREMIUM_STOP_PCT:  { type:"number", min:0.05, max:0.95,   set:v=>PREMIUM_STOP_PCT=v },
+  TP1_MULTIPLIER:    { type:"number", min:1.1,  max:10,     set:v=>TP1_MULTIPLIER=v },
+  TP1_MIN_MULT:      { type:"number", min:1.05, max:10,     set:v=>TP1_MIN_MULT=v },
+  TP1_MAX_MULT:      { type:"number", min:1.1,  max:20,     set:v=>TP1_MAX_MULT=v },
+  TRAIL_TRIGGER_PCT: { type:"number", min:0.05, max:5,      set:v=>TRAIL_TRIGGER_PCT=v },
+  TRAIL_DISTANCE_PCT:{ type:"number", min:0.01, max:0.95,   set:v=>TRAIL_DISTANCE_PCT=v },
+  GEX_BUFFER:        { type:"number", min:0,    max:20,     set:v=>GEX_BUFFER=v },
+  SIGNAL_MODE:       { type:"enum",   values:["MODERATE","STRICT"], set:v=>SIGNAL_MODE=v },
+  MAX_TRADES_DAY:    { type:"number", min:1,    max:50, integer:true, set:v=>MAX_TRADES_DAY=v },
+};
+
+function getSettingsSnapshot(){
+  return {
+    RISK_DOLLARS, RISK_PER_TRADE, MAX_DAILY_LOSS, PREMIUM_STOP_PCT,
+    TP1_MULTIPLIER, TP1_MIN_MULT, TP1_MAX_MULT,
+    TRAIL_TRIGGER_PCT, TRAIL_DISTANCE_PCT,
+    GEX_BUFFER, SIGNAL_MODE, MAX_TRADES_DAY,
+  };
+}
 
 function getRiskBudget() { return RISK_DOLLARS > 0 ? RISK_DOLLARS : ACCOUNT_SIZE * RISK_PER_TRADE; }
 function calcContracts(p) { return !p||p<=0 ? 1 : Math.max(1, Math.floor(getRiskBudget()/(p*100))); }
@@ -1143,7 +1173,7 @@ app.options("*",cors());
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"11.3-volume-detection",status:"running",
+  service:"SPX COMMAND",version:"11.4-settings-tab",status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -1273,12 +1303,44 @@ app.get("/db/export",(req,res)=>{
   res.send(h+"\n"+r);
 });
 
+// ── Runtime settings ──────────────────────────────────────────────────────────
+app.get("/settings",(req,res)=>{
+  res.json({settings:getSettingsSnapshot(),schema:Object.fromEntries(
+    Object.entries(SETTINGS_SCHEMA).map(([k,v])=>[k,{type:v.type,min:v.min,max:v.max,values:v.values,integer:v.integer}])
+  )});
+});
+
+app.post("/settings",(req,res)=>{
+  const body=req.body||{};
+  const applied={}, errors={};
+  for(const [key,val] of Object.entries(body)){
+    const def=SETTINGS_SCHEMA[key];
+    if(!def){ errors[key]="Unknown setting"; continue; }
+    if(def.type==="enum"){
+      const v=String(val).toUpperCase();
+      if(!def.values.includes(v)){ errors[key]="Must be one of: "+def.values.join(", "); continue; }
+      def.set(v); applied[key]=v;
+    } else {
+      let n=parseFloat(val);
+      if(isNaN(n)){ errors[key]="Must be a number"; continue; }
+      if(def.integer) n=Math.round(n);
+      if(n<def.min||n>def.max){ errors[key]="Must be between "+def.min+" and "+def.max; continue; }
+      def.set(n); applied[key]=n;
+    }
+  }
+  if(Object.keys(applied).length){
+    log("SETTINGS","Updated: "+Object.entries(applied).map(([k,v])=>k+"="+v).join(", "));
+    broadcast({type:"settings_update",settings:getSettingsSnapshot()});
+  }
+  res.json({applied,errors,settings:getSettingsSnapshot()});
+});
+
 app.get("/status",(req,res)=>{
   const allTrades=loadDB("trades").filter(t=>t.close_reason);
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"11.3-volume-detection", mode:IS_PAPER?"PAPER":"LIVE",
+    version:"11.4-settings-tab", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, noTradingView:true,
     exitStrategy:"price-monitor + DELETE /v2/positions",
     riskBudget:"$"+getRiskBudget(),

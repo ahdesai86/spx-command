@@ -100,13 +100,14 @@
       <div style="font-size:15px;font-weight:700;letter-spacing:.5px">
         <span style="color:#2dd4a0">SPX</span> COMMAND
       </div>
-      <div style="color:#1a2535;font-size:8px;letter-spacing:1.5px">SPY 0DTE · PAPER · v9 · NO TRADINGVIEW</div>
+      <div style="color:#7a9cb5;font-size:9px;letter-spacing:1.5px">SPY 0DTE · PAPER · v11 · FLASHALPHA</div>
     </div>
     <div class="tabs" id="tabs">
       <button class="tab active" onclick="setTab('signals')">SIGNALS</button>
       <button class="tab" onclick="setTab('gex')">GEX</button>
       <button class="tab" onclick="setTab('journal')">JOURNAL <span id="j-count" style="color:#4db8ff"></span></button>
       <button class="tab" onclick="setTab('logs')">LOGS</button>
+      <button class="tab" onclick="setTab('settings')">SETTINGS</button>
     </div>
   </div>
   <div style="display:flex;align-items:center;gap:8px">
@@ -198,6 +199,26 @@
           <div id="log-full"></div>
         </div>
       </div>
+
+      <!-- SETTINGS tab -->
+      <div id="tab-settings" style="display:none">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <span style="color:#4a5e74;font-size:9px;letter-spacing:2px">BOT SETTINGS</span>
+          <span id="settings-saved-msg" style="color:#2dd4a0;font-size:9px;display:none">✓ Saved</span>
+        </div>
+        <div class="panel" style="padding:14px">
+          <div id="settings-form"></div>
+          <div style="display:flex;gap:8px;margin-top:14px">
+            <button id="settings-save-btn" onclick="saveSettings()" style="background:#2dd4a018;
+              border:1px solid #2dd4a033;border-radius:5px;color:#2dd4a0;padding:7px 16px;font-size:10px;font-weight:700">
+              SAVE CHANGES</button>
+            <button onclick="loadSettings()" style="background:#4db8ff15;
+              border:1px solid #4db8ff33;border-radius:5px;color:#4db8ff;padding:7px 16px;font-size:10px">
+              RELOAD</button>
+          </div>
+          <div style="margin-top:10px;color:#5a7a94;font-size:9px">Changes apply immediately to the running bot — no redeploy needed. Values reset to env-var defaults on next deploy.</div>
+        </div>
+      </div>
     </div>
 
     <!-- Right sidebar -->
@@ -282,11 +303,12 @@ let currentTab = "signals";
 // ── Tabs ──────────────────────────────────────────────────────────────────────
 function setTab(name) {
   currentTab = name;
-  ["signals","gex","journal","logs"].forEach(t=>{
+  ["signals","gex","journal","logs","settings"].forEach(t=>{
     document.getElementById("tab-"+t).style.display = t===name?"block":"none";
     document.querySelector(".tab[onclick=\"setTab('"+t+"')\"]").className =
       "tab"+(t===name?" active":"");
   });
+  if(name==="settings") loadSettings();
 }
 
 // ── Format helpers ────────────────────────────────────────────────────────────
@@ -675,6 +697,89 @@ async function closeAll() {
   await fetch(SERVER+"/closeall", {method:"POST"});
 }
 
+// ── Settings ──────────────────────────────────────────────────────────────────
+const SETTINGS_META = {
+  RISK_DOLLARS:       {label:"Risk per Trade",          unit:"$",   step:50},
+  RISK_PER_TRADE:     {label:"Risk % of Account",        unit:"",    step:0.01, hint:"used only if Risk per Trade = 0"},
+  MAX_DAILY_LOSS:      {label:"Daily Loss Limit",         unit:"× acct", step:0.01},
+  PREMIUM_STOP_PCT:   {label:"Stop Loss",                unit:"× premium", step:0.01},
+  TP1_MULTIPLIER:      {label:"TP1 Fallback Multiplier",  unit:"x",   step:0.1, hint:"used when no GEX target available"},
+  TP1_MIN_MULT:        {label:"TP1 Min Multiplier",       unit:"x",   step:0.1, hint:"floor on GEX-derived TP1"},
+  TP1_MAX_MULT:        {label:"TP1 Max Multiplier",       unit:"x",   step:0.1, hint:"ceiling on GEX-derived TP1"},
+  TRAIL_TRIGGER_PCT:  {label:"Trailing Stop Trigger",    unit:"× gain", step:0.05, hint:"unrealized gain that activates trailing stop"},
+  TRAIL_DISTANCE_PCT: {label:"Trailing Stop Distance",   unit:"× peak", step:0.05, hint:"trail this far below peak price"},
+  GEX_BUFFER:          {label:"GEX Wall Buffer",          unit:"$",   step:0.25, hint:"don't enter within this $ of a wall"},
+  SIGNAL_MODE:         {label:"Signal Mode",              enum:true},
+  MAX_TRADES_DAY:      {label:"Max Trades / Day",          unit:"",    step:1},
+};
+
+let settingsSchema = {};
+
+async function loadSettings() {
+  try {
+    const r = await fetch(SERVER+"/settings");
+    const d = await r.json();
+    settingsSchema = d.schema||{};
+    renderSettingsForm(d.settings||{});
+  } catch(_){}
+}
+
+function renderSettingsForm(values) {
+  const el = document.getElementById("settings-form");
+  el.innerHTML = Object.keys(SETTINGS_META).map(key=>{
+    const meta = SETTINGS_META[key];
+    const schema = settingsSchema[key]||{};
+    const val = values[key];
+    let input;
+    if (meta.enum) {
+      const opts = (schema.values||["MODERATE","STRICT"]).map(v=>
+        `<option value="${v}" ${v===val?"selected":""}>${v}</option>`).join("");
+      input = `<select id="set-${key}" style="background:${C.panel};border:1px solid ${C.border};
+        border-radius:4px;color:${C.text};padding:6px 8px;font-size:11px;font-family:inherit;width:140px">${opts}</select>`;
+    } else {
+      input = `<input id="set-${key}" type="number" value="${val}" step="${meta.step||1}"
+        min="${schema.min ?? ""}" max="${schema.max ?? ""}"
+        style="background:${C.panel};border:1px solid ${C.border};border-radius:4px;
+        color:${C.text};padding:6px 8px;font-size:11px;font-family:inherit;width:140px">`;
+    }
+    return `<div style="display:flex;justify-content:space-between;align-items:center;
+      padding:9px 0;border-bottom:1px solid ${C.border}">
+      <div>
+        <div style="color:${C.text};font-size:11px;font-weight:600">${meta.label}${meta.unit?` <span style="color:${C.muted};font-size:9px">(${meta.unit})</span>`:""}</div>
+        ${meta.hint?`<div style="color:${C.muted};font-size:9px;margin-top:2px">${meta.hint}</div>`:""}
+        ${schema.min!=null?`<div style="color:${C.dim};font-size:8px;margin-top:2px">range: ${schema.min}–${schema.max}</div>`:""}
+      </div>
+      ${input}
+    </div>`;
+  }).join("");
+}
+
+async function saveSettings() {
+  const body = {};
+  Object.keys(SETTINGS_META).forEach(key=>{
+    const elInput = document.getElementById("set-"+key);
+    if (elInput) body[key] = elInput.value;
+  });
+  const btn = document.getElementById("settings-save-btn");
+  btn.disabled = true; btn.textContent = "SAVING...";
+  try {
+    const r = await fetch(SERVER+"/settings", {
+      method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)
+    });
+    const d = await r.json();
+    if (Object.keys(d.errors||{}).length) {
+      alert("Some settings were rejected:\n"+Object.entries(d.errors).map(([k,v])=>k+": "+v).join("\n"));
+    }
+    renderSettingsForm(d.settings||{});
+    const msg = document.getElementById("settings-saved-msg");
+    msg.style.display = "inline";
+    setTimeout(()=>msg.style.display="none", 2500);
+  } catch(_){
+    alert("Failed to save settings — check connection.");
+  }
+  btn.disabled = false; btn.textContent = "SAVE CHANGES";
+}
+
 // ── SSE ───────────────────────────────────────────────────────────────────────
 function connect() {
   const es = new EventSource(SERVER+"/events");
@@ -760,6 +865,10 @@ function connect() {
 
       else if (ev.type==="cfg_trades") {
         document.getElementById("cfg-trades").textContent = ev.value;
+      }
+
+      else if (ev.type==="settings_update") {
+        if (currentTab==="settings") renderSettingsForm(ev.settings||{});
       }
 
     } catch(_) {}
