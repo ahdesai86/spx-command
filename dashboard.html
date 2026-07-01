@@ -6,82 +6,82 @@
   <title>SPX COMMAND v9</title>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
-    body{background:#07090c;color:#d4e4f4;font-family:'Courier New',monospace;font-size:14px}
+    body{background:#07090c;color:#e2eef8;font-family:'Courier New',monospace;font-size:15px}
     @keyframes pip{0%,100%{opacity:1}50%{opacity:0.2}}
     @keyframes fin{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
-    ::-webkit-scrollbar{width:3px}
-    ::-webkit-scrollbar-thumb{background:#1a2535;border-radius:2px}
+    ::-webkit-scrollbar{width:4px}
+    ::-webkit-scrollbar-thumb{background:#2a3f55;border-radius:2px}
     button{cursor:pointer;font-family:inherit;transition:filter .15s}
-    button:hover:not(:disabled){filter:brightness(1.2)}
+    button:hover:not(:disabled){filter:brightness(1.25)}
     a{color:#4db8ff;text-decoration:none}
 
     /* Layout */
-    #topbar{background:#0c1017;border-bottom:1px solid #151d28;padding:10px 18px;
+    #topbar{background:#0d1219;border-bottom:1px solid #1e2d3d;padding:11px 20px;
       display:flex;align-items:center;justify-content:space-between;
       position:sticky;top:0;z-index:100}
-    #main{padding:13px 18px;max-width:1100px;margin:0 auto}
-    .two-col{display:grid;grid-template-columns:1fr 320px;gap:12px}
-    .panel{background:#0c1017;border:1px solid #151d28;border-radius:10px;padding:12px 14px;margin-bottom:12px}
+    #main{padding:14px 20px;max-width:1160px;margin:0 auto}
+    .two-col{display:grid;grid-template-columns:1fr 340px;gap:14px}
+    .panel{background:#0d1219;border:1px solid #1e2d3d;border-radius:10px;padding:14px 16px;margin-bottom:13px}
 
     /* Stats bar */
     #statsbar{display:grid;grid-template-columns:repeat(6,1fr);
-      background:#0c1017;border:1px solid #151d28;border-radius:10px;
-      overflow:hidden;margin-bottom:12px}
-    .stat-cell{padding:10px 12px;border-right:1px solid #151d28}
+      background:#0d1219;border:1px solid #1e2d3d;border-radius:10px;
+      overflow:hidden;margin-bottom:13px}
+    .stat-cell{padding:11px 14px;border-right:1px solid #1e2d3d}
     .stat-cell:last-child{border-right:none}
-    .stat-k{color:#5a7a94;font-size:9px;letter-spacing:1.2px;margin-bottom:3px}
-    .stat-v{font-size:14px;font-weight:700}
+    .stat-k{color:#7a9db8;font-size:14px;letter-spacing:1.2px;margin-bottom:4px;text-transform:uppercase}
+    .stat-v{font-size:16px;font-weight:700}
 
     /* Tabs */
-    .tabs{display:flex;background:#07090c;border:1px solid #151d28;border-radius:6px;overflow:hidden}
-    .tab{padding:6px 14px;font-size:11px;background:transparent;color:#6a8a9f;
+    .tabs{display:flex;background:#07090c;border:1px solid #1e2d3d;border-radius:6px;overflow:hidden}
+    .tab{padding:7px 16px;font-size:14px;background:transparent;color:#7a9db8;
       border:none;font-family:inherit;letter-spacing:.5px}
-    .tab.active{background:#1a2535;color:#e8f0f8}
+    .tab.active{background:#1e2d3d;color:#e2eef8}
 
     /* Signal cards */
-    .signal-card{border-radius:9px;padding:12px 14px;margin-bottom:8px;animation:fin .25s ease}
-    .grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:3px;margin-bottom:4px}
-    .cell{background:#07090c;border-radius:4px;padding:6px 8px}
-    .cell-k{color:#5a7a94;font-size:9px;letter-spacing:1px;margin-bottom:2px}
-    .cell-v{font-size:12px;font-weight:600}
+    .signal-card{border-radius:9px;padding:14px 16px;margin-bottom:9px;animation:fin .25s ease}
+    .grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:4px;margin-bottom:5px}
+    .cell{background:#07090c;border-radius:4px;padding:8px 10px;border:1px solid #1e2d3d}
+    .cell-k{color:#7a9db8;font-size:14px;letter-spacing:1px;margin-bottom:3px;text-transform:uppercase}
+    .cell-v{font-size:13px;font-weight:600}
     .cell.dash{border-style:dashed}
-    .badge{border-radius:3px;padding:2px 8px;font-size:11px;font-weight:700;display:inline-block}
+    .badge{border-radius:3px;padding:3px 9px;font-size:14px;font-weight:700;display:inline-block}
     .status-bar{display:flex;align-items:center;justify-content:space-between;
-      padding:7px 10px;border-radius:5px;margin-top:6px}
-    .pip{width:6px;height:6px;border-radius:50%;display:inline-block;animation:pip 2s infinite;flex-shrink:0}
-    .row{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:3px}
+      padding:8px 11px;border-radius:5px;margin-top:7px}
+    .pip{width:7px;height:7px;border-radius:50%;display:inline-block;animation:pip 2s infinite;flex-shrink:0}
+    .row{display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-bottom:4px}
 
     /* GEX bars */
-    .gex-row{display:flex;align-items:center;gap:6px;margin-bottom:5px}
-    .gex-bar-wrap{flex:1;height:12px;background:#1a2535;border-radius:2px;overflow:hidden}
+    .gex-row{display:flex;align-items:center;gap:7px;margin-bottom:6px}
+    .gex-bar-wrap{flex:1;height:13px;background:#1e2d3d;border-radius:2px;overflow:hidden}
     .gex-bar{height:100%;border-radius:2px;transition:width .5s}
 
     /* Log */
-    #log-area{overflow-y:auto;height:200px;font-size:11px}
-    #log-full{overflow-y:auto;height:500px;font-size:11px}
-    .log-row{display:flex;gap:7px;margin-bottom:3px;border-bottom:1px solid #1a253544;padding-bottom:2px}
-    .log-time{color:#6a8a9f;flex-shrink:0;min-width:55px}
-    .log-tag{flex-shrink:0;min-width:60px;font-weight:700}
-    .log-msg{color:#8aa4b8;word-break:break-all}
+    #log-area{overflow-y:auto;height:220px;font-size:14px}
+    #log-full{overflow-y:auto;height:540px;font-size:14px}
+    .log-row{display:flex;gap:8px;margin-bottom:4px;border-bottom:1px solid #1e2d3d55;padding-bottom:3px}
+    .log-time{color:#7a9db8;flex-shrink:0;min-width:60px;font-size:14px}
+    .log-tag{flex-shrink:0;min-width:68px;font-weight:700;font-size:14px}
+    .log-msg{color:#a8c4d8;word-break:break-all;font-size:14px}
 
     /* Journal */
-    .j-row{background:#0c1017;border:1px solid #151d28;border-radius:7px;
-      padding:9px 12px;margin-bottom:6px;display:grid;
-      grid-template-columns:80px 110px 70px 70px 70px 70px 1fr;gap:8px;align-items:center}
-    .j-k{color:#5a7a94;font-size:9px;margin-bottom:2px}
-    .j-v{font-size:11px}
+    .j-row{background:#0d1219;border:1px solid #1e2d3d;border-radius:7px;
+      padding:10px 14px;margin-bottom:7px;display:grid;
+      grid-template-columns:80px 120px 72px 72px 72px 72px 1fr;gap:9px;align-items:center}
+    .j-k{color:#7a9db8;font-size:14px;margin-bottom:2px;text-transform:uppercase;letter-spacing:.8px}
+    .j-v{font-size:14px}
 
-    /* Config */
-    .cfg-row{display:flex;justify-content:space-between;margin-bottom:5px}
-    .cfg-k{color:#6a8a9f;font-size:10px}
-    .cfg-v{color:#8aa4b8;font-size:10px}
+    /* Config sidebar */
+    .cfg-row{display:flex;justify-content:space-between;margin-bottom:7px;align-items:baseline}
+    .cfg-k{color:#7a9db8;font-size:13px}
+    .cfg-v{color:#b8d0e4;font-size:13px}
 
     /* GEX summary mini */
-    .wall-row{display:flex;align-items:center;gap:5px;margin-bottom:3px}
+    .wall-row{display:flex;align-items:center;gap:6px;margin-bottom:4px}
 
     /* Empty state */
-    .empty{text-align:center;padding:44px 20px;border:1px dashed #2a3a4a;
-      border-radius:10px;color:#6a8a9f;font-size:12px}
+    .empty{text-align:center;padding:48px 20px;border:1px dashed #2a3f55;
+      border-radius:10px;color:#7a9db8;font-size:13px}
 
     /* Responsive */
     @media(max-width:700px){
@@ -100,7 +100,7 @@
       <div style="font-size:15px;font-weight:700;letter-spacing:.5px">
         <span style="color:#2dd4a0">SPX</span> COMMAND
       </div>
-      <div style="color:#7a9cb5;font-size:9px;letter-spacing:1.5px">SPY 0DTE · PAPER · v11 · FLASHALPHA</div>
+      <div style="color:#7a9cb5;font-size:13px;letter-spacing:1.5px">SPY 0DTE · PAPER · v11 · FLASHALPHA</div>
     </div>
     <div class="tabs" id="tabs">
       <button class="tab active" onclick="setTab('signals')">SIGNALS</button>
@@ -116,12 +116,12 @@
     <div id="conn-status" style="display:flex;align-items:center;gap:6px;
       background:#f05b6d0f;border:1px solid #f05b6d25;border-radius:6px;padding:4px 10px">
       <span class="pip" id="conn-pip" style="background:#f05b6d"></span>
-      <span id="conn-text" style="color:#f05b6d;font-size:9px">CONNECTING...</span>
+      <span id="conn-text" style="color:#f05b6d;font-size:13px">CONNECTING...</span>
     </div>
     <button id="closeall-btn" onclick="closeAll()" style="display:none;
       background:#f05b6d0f;border:1px solid #f05b6d30;border-radius:5px;
-      color:#f05b6d;padding:4px 10px;font-size:9px">CLOSE ALL</button>
-    <span id="clock" style="color:#1a2535;font-size:10px"></span>
+      color:#f05b6d;padding:4px 10px;font-size:13px">CLOSE ALL</button>
+    <span id="clock" style="color:#4a6680;font-size:14px"></span>
   </div>
 </div>
 
@@ -129,22 +129,22 @@
   <!-- Stats bar -->
   <div id="statsbar">
     <div class="stat-cell"><div class="stat-k">SESSION P&amp;L</div><div class="stat-v" id="s-pnl" style="color:#2dd4a0">+$0</div></div>
-    <div class="stat-cell"><div class="stat-k">DAILY LOSS</div><div class="stat-v" id="s-loss" style="color:#1a2535">$0</div></div>
-    <div class="stat-cell"><div class="stat-k">LOSS LIMIT</div><div class="stat-v" id="s-limit" style="color:#4a5e74">$6,000</div></div>
+    <div class="stat-cell"><div class="stat-k">DAILY LOSS</div><div class="stat-v" id="s-loss" style="color:#4a6680">$0</div></div>
+    <div class="stat-cell"><div class="stat-k">LOSS LIMIT</div><div class="stat-v" id="s-limit" style="color:#7a9db8">$6,000</div></div>
     <div class="stat-cell"><div class="stat-k">RISK/TRADE</div><div class="stat-v" id="s-risk" style="color:#f5c842">$2000</div></div>
     <div class="stat-cell"><div class="stat-k">WIN RATE</div><div class="stat-v" id="s-winrate" style="color:#4db8ff">—</div></div>
     <div class="stat-cell"><div class="stat-k">ALL-TIME P&amp;L</div><div class="stat-v" id="s-allpnl" style="color:#2dd4a0">+$0</div></div>
   </div>
 
   <!-- ORB info bar -->
-  <div id="orb-bar" style="display:none;background:#0c1017;border:1px solid #151d28;
+  <div id="orb-bar" style="display:none;background:#0d1219;border:1px solid #1e2d3d;
     border-radius:8px;padding:8px 14px;margin-bottom:12px;
     display:flex;gap:20px;align-items:center">
-    <span style="color:#4a5e74;font-size:9px;letter-spacing:2px">ORB (15 MIN)</span>
-    <span style="font-size:10px">High: <span id="orb-high" style="color:#2dd4a0;font-weight:700">—</span></span>
-    <span style="font-size:10px">Low: <span id="orb-low" style="color:#f05b6d;font-weight:700">—</span></span>
-    <span style="font-size:10px">Range: <span id="orb-range" style="color:#f5c842">—</span></span>
-    <span id="orb-status" style="font-size:9px;margin-left:auto"></span>
+    <span style="color:#7a9db8;font-size:13px;letter-spacing:2px">ORB (15 MIN)</span>
+    <span style="font-size:14px">High: <span id="orb-high" style="color:#2dd4a0;font-weight:700">—</span></span>
+    <span style="font-size:14px">Low: <span id="orb-low" style="color:#f05b6d;font-weight:700">—</span></span>
+    <span style="font-size:14px">Range: <span id="orb-range" style="color:#f5c842">—</span></span>
+    <span id="orb-status" style="font-size:13px;margin-left:auto"></span>
   </div>
 
   <div class="two-col">
@@ -153,12 +153,12 @@
       <!-- SIGNALS tab -->
       <div id="tab-signals">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-          <span style="color:#4a5e74;font-size:9px;letter-spacing:2px">LIVE SIGNALS</span>
-          <span id="sig-count" style="color:#1a2535;font-size:9px">0 today · auto-close 3:45 PM ET</span>
+          <span style="color:#7a9db8;font-size:13px;letter-spacing:2px">LIVE SIGNALS</span>
+          <span id="sig-count" style="color:#4a6680;font-size:13px">0 today · auto-close 3:45 PM ET</span>
         </div>
         <div id="signals-list">
           <div class="empty">Waiting for signal engine scan...<br><br>
-            <span style="font-size:10px;color:#1a2535">Scans every 5 min · ORB builds 9:30–9:45 AM ET</span>
+            <span style="font-size:14px;color:#4a6680">Scans every 5 min · ORB builds 9:30–9:45 AM ET</span>
           </div>
         </div>
       </div>
@@ -166,11 +166,11 @@
       <!-- GEX tab -->
       <div id="tab-gex" style="display:none">
         <div style="display:flex;justify-content:space-between;margin-bottom:8px">
-          <span style="color:#4a5e74;font-size:9px;letter-spacing:2px">GEX LEVELS</span>
-          <span style="color:#1a2535;font-size:9px">Compare → TradeEcho / Unusual Whales</span>
+          <span style="color:#7a9db8;font-size:13px;letter-spacing:2px">GEX LEVELS</span>
+          <span style="color:#4a6680;font-size:13px">Compare → TradeEcho / Unusual Whales</span>
         </div>
         <div id="gex-panel" class="panel">
-          <div style="color:#1a2535;font-size:10px;text-align:center;padding:20px 0">
+          <div style="color:#4a6680;font-size:14px;text-align:center;padding:20px 0">
             GEX calculates at 9:25 AM ET
           </div>
         </div>
@@ -179,9 +179,9 @@
       <!-- JOURNAL tab -->
       <div id="tab-journal" style="display:none">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-          <span style="color:#4a5e74;font-size:9px;letter-spacing:2px">TRADE JOURNAL</span>
+          <span style="color:#7a9db8;font-size:13px;letter-spacing:2px">TRADE JOURNAL</span>
           <a href="/db/export" style="background:#4db8ff15;border:1px solid #4db8ff33;
-            border-radius:5px;color:#4db8ff;padding:4px 12px;font-size:9px">⬇ EXPORT CSV</a>
+            border-radius:5px;color:#4db8ff;padding:4px 12px;font-size:13px">⬇ EXPORT CSV</a>
         </div>
         <div id="j-stats" class="panel" style="display:none"></div>
         <div id="journal-list">
@@ -192,8 +192,8 @@
       <!-- LOGS tab -->
       <div id="tab-logs" style="display:none">
         <div style="display:flex;justify-content:space-between;margin-bottom:8px">
-          <span style="color:#4a5e74;font-size:9px;letter-spacing:2px">SERVER LOGS</span>
-          <span id="log-count" style="color:#1a2535;font-size:9px">0 events</span>
+          <span style="color:#7a9db8;font-size:13px;letter-spacing:2px">SERVER LOGS</span>
+          <span id="log-count" style="color:#4a6680;font-size:13px">0 events</span>
         </div>
         <div class="panel" style="padding:10px">
           <div id="log-full"></div>
@@ -203,20 +203,20 @@
       <!-- SETTINGS tab -->
       <div id="tab-settings" style="display:none">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-          <span style="color:#4a5e74;font-size:9px;letter-spacing:2px">BOT SETTINGS</span>
-          <span id="settings-saved-msg" style="color:#2dd4a0;font-size:9px;display:none">✓ Saved</span>
+          <span style="color:#7a9db8;font-size:13px;letter-spacing:2px">BOT SETTINGS</span>
+          <span id="settings-saved-msg" style="color:#2dd4a0;font-size:13px;display:none">✓ Saved</span>
         </div>
         <div class="panel" style="padding:14px">
           <div id="settings-form"></div>
           <div style="display:flex;gap:8px;margin-top:14px">
             <button id="settings-save-btn" onclick="saveSettings()" style="background:#2dd4a018;
-              border:1px solid #2dd4a033;border-radius:5px;color:#2dd4a0;padding:7px 16px;font-size:10px;font-weight:700">
+              border:1px solid #2dd4a033;border-radius:5px;color:#2dd4a0;padding:7px 16px;font-size:14px;font-weight:700">
               SAVE CHANGES</button>
             <button onclick="loadSettings()" style="background:#4db8ff15;
-              border:1px solid #4db8ff33;border-radius:5px;color:#4db8ff;padding:7px 16px;font-size:10px">
+              border:1px solid #4db8ff33;border-radius:5px;color:#4db8ff;padding:7px 16px;font-size:14px">
               RELOAD</button>
           </div>
-          <div style="margin-top:10px;color:#5a7a94;font-size:9px">Changes apply immediately to the running bot — no redeploy needed. Values reset to env-var defaults on next deploy.</div>
+          <div style="margin-top:10px;color:#5a7a94;font-size:13px">Changes apply immediately to the running bot — no redeploy needed. Values reset to env-var defaults on next deploy.</div>
         </div>
       </div>
     </div>
@@ -225,7 +225,7 @@
     <div>
       <!-- Signal mode -->
       <div class="panel" style="margin-bottom:12px">
-        <div style="color:#4a5e74;font-size:9px;letter-spacing:2px;margin-bottom:8px">SIGNAL ENGINE</div>
+        <div style="color:#7a9db8;font-size:13px;letter-spacing:2px;margin-bottom:8px">SIGNAL ENGINE</div>
         <div class="cfg-row"><span class="cfg-k">Mode</span><span id="cfg-mode" class="cfg-v" style="color:#f5c842">—</span></div>
         <div class="cfg-row"><span class="cfg-k">ORB</span><span class="cfg-v">15 min (9:30–9:45)</span></div>
         <div class="cfg-row"><span class="cfg-k">Scan</span><span class="cfg-v">Every 5-min bar close</span></div>
@@ -236,15 +236,15 @@
 
       <!-- GEX summary -->
       <div class="panel" style="margin-bottom:12px">
-        <div style="color:#4a5e74;font-size:9px;letter-spacing:2px;margin-bottom:8px">GEX SUMMARY</div>
+        <div style="color:#7a9db8;font-size:13px;letter-spacing:2px;margin-bottom:8px">GEX SUMMARY</div>
         <div id="gex-summary">
-          <div style="color:#1a2535;font-size:10px;text-align:center;padding:8px 0">9:25 AM ET</div>
+          <div style="color:#4a6680;font-size:14px;text-align:center;padding:8px 0">9:25 AM ET</div>
         </div>
       </div>
 
       <!-- Config -->
       <div class="panel" style="margin-bottom:12px">
-        <div style="color:#4a5e74;font-size:9px;letter-spacing:2px;margin-bottom:8px">EXIT CONFIG</div>
+        <div style="color:#7a9db8;font-size:13px;letter-spacing:2px;margin-bottom:8px">EXIT CONFIG</div>
         <div class="cfg-row"><span class="cfg-k">Risk/trade</span><span id="cfg-risk" class="cfg-v">$2000</span></div>
         <div class="cfg-row"><span class="cfg-k">Stop</span><span class="cfg-v">25% of premium</span></div>
         <div class="cfg-row"><span class="cfg-k">Trail Trigger</span><span id="cfg-tp1" class="cfg-v">50% gain</span></div>
@@ -257,8 +257,8 @@
       <!-- Mini log -->
       <div class="panel">
         <div style="display:flex;justify-content:space-between;margin-bottom:7px">
-          <span style="color:#4a5e74;font-size:9px;letter-spacing:2px">LIVE LOG</span>
-          <span id="mini-log-count" style="color:#1a2535;font-size:9px">0</span>
+          <span style="color:#7a9db8;font-size:13px;letter-spacing:2px">LIVE LOG</span>
+          <span id="mini-log-count" style="color:#4a6680;font-size:13px">0</span>
         </div>
         <div id="log-area"></div>
       </div>
@@ -273,9 +273,9 @@ const SERVER = window.location.origin;
 // ── Colors ────────────────────────────────────────────────────────────────────
 const C = {
   bull:"#2dd4a0", bear:"#f05b6d", yellow:"#f5c842",
-  purple:"#9d7ff5", blue:"#4db8ff", dim:"#3a4f65",
-  muted:"#6a8a9f", text:"#d4e4f4", textDim:"#8aa4b8",
-  panel:"#0c1017", border:"#1e2a38"
+  purple:"#b09af7", blue:"#4db8ff", dim:"#4a6680",
+  muted:"#7a9db8", text:"#e2eef8", textDim:"#a8c4d8",
+  panel:"#0d1219", border:"#1e2d3d"
 };
 
 const TAG_COLORS = {
@@ -380,7 +380,7 @@ function renderSignals() {
   const el = document.getElementById("signals-list");
   if (!signals.length) {
     el.innerHTML = `<div class="empty">Waiting for signal engine scan...<br><br>
-      <span style="font-size:10px;color:${C.dim}">Scans every 5 min · ORB builds 9:30–9:45 AM ET</span></div>`;
+      <span style="font-size:14px;color:${C.dim}">Scans every 5 min · ORB builds 9:30–9:45 AM ET</span></div>`;
     return;
   }
 
@@ -407,24 +407,24 @@ function renderSignals() {
         <div class="row">
           <span style="font-size:14px;font-weight:700;color:${C.text};letter-spacing:2px">SPY</span>
           <span class="badge" style="background:${dc}18;color:${dc};border:1px solid ${dc}33">${sig.direction}</span>
-          <span style="color:${C.textDim};font-size:11px">$${sig.strike} ${sig.right==="C"?"CALL":"PUT"}</span>
+          <span style="color:${C.textDim};font-size:13px">$${sig.strike} ${sig.right==="C"?"CALL":"PUT"}</span>
           ${pnl!=null?`<span class="badge" style="background:${pnl>=0?C.bull:C.bear}18;color:${pnl>=0?C.bull:C.bear};border:1px solid ${pnl>=0?C.bull:C.bear}33">${fp(pnl)}</span>`:""}
         </div>
         <div style="background:${sc}15;color:${sc};border:1px solid ${sc}30;
-          border-radius:4px;padding:3px 9px;font-size:9px;display:flex;align-items:center;gap:5px">
+          border-radius:4px;padding:3px 9px;font-size:13px;display:flex;align-items:center;gap:5px">
           ${isActive?`<span class="pip" style="background:${sc};width:5px;height:5px"></span>`:""}
           ${trailWin?"TRAIL ✓":(SL[sig.status]||sig.status)}
         </div>
       </div>
 
-      <div style="color:${C.textDim};font-size:9px;margin-bottom:8px">${sig.trigger||"Signal Engine"} · ${sig.time} ET</div>
+      <div style="color:${C.textDim};font-size:13px;margin-bottom:8px">${sig.trigger||"Signal Engine"} · ${sig.time} ET</div>
 
       ${sig.optionSymbol?`<div style="margin-bottom:8px;padding:4px 9px;background:#07090c;
         border-radius:4px;border:1px solid ${C.border}">
-        <span style="color:${C.muted};font-size:8px">CONTRACT </span>
-        <span style="color:${C.purple};font-size:10px">${sig.optionSymbol}</span>
-        ${sig.contracts?`<span style="color:${C.text};font-size:10px"> ×${sig.contracts}</span>`:""}
-        ${sig.totalCost?`<span style="color:${C.yellow};font-size:10px"> · $${sig.totalCost} cost</span>`:""}
+        <span style="color:${C.muted};font-size:10px">CONTRACT </span>
+        <span style="color:${C.purple};font-size:14px">${sig.optionSymbol}</span>
+        ${sig.contracts?`<span style="color:${C.text};font-size:14px"> ×${sig.contracts}</span>`:""}
+        ${sig.totalCost?`<span style="color:${C.yellow};font-size:14px"> · $${sig.totalCost} cost</span>`:""}
       </div>`:""}
 
       <div class="grid4">
@@ -465,22 +465,22 @@ function renderSignals() {
             }
             return `<div class="cell" style="border:1px solid ${C.border}">
               <div class="cell-k">${k}</div>
-              <div class="cell-v" style="color:${c};font-size:10px">${display}</div></div>`;
+              <div class="cell-v" style="color:${c};font-size:14px">${display}</div></div>`;
           }).join("")}
       </div>` : ""}
 
       ${sig.strikeReason?`<div style="padding:4px 8px;margin-bottom:5px;background:${C.purple}08;
-        border-radius:4px;border:1px solid ${C.purple}20;font-size:9px">
+        border-radius:4px;border:1px solid ${C.purple}20;font-size:13px">
         <span style="color:${C.purple};font-weight:700">STRIKE </span>
         <span style="color:${C.textDim}">${sig.strikeReason}</span></div>`:""}
 
       ${sig.gexReason?`<div style="padding:4px 8px;margin-bottom:8px;background:${C.dim}44;
-        border-radius:4px;border:1px solid ${C.dim};font-size:9px">
+        border-radius:4px;border:1px solid ${C.dim};font-size:13px">
         <span style="color:${C.muted}">GEX </span>
         <span style="color:${C.textDim}">${sig.gexReason}</span></div>`:""}
 
       ${sig.indicators?`<div style="padding:4px 8px;margin-bottom:8px;background:#07090c;
-        border-radius:4px;border:1px solid ${C.border};font-size:9px;color:${C.muted}">
+        border-radius:4px;border:1px solid ${C.border};font-size:13px;color:${C.muted}">
         VWAP $${sig.indicators.vwap?.toFixed(2)||"—"} ·
         RSI ${sig.indicators.rsi||"—"} ·
         EMA9 $${sig.indicators.ema9?.toFixed(2)||"—"} ·
@@ -490,15 +490,15 @@ function renderSignals() {
       ${isActive?`<div class="status-bar" style="background:${C.bull}08;border:1px solid ${C.bull}20">
         <div class="row">
           <span class="pip" style="background:${C.bull};width:5px;height:5px"></span>
-          <span style="color:${C.bull};font-size:9px">Live · price monitor active (30s)</span>
+          <span style="color:${C.bull};font-size:13px">Live · price monitor active (30s)</span>
         </div>
         <button onclick="cancelSignal(${sig.id})" style="background:${C.bear}0f;
-          border:1px solid ${C.bear}30;border-radius:4px;color:${C.bear};padding:2px 8px;font-size:9px">
+          border:1px solid ${C.bear}30;border-radius:4px;color:${C.bear};padding:2px 8px;font-size:13px">
           CLOSE</button>
       </div>`:""}
 
       ${isClosed?`<div style="padding:6px 9px;background:${sc}08;border:1px solid ${sc}20;
-        border-radius:5px;color:${sc};font-size:9px">
+        border-radius:5px;color:${sc};font-size:13px">
         ${sig.status==="TP1_HIT"?"✓ Target hit · closed":""}
         ${sig.status==="STOPPED"&&trailWin?"✓ Trailing stop · locked in gain":""}
         ${sig.status==="STOPPED"&&!trailWin?"✗ Stop hit · closed":""}
@@ -518,9 +518,9 @@ function renderGEX() {
 function renderGEXPanel() {
   const el = document.getElementById("gex-panel");
   if (!gex) {
-    el.innerHTML = `<div style="color:${C.muted};font-size:11px;text-align:center;padding:20px 0">
+    el.innerHTML = `<div style="color:${C.muted};font-size:13px;text-align:center;padding:20px 0">
       GEX calculates at 9:25 AM ET<br>
-      <span style="color:${C.dim};font-size:9px">Alpaca option chain · self-calculated · free</span></div>`;
+      <span style="color:${C.dim};font-size:13px">Alpaca option chain · self-calculated · free</span></div>`;
     return;
   }
 
@@ -534,16 +534,16 @@ function renderGEXPanel() {
       border-bottom:1px solid ${C.border};padding-bottom:10px;margin-bottom:10px">
       <div class="row">
         <span class="pip" style="background:${rc};box-shadow:0 0 6px ${rc}"></span>
-        <span style="color:${C.text};font-size:12px;font-weight:700">GEX · ${(gex.regime||"").toUpperCase()}</span>
+        <span style="color:${C.text};font-size:14px;font-weight:700">GEX · ${(gex.regime||"").toUpperCase()}</span>
       </div>
       <div class="row" style="gap:14px">
         ${[["NET",fgex(gex.netGex),rc],["FLIP","$"+gex.gammaFlip,C.yellow],["SPY","$"+spot.toFixed(2),C.text]].map(
           ([k,v,c])=>`<div style="text-align:right">
-            <div style="color:${C.muted};font-size:8px;letter-spacing:1px">${k}</div>
-            <div style="color:${c};font-size:12px;font-weight:700">${v}</div></div>`).join("")}
+            <div style="color:${C.muted};font-size:10px;letter-spacing:1px">${k}</div>
+            <div style="color:${c};font-size:14px;font-weight:700">${v}</div></div>`).join("")}
       </div>
     </div>
-    <div style="padding:6px 0;margin-bottom:10px;color:${rc};font-size:10px">
+    <div style="padding:6px 0;margin-bottom:10px;color:${rc};font-size:14px">
       ${isPos?"▲ POSITIVE — range bound · price pulls to walls":"▼ NEGATIVE — trending · moves amplified"}
     </div>
     ${walls.map((w,i)=>{
@@ -553,36 +553,36 @@ function renderGEXPanel() {
       const showSpot=i<walls.length-1&&walls[i].price>spot&&walls[i+1]?.price<=spot;
       return `<div class="gex-row">
         <span style="width:46px;text-align:right;color:${isFirst?color:C.muted};
-          font-size:11px;font-weight:${isFirst?700:400};flex-shrink:0">$${w.price}</span>
+          font-size:13px;font-weight:${isFirst?700:400};flex-shrink:0">$${w.price}</span>
         <span style="width:32px;background:${color}18;border:1px solid ${color}33;
-          border-radius:3px;padding:1px 3px;color:${color};font-size:8px;
+          border-radius:3px;padding:1px 3px;color:${color};font-size:10px;
           text-align:center;flex-shrink:0">${isCall?"CALL":"PUT"}</span>
         <div class="gex-bar-wrap">
           <div class="gex-bar" style="width:${(w.gex/maxG*100)}%;background:${isFirst?color:color+"55"}"></div>
         </div>
-        <span style="width:44px;color:${C.muted};font-size:9px;flex-shrink:0">$${(w.gex/1e6).toFixed(1)}M</span>
-        ${isFirst?`<span style="color:${color};font-size:9px;flex-shrink:0">${isCall?"▲":"▼"}</span>`:""}
+        <span style="width:44px;color:${C.muted};font-size:13px;flex-shrink:0">$${(w.gex/1e6).toFixed(1)}M</span>
+        ${isFirst?`<span style="color:${color};font-size:13px;flex-shrink:0">${isCall?"▲":"▼"}</span>`:""}
       </div>
       ${showSpot?`<div class="gex-row">
         <div style="width:46px"></div><div style="width:32px"></div>
         <div style="flex:1;display:flex;align-items:center;gap:5px">
           <div style="flex:1;height:1px;background:${C.yellow}33"></div>
-          <span style="color:${C.yellow};font-size:9px;white-space:nowrap">SPY $${spot.toFixed(2)} ← HERE</span>
+          <span style="color:${C.yellow};font-size:13px;white-space:nowrap">SPY $${spot.toFixed(2)} ← HERE</span>
           <div style="flex:1;height:1px;background:${C.yellow}33"></div>
         </div></div>`:""}`;
     }).join("")}
     <div style="display:flex;justify-content:space-between;border-top:1px solid ${C.border};
       padding-top:8px;margin-top:8px">
-      <span style="color:${C.dim};font-size:9px">Alpaca chain · self-calc</span>
-      <span style="color:${C.muted};font-size:9px">Compare → TradeEcho · Unusual Whales</span>
-      <span style="color:${C.dim};font-size:9px">${gex.updatedAt?new Date(gex.updatedAt).toLocaleTimeString("en-US",{hour12:false,timeZone:"America/New_York"})+" ET":"—"}</span>
+      <span style="color:${C.dim};font-size:13px">Alpaca chain · self-calc</span>
+      <span style="color:${C.muted};font-size:13px">Compare → TradeEcho · Unusual Whales</span>
+      <span style="color:${C.dim};font-size:13px">${gex.updatedAt?new Date(gex.updatedAt).toLocaleTimeString("en-US",{hour12:false,timeZone:"America/New_York"})+" ET":"—"}</span>
     </div>`;
 }
 
 function renderGEXSummary() {
   const el = document.getElementById("gex-summary");
   if (!gex) {
-    el.innerHTML = `<div style="color:${C.dim};font-size:10px;text-align:center;padding:8px 0">9:25 AM ET</div>`;
+    el.innerHTML = `<div style="color:${C.dim};font-size:14px;text-align:center;padding:8px 0">9:25 AM ET</div>`;
     return;
   }
   const isPos=gex.regime==="positive", rc=isPos?C.bull:C.bear;
@@ -594,7 +594,7 @@ function renderGEXSummary() {
       ${grid.map(([k,v,c])=>`<div style="background:#07090c;border-radius:5px;
         padding:6px 8px;border:1px solid ${C.border}">
         <div style="color:${C.dim};font-size:7px;letter-spacing:1px;margin-bottom:2px">${k}</div>
-        <div style="color:${c};font-size:11px;font-weight:700">${v}</div></div>`).join("")}
+        <div style="color:${c};font-size:13px;font-weight:700">${v}</div></div>`).join("")}
     </div>
     ${[{label:"CALL WALLS",walls:gex.callWalls,color:C.bull},
        {label:"PUT WALLS", walls:gex.putWalls, color:C.bear}].map(({label,walls,color})=>`
@@ -602,11 +602,11 @@ function renderGEXSummary() {
         <div style="color:${C.muted};font-size:7px;letter-spacing:1px;margin-bottom:4px">${label}</div>
         ${(walls||[]).slice(0,3).map((w,i)=>`
           <div class="wall-row">
-            <span style="color:${i===0?color:C.muted};font-size:10px;font-weight:${i===0?700:400};width:36px">$${w.price}</span>
+            <span style="color:${i===0?color:C.muted};font-size:14px;font-weight:${i===0?700:400};width:36px">$${w.price}</span>
             <div style="flex:1;height:3px;background:${C.dim};border-radius:1px;overflow:hidden">
               <div style="width:${i===0?100:i===1?65:40}%;height:100%;background:${color+(i===0?"":"66")}"></div>
             </div>
-            <span style="color:${C.muted};font-size:8px;width:36px">$${(w.gex/1e6).toFixed(0)}M</span>
+            <span style="color:${C.muted};font-size:10px;width:36px">$${(w.gex/1e6).toFixed(0)}M</span>
           </div>`).join("")}
       </div>`).join("")}`;
 }
@@ -627,7 +627,7 @@ function renderJournal() {
          ["AVG LOSS","$"+Math.abs(jStats.avg_loss||0).toFixed(0),C.bear]
       ].map(([k,v,c])=>`<div style="text-align:center">
         <div style="color:${C.dim};font-size:7px;letter-spacing:1px;margin-bottom:3px">${k}</div>
-        <div style="color:${c};font-size:12px;font-weight:700">${v}</div></div>`).join("")}
+        <div style="color:${c};font-size:14px;font-weight:700">${v}</div></div>`).join("")}
     </div>`;
   }
 
@@ -649,7 +649,7 @@ function renderJournal() {
       <div><div class="j-k">QTY</div><div class="j-v">×${t.contracts}</div></div>
       <div><div class="j-k">P&L</div><div class="j-v" style="color:${c};font-weight:700">${fp(t.pnl)}</div></div>
       <div><div class="j-v" style="color:${c};font-weight:700">${t.outcome} ${fpct(t.pnl_pct)}</div>
-        <div style="color:${C.dim};font-size:8px">${t.close_reason} · ${t.signal_mode}${t.max_pnl_pct!=null?" · peak "+(t.max_pnl_pct>=0?"+":"")+t.max_pnl_pct+"%":""}</div></div>
+        <div style="color:${C.dim};font-size:10px">${t.close_reason} · ${t.signal_mode}${t.max_pnl_pct!=null?" · peak "+(t.max_pnl_pct>=0?"+":"")+t.max_pnl_pct+"%":""}</div></div>
     </div>`;
   }).join("");
 }
@@ -735,19 +735,19 @@ function renderSettingsForm(values) {
       const opts = (schema.values||["MODERATE","STRICT"]).map(v=>
         `<option value="${v}" ${v===val?"selected":""}>${v}</option>`).join("");
       input = `<select id="set-${key}" style="background:${C.panel};border:1px solid ${C.border};
-        border-radius:4px;color:${C.text};padding:6px 8px;font-size:11px;font-family:inherit;width:140px">${opts}</select>`;
+        border-radius:4px;color:${C.text};padding:6px 8px;font-size:13px;font-family:inherit;width:140px">${opts}</select>`;
     } else {
       input = `<input id="set-${key}" type="number" value="${val}" step="${meta.step||1}"
         min="${schema.min ?? ""}" max="${schema.max ?? ""}"
         style="background:${C.panel};border:1px solid ${C.border};border-radius:4px;
-        color:${C.text};padding:6px 8px;font-size:11px;font-family:inherit;width:140px">`;
+        color:${C.text};padding:6px 8px;font-size:13px;font-family:inherit;width:140px">`;
     }
     return `<div style="display:flex;justify-content:space-between;align-items:center;
       padding:9px 0;border-bottom:1px solid ${C.border}">
       <div>
-        <div style="color:${C.text};font-size:11px;font-weight:600">${meta.label}${meta.unit?` <span style="color:${C.muted};font-size:9px">(${meta.unit})</span>`:""}</div>
-        ${meta.hint?`<div style="color:${C.muted};font-size:9px;margin-top:2px">${meta.hint}</div>`:""}
-        ${schema.min!=null?`<div style="color:${C.dim};font-size:8px;margin-top:2px">range: ${schema.min}–${schema.max}</div>`:""}
+        <div style="color:${C.text};font-size:13px;font-weight:600">${meta.label}${meta.unit?` <span style="color:${C.muted};font-size:13px">(${meta.unit})</span>`:""}</div>
+        ${meta.hint?`<div style="color:${C.muted};font-size:13px;margin-top:2px">${meta.hint}</div>`:""}
+        ${schema.min!=null?`<div style="color:${C.dim};font-size:10px;margin-top:2px">range: ${schema.min}–${schema.max}</div>`:""}
       </div>
       ${input}
     </div>`;
@@ -850,7 +850,7 @@ function connect() {
         const notif = document.createElement("div");
         notif.style.cssText = `position:fixed;top:60px;right:18px;z-index:999;
           background:#2dd4a018;border:1px solid #2dd4a033;border-radius:8px;
-          padding:10px 16px;color:#2dd4a0;font-size:12px;font-family:monospace;
+          padding:10px 16px;color:#2dd4a0;font-size:14px;font-family:monospace;
           animation:fin .3s ease`;
         notif.textContent = "⚡ SIGNAL FIRED: "+ev.direction+" SPY @ $"+ev.price?.toFixed(2);
         document.body.appendChild(notif);
