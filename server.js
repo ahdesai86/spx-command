@@ -58,8 +58,10 @@ let PREMIUM_STOP_PCT  = parseFloat(process.env.PREMIUM_STOP_PCT || "0.25");
 let TP1_MULTIPLIER    = parseFloat(process.env.TP1_MULTIPLIER   || "3.0");
 let TP1_MIN_MULT      = parseFloat(process.env.TP1_MIN_MULTIPLIER || "1.4");  // floor on GEX-derived TP1
 let TP1_MAX_MULT      = parseFloat(process.env.TP1_MAX_MULTIPLIER || "4.0");  // ceiling on GEX-derived TP1
-let TRAIL_TRIGGER_PCT = parseFloat(process.env.TRAIL_TRIGGER_PCT  || "0.50"); // gain % that activates trailing stop
-let TRAIL_DISTANCE_PCT= parseFloat(process.env.TRAIL_DISTANCE_PCT || "0.20"); // trail this far below peak
+let TRAIL_TRIGGER_PCT     = parseFloat(process.env.TRAIL_TRIGGER_PCT     || "0.50"); // gain % that activates trailing stop (overridden by $ if set)
+let TRAIL_DISTANCE_PCT    = parseFloat(process.env.TRAIL_DISTANCE_PCT    || "0.20"); // trail this far below peak (overridden by $ if set)
+let TRAIL_TRIGGER_DOLLARS = parseFloat(process.env.TRAIL_TRIGGER_DOLLARS || "0");    // > 0: use $ gain to trigger instead of %
+let TRAIL_DISTANCE_DOLLARS= parseFloat(process.env.TRAIL_DISTANCE_DOLLARS|| "0");    // > 0: trail $ below peak instead of %
 let GEX_BUFFER         = parseFloat(process.env.GEX_BUFFER       || "1.0");
 let SIGNAL_MODE        = (process.env.SIGNAL_MODE || "MODERATE").toUpperCase().split(" ")[0]; // MODERATE or STRICT
 let MAX_TRADES_DAY     = parseInt(process.env.MAX_TRADES_DAY || "3");
@@ -73,11 +75,13 @@ const SETTINGS_SCHEMA = {
   TP1_MULTIPLIER:    { type:"number", min:1.1,  max:10,     set:v=>TP1_MULTIPLIER=v },
   TP1_MIN_MULT:      { type:"number", min:1.05, max:10,     set:v=>TP1_MIN_MULT=v },
   TP1_MAX_MULT:      { type:"number", min:1.1,  max:20,     set:v=>TP1_MAX_MULT=v },
-  TRAIL_TRIGGER_PCT: { type:"number", min:0.05, max:5,      set:v=>TRAIL_TRIGGER_PCT=v },
-  TRAIL_DISTANCE_PCT:{ type:"number", min:0.01, max:0.95,   set:v=>TRAIL_DISTANCE_PCT=v },
-  GEX_BUFFER:        { type:"number", min:0,    max:20,     set:v=>GEX_BUFFER=v },
-  SIGNAL_MODE:       { type:"enum",   values:["MODERATE","STRICT"], set:v=>SIGNAL_MODE=v },
-  MAX_TRADES_DAY:    { type:"number", min:1,    max:50, integer:true, set:v=>MAX_TRADES_DAY=v },
+  TRAIL_TRIGGER_PCT:     { type:"number", min:0.05, max:5,    set:v=>TRAIL_TRIGGER_PCT=v },
+  TRAIL_DISTANCE_PCT:    { type:"number", min:0.01, max:0.95, set:v=>TRAIL_DISTANCE_PCT=v },
+  TRAIL_TRIGGER_DOLLARS: { type:"number", min:0,    max:50,   set:v=>TRAIL_TRIGGER_DOLLARS=v },
+  TRAIL_DISTANCE_DOLLARS:{ type:"number", min:0,    max:50,   set:v=>TRAIL_DISTANCE_DOLLARS=v },
+  GEX_BUFFER:            { type:"number", min:0,    max:20,   set:v=>GEX_BUFFER=v },
+  SIGNAL_MODE:           { type:"enum",   values:["MODERATE","STRICT"], set:v=>SIGNAL_MODE=v },
+  MAX_TRADES_DAY:        { type:"number", min:0,    max:50, integer:true, set:v=>MAX_TRADES_DAY=v },
 };
 
 function getSettingsSnapshot(){
@@ -85,6 +89,7 @@ function getSettingsSnapshot(){
     RISK_DOLLARS, RISK_PER_TRADE, MAX_DAILY_LOSS, PREMIUM_STOP_PCT,
     TP1_MULTIPLIER, TP1_MIN_MULT, TP1_MAX_MULT,
     TRAIL_TRIGGER_PCT, TRAIL_DISTANCE_PCT,
+    TRAIL_TRIGGER_DOLLARS, TRAIL_DISTANCE_DOLLARS,
     GEX_BUFFER, SIGNAL_MODE, MAX_TRADES_DAY,
   };
 }
@@ -92,28 +97,18 @@ function getSettingsSnapshot(){
 function getRiskBudget() { return RISK_DOLLARS > 0 ? RISK_DOLLARS : ACCOUNT_SIZE * RISK_PER_TRADE; }
 function calcContracts(p) { return !p||p<=0 ? 1 : Math.max(1, Math.floor(getRiskBudget()/(p*100))); }
 /**
- * TP1 target selection, in priority order:
- *   1. Fixed-$-move mode (TP1_FIXED_MOVE env override), if set.
- *   2. GEX-derived: translate the SPY-level wall/magnet target into an estimated
- *      option premium using the delta-gamma approximation (same method used by
- *      selectStrike's payoff scoring), bounded between TP1_MIN_MULT and
- *      TP1_MAX_MULT of entry premium so a too-close or too-far wall doesn't
- *      produce a degenerate target.
- *   3. Flat TP1_MULTIPLIER fallback when no GEX target is available.
- * Replaces the old flat-3x-only target, which two confirmed trades (June 26
- * +86.2% peak, June 29 +103.5% peak) showed is rarely reachable intraday on 0DTE.
+ * TP1 now represents the trailing stop TRIGGER price — the option premium level
+ * at which the trailing stop activates. This replaces the old theoretical 3x/GEX-wall
+ * target, which confirmed trades showed is rarely reachable intraday on 0DTE.
+ * The trailing stop is the real exit; TP1 is its activation threshold.
+ *
+ * Priority:
+ *   1. Dollar-amount mode (TRAIL_TRIGGER_DOLLARS > 0): trigger at entry + $N
+ *   2. Percentage mode (TRAIL_TRIGGER_PCT): trigger at entry × (1 + PCT)
  */
-function calcTP1(entry, delta, spyEntry, gexTarget, gamma) {
-  if (TP1_FIXED_MOVE > 0) return parseFloat((entry + TP1_FIXED_MOVE*(delta||0.35)).toFixed(2));
-
-  if (gexTarget!=null && spyEntry!=null && delta) {
-    const move = Math.abs(gexTarget - spyEntry);
-    const estGain = delta*move + 0.5*(gamma||0)*move*move;
-    const lo = entry*TP1_MIN_MULT, hi = entry*TP1_MAX_MULT;
-    const target = Math.min(Math.max(entry+estGain, lo), hi);
-    return parseFloat(target.toFixed(2));
-  }
-  return parseFloat((entry * TP1_MULTIPLIER).toFixed(2));
+function calcTP1(entry) {
+  if (TRAIL_TRIGGER_DOLLARS > 0) return parseFloat((entry + TRAIL_TRIGGER_DOLLARS).toFixed(2));
+  return parseFloat((entry * (1 + TRAIL_TRIGGER_PCT)).toFixed(2));
 }
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -137,6 +132,9 @@ let faZeroDteCache  = null;
 let faSummaryCache  = null;
 let faMaxPainCache  = null;
 let faCacheTime     = 0;
+// Daily EMA9/21 seeded from prior trading-day closes — always available from first intraday bar
+let dailyEMA9  = null;
+let dailyEMA21 = null;
 
 // ── JSON File Database ────────────────────────────────────────────────────────
 // Railway auto-injects RAILWAY_VOLUME_MOUNT_PATH at runtime once a volume is
@@ -249,7 +247,7 @@ function saveTradeToDB(trade, signalDbId, indicators) {
       rsi_at_entry:   indicators?.rsi||null,
       ema9_at_entry:  indicators?.ema9||null,
       ema21_at_entry: indicators?.ema21||null,
-      tp1_mode:       TP1_FIXED_MOVE>0?"fixed-$"+TP1_FIXED_MOVE:TP1_MULTIPLIER+"x",
+      tp1_mode:       TRAIL_TRIGGER_DOLLARS>0?"trail-trigger-$"+TRAIL_TRIGGER_DOLLARS:"trail-trigger-"+(TRAIL_TRIGGER_PCT*100)+"%",
       risk_budget:    getRiskBudget(),
       signal_mode:    SIGNAL_MODE,
     });
@@ -384,6 +382,29 @@ async function getSPYQuote() {
   } catch(_) { return null; }
 }
 
+/**
+ * Fetch prior trading-day daily bars and seed EMA9/EMA21 from historical closes.
+ * This makes EMA21 available from the very first intraday bar instead of needing
+ * 105 minutes of 5-min data to accumulate. The bot calculates EMA from intraday
+ * bars; without this seed the first ~100 minutes of each session have null EMA21.
+ */
+async function fetchDailyEMAs() {
+  try {
+    const r = await fetch(ALPACA_DATA+"/v2/stocks/SPY/bars?timeframe=1Day&limit=30&feed=iex",{headers:aH()});
+    if (!r.ok) { log("DATA ERR","Daily bars for EMA seed "+r.status); return; }
+    const data = await r.json();
+    const allBars = (data.bars||[]).sort((a,b)=>new Date(a.t)-new Date(b.t));
+    // Exclude today's bar (incomplete intraday)
+    const etToday = new Date().toLocaleDateString("en-CA",{timeZone:"America/New_York"});
+    const hist = allBars.filter(b=>b.t.slice(0,10)<etToday);
+    if (hist.length<21) { log("DATA","Not enough daily bars for EMA seed ("+hist.length+"/21)"); return; }
+    const closes = hist.map(b=>b.c);
+    dailyEMA9  = calcEMA(closes, 9);
+    dailyEMA21 = calcEMA(closes, 21);
+    log("DATA","Daily EMA seed — EMA9:"+dailyEMA9+" EMA21:"+dailyEMA21+" (from "+hist.length+" prior closes)");
+  } catch(e) { log("DATA ERR","fetchDailyEMAs: "+e.message); }
+}
+
 // ── Technical Indicators ──────────────────────────────────────────────────────
 function calcEMA(closes, period) {
   if (closes.length < period) return null;
@@ -477,8 +498,13 @@ function calcIndicators(bars, currentPrice) {
     if (price < orb.low)  orbBreak = "SHORT";
   }
 
+  // Fall back to daily-seeded EMAs when intraday bars are insufficient.
+  // dailyEMA9/21 are fetched from prior closes at startup, making trend
+  // confirmation available from the first 5-min bar instead of waiting 105 min.
+  const ema9Final  = ema9  ?? dailyEMA9;
+  const ema21Final = ema21 ?? dailyEMA21;
   return { price, orbHigh:orb?.high||null, orbLow:orb?.low||null,
-    vwap, rsi, ema9, ema21, orbBreak };
+    vwap, rsi, ema9:ema9Final, ema21:ema21Final, orbBreak };
 }
 
 /**
@@ -683,7 +709,9 @@ function applyGEX(direction, entry) {
     if (callWall - entry < GEX_BUFFER) return { allowed: false, reason: "LONG blocked — at call wall $" + callWall, tp1: callWall, tp2: callWall, target: callWall };
     const tp1 = magnet && magnet > entry && magnet < callWall ? magnet : callWall;
     const tp2 = callWall > tp1 ? callWall : (walls[1]?.price || callWall);
-    return { allowed: true, reason: "LONG → wall $" + callWall + (magnet ? " | magnet $" + magnet : ""), tp1, tp2, target: callWall };
+    // Prefer zeroDteMagnet as the strike-selection target when it sits between price and wall
+    const target = magnet && magnet > entry && magnet < callWall ? magnet : callWall;
+    return { allowed: true, reason: "LONG → wall $" + callWall + (magnet ? " | magnet $" + magnet : ""), tp1, tp2, target };
   }
 
   if (direction === "SHORT") {
@@ -693,7 +721,8 @@ function applyGEX(direction, entry) {
     if (entry - putWall < GEX_BUFFER) return { allowed: false, reason: "SHORT blocked — at put wall $" + putWall, tp1: putWall, tp2: putWall, target: putWall };
     const tp1 = magnet && magnet < entry && magnet > putWall ? magnet : putWall;
     const tp2 = putWall < tp1 ? putWall : (walls[1]?.price || putWall);
-    return { allowed: true, reason: "SHORT → wall $" + putWall + (magnet ? " | magnet $" + magnet : ""), tp1, tp2, target: putWall };
+    const target = magnet && magnet < entry && magnet > putWall ? magnet : putWall;
+    return { allowed: true, reason: "SHORT → wall $" + putWall + (magnet ? " | magnet $" + magnet : ""), tp1, tp2, target };
   }
 
   return { allowed: true, reason: "No GEX filter", tp1: entry, tp2: entry, target: null };
@@ -836,20 +865,42 @@ function startMonitor(signal, indicators) {
       signal.maxPnlPct = signal.maxPrice!=null ? parseFloat((((signal.maxPrice-entry)/entry)*100).toFixed(1)) : null;
       signal.minPnlPct = signal.minPrice!=null ? parseFloat((((signal.minPrice-entry)/entry)*100).toFixed(1)) : null;
 
-      // Trailing stop: once a position is up TRAIL_TRIGGER_PCT, ratchet the stop up to
-      // trail TRAIL_DISTANCE_PCT below the peak (never below breakeven once active, and
-      // only ever moves up). Catches large moves that fall short of the TP1 target instead
-      // of riding them back down to a fixed-% loss — confirmed twice now (June 26 +86.2%
-      // peak, June 29 +103.5% peak) that 0DTE often reverses well before TP1.
-      const gainPct=(signal.maxPrice-entry)/entry;
-      if(gainPct>=TRAIL_TRIGGER_PCT){
-        const trailStop=signal.maxPrice*(1-TRAIL_DISTANCE_PCT);
-        const newStop=Math.max(trailStop,entry,signal.stopPrice);
-        if(newStop>signal.stopPrice){
-          signal.stopPrice=parseFloat(newStop.toFixed(2));
-          signal.trailingActive=true;
-          log("TRAIL",signal.optionSymbol+" stop raised to $"+signal.stopPrice+" (peak $"+signal.maxPrice+", "+signal.maxPnlPct+"%)");
-          broadcast({type:"signal_update",id:signal.id,stopPrice:signal.stopPrice,trailingActive:true});
+      // Trailing stop — activates once gain reaches trigger ($ or %).
+      // Trail distance is dynamic: tightens when price is near the 0DTE magnet/wall
+      // (maximizing profit capture at the likely SPY reversal zone) and widens when
+      // far from it (gives the position room to run toward the target).
+      const gainPct  = (signal.maxPrice - entry) / entry;
+      const gainDollars = signal.maxPrice - entry;
+      const trailTriggered = TRAIL_TRIGGER_DOLLARS > 0
+        ? gainDollars >= TRAIL_TRIGGER_DOLLARS
+        : gainPct >= TRAIL_TRIGGER_PCT;
+      if (trailTriggered) {
+        // Dynamic distance: tighten near GEX magnet/wall to lock in gains at target
+        let trailDist = TRAIL_DISTANCE_PCT;
+        if (TRAIL_DISTANCE_DOLLARS > 0) {
+          trailDist = TRAIL_DISTANCE_DOLLARS / signal.maxPrice;
+        } else if (gexCache) {
+          const magnet = gexCache.zeroDteMagnet || (signal.direction==="LONG" ? gexCache.callWall : gexCache.putWall);
+          if (magnet && price) {
+            const headroom = signal.direction==="LONG"
+              ? (magnet - price) / price
+              : (price - magnet) / price;
+            if      (headroom <= 0) trailDist = 0.07;       // past magnet: very tight 7%
+            else if (headroom <= 0.003) trailDist = 0.10;   // within $0.20: 10%
+            else if (headroom <= 0.007) trailDist = 0.13;   // within $0.50: 13%
+            else if (headroom <= 0.015) trailDist = 0.18;   // within $1: 18%
+            else trailDist = Math.min(TRAIL_DISTANCE_PCT, 0.25); // far from target: max 25%
+          }
+        }
+        const trailStop = signal.maxPrice * (1 - trailDist);
+        const newStop   = Math.max(trailStop, entry, signal.stopPrice);
+        if (newStop > signal.stopPrice) {
+          signal.stopPrice    = parseFloat(newStop.toFixed(2));
+          signal.trailingActive = true;
+          signal.trailDist    = parseFloat((trailDist*100).toFixed(1));
+          log("TRAIL", signal.optionSymbol+" stop raised to $"+signal.stopPrice+
+            " (peak $"+signal.maxPrice+", "+signal.maxPnlPct+"%, trail "+signal.trailDist+"%)");
+          broadcast({type:"signal_update",id:signal.id,stopPrice:signal.stopPrice,trailingActive:true,trailDist:signal.trailDist});
         }
       }
 
@@ -918,7 +969,14 @@ function startMonitor(signal, indicators) {
 // ── Execute trade ─────────────────────────────────────────────────────────────
 async function executeTrade(direction, price, indicators, gexResult) {
   if(!ALPACA_KEY||!ALPACA_SECRET){log("ERROR","No Alpaca keys");return;}
-  if(tradesDay>=MAX_TRADES_DAY){log("GUARD","Max "+MAX_TRADES_DAY+" trades/day reached");return;}
+  // MAX_TRADES_DAY = 0 → auto mode: up to 5 when DEX strongly bullish and session is green
+  const effectiveMaxTrades = MAX_TRADES_DAY === 0
+    ? (gexCache?.dex != null && gexCache.dex > 5e10 && sessionPnL > 0 ? 5 : 3)
+    : MAX_TRADES_DAY;
+  if(tradesDay>=effectiveMaxTrades){
+    log("GUARD","Max "+effectiveMaxTrades+" trades/day reached"+(MAX_TRADES_DAY===0?" (auto: DEX="+((gexCache?.dex||0)/1e9).toFixed(0)+"B, PnL $"+sessionPnL.toFixed(0)+")":""));
+    return;
+  }
   if(dailyLoss>=ACCOUNT_SIZE*MAX_DAILY_LOSS){log("GUARD","Daily loss limit reached");return;}
 
   const right = direction==="LONG"?"C":"P";
@@ -996,7 +1054,7 @@ async function executeTrade(direction, price, indicators, gexResult) {
 
     sig.fillPrice=parseFloat(filled.filled_avg_price||mid);
     const stop=parseFloat((sig.fillPrice*(1-PREMIUM_STOP_PCT)).toFixed(2));
-    const tp1=calcTP1(sig.fillPrice,si.delta,price,gexResult?.target,si.gamma);
+    const tp1=calcTP1(sig.fillPrice); // trailing stop trigger price
     sig.stopPrice=stop; sig.tp1Price=tp1; sig.status="FILLED";
     sig.entryTime=Date.now();
     tradesDay++;
@@ -1173,7 +1231,7 @@ app.options("*",cors());
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"11.4-settings-tab",status:"running",
+  service:"SPX COMMAND",version:"11.5-smart-exits",status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -1340,7 +1398,7 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"11.4-settings-tab", mode:IS_PAPER?"PAPER":"LIVE",
+    version:"11.5-smart-exits", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, noTradingView:true,
     exitStrategy:"price-monitor + DELETE /v2/positions",
     riskBudget:"$"+getRiskBudget(),
@@ -1375,11 +1433,12 @@ setInterval(async()=>{
   if(m%5===0){
     await runSignalEngine();
   }
-  // Reset daily counters at market open
+  // Reset daily counters at market open and refresh daily EMA seed with yesterday's close
   if(h===9&&m===30) {
     tradesDay=0; sessionPnL=0; dailyLoss=0;
     orbState=null; lastBarTime=null;
     log("DAY","New trading day — counters reset");
+    await fetchDailyEMAs();
   }
 },60000);
 
@@ -1413,7 +1472,7 @@ setInterval(async()=>{
 app.listen(PORT,async()=>{
   console.log(`
  ╔══════════════════════════════════════════════════════╗
- ║   SPX COMMAND v11 · FlashAlpha · Autonomous         ║
+ ║  SPX COMMAND v11.5 · FlashAlpha · Smart Exits        ║
  ╠══════════════════════════════════════════════════════╣
  ║  Signal engine : 5-min bar close scan               ║
  ║  Indicators    : ORB(15m) + VWAP + RSI + EMA        ║
@@ -1436,6 +1495,7 @@ app.listen(PORT,async()=>{
 `);
   initDB();
   await checkAccount();
+  await fetchDailyEMAs(); // seed EMA9/21 from prior closes — always available from first bar
   const now=new Date(new Date().toLocaleString("en-US",{timeZone:"America/New_York"}));
   const h=now.getHours(),m=now.getMinutes();
   if((h>9||(h===9&&m>=30))&&h<16){

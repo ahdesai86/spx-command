@@ -247,7 +247,8 @@
         <div style="color:#4a5e74;font-size:9px;letter-spacing:2px;margin-bottom:8px">EXIT CONFIG</div>
         <div class="cfg-row"><span class="cfg-k">Risk/trade</span><span id="cfg-risk" class="cfg-v">$2000</span></div>
         <div class="cfg-row"><span class="cfg-k">Stop</span><span class="cfg-v">25% of premium</span></div>
-        <div class="cfg-row"><span class="cfg-k">TP1</span><span id="cfg-tp1" class="cfg-v">3x premium</span></div>
+        <div class="cfg-row"><span class="cfg-k">Trail Trigger</span><span id="cfg-tp1" class="cfg-v">50% gain</span></div>
+        <div class="cfg-row"><span class="cfg-k">Trail (dynamic)</span><span class="cfg-v" style="color:#2dd4a0">GEX magnet-aware ✓</span></div>
         <div class="cfg-row"><span class="cfg-k">Exit method</span><span class="cfg-v" style="color:#2dd4a0">DELETE position ✓</span></div>
         <div class="cfg-row"><span class="cfg-k">Force close</span><span class="cfg-v">3:45 PM ET</span></div>
         <div class="cfg-row"><span class="cfg-k">Database</span><span class="cfg-v"><a href="/db/trades">trades</a> · <a href="/db/stats">stats</a></span></div>
@@ -427,7 +428,7 @@ function renderSignals() {
       </div>`:""}
 
       <div class="grid4">
-        ${["ENTRY","STOP","TP1","TP2"].map((k,i)=>{
+        ${["ENTRY","STOP","TRAIL TRIG","WALL"].map((k,i)=>{
           const vals=[sig.spyEntry,sig.stop,sig.tp1,sig.tp2];
           const cols=[C.text,C.bear,C.blue,C.purple];
           const v=vals[i]; return `<div class="cell" style="border:1px solid ${C.border}">
@@ -438,10 +439,10 @@ function renderSignals() {
       <div class="grid4" style="margin-bottom:8px">
         ${[["PREM PAID",sig.fillPrice||sig.midPrice,C.text],
            ["PREM STOP",sig.stopPrice,C.bear],
-           ["PREM TP1",sig.tp1Price,C.blue],
-           ["R:R",null,C.yellow]].map(([k,v,c])=>`<div class="cell dash" style="border:1px dashed ${C.border}">
+           ["TRAIL TRIG",sig.tp1Price,C.blue],
+           ["TRAILING",(sig.trailingActive?"ACTIVE ✓":null),C.bull]].map(([k,v,c])=>`<div class="cell dash" style="border:1px dashed ${C.border}">
             <div class="cell-k">${k}</div>
-            <div class="cell-v" style="color:${c}">${v?"$"+v.toFixed(2):"—"}</div></div>`).join("")}
+            <div class="cell-v" style="color:${c}">${k==="TRAIL TRIG"?(v?"$"+v.toFixed(2):"—"):(k==="TRAILING"?(v||"—"):(v?"$"+v.toFixed(2):"—"))}</div></div>`).join("")}
       </div>
 
       ${(sig.maxPrice!=null || sig.minPrice!=null || sig.currentPrice!=null) ? `
@@ -699,18 +700,17 @@ async function closeAll() {
 
 // ── Settings ──────────────────────────────────────────────────────────────────
 const SETTINGS_META = {
-  RISK_DOLLARS:       {label:"Risk per Trade",          unit:"$",   step:50},
-  RISK_PER_TRADE:     {label:"Risk % of Account",        unit:"",    step:0.01, hint:"used only if Risk per Trade = 0"},
-  MAX_DAILY_LOSS:      {label:"Daily Loss Limit",         unit:"× acct", step:0.01},
-  PREMIUM_STOP_PCT:   {label:"Stop Loss",                unit:"× premium", step:0.01},
-  TP1_MULTIPLIER:      {label:"TP1 Fallback Multiplier",  unit:"x",   step:0.1, hint:"used when no GEX target available"},
-  TP1_MIN_MULT:        {label:"TP1 Min Multiplier",       unit:"x",   step:0.1, hint:"floor on GEX-derived TP1"},
-  TP1_MAX_MULT:        {label:"TP1 Max Multiplier",       unit:"x",   step:0.1, hint:"ceiling on GEX-derived TP1"},
-  TRAIL_TRIGGER_PCT:  {label:"Trailing Stop Trigger",    unit:"× gain", step:0.05, hint:"unrealized gain that activates trailing stop"},
-  TRAIL_DISTANCE_PCT: {label:"Trailing Stop Distance",   unit:"× peak", step:0.05, hint:"trail this far below peak price"},
-  GEX_BUFFER:          {label:"GEX Wall Buffer",          unit:"$",   step:0.25, hint:"don't enter within this $ of a wall"},
-  SIGNAL_MODE:         {label:"Signal Mode",              enum:true},
-  MAX_TRADES_DAY:      {label:"Max Trades / Day",          unit:"",    step:1},
+  RISK_DOLLARS:          {label:"Risk per Trade",            unit:"$",        step:50},
+  RISK_PER_TRADE:        {label:"Risk % of Account",         unit:"",         step:0.01, hint:"used only if Risk per Trade = 0"},
+  MAX_DAILY_LOSS:        {label:"Daily Loss Limit",          unit:"× acct",   step:0.01},
+  PREMIUM_STOP_PCT:      {label:"Stop Loss",                 unit:"× premium",step:0.01},
+  TRAIL_TRIGGER_PCT:     {label:"Trail Trigger % (gain)",    unit:"× gain",   step:0.05, hint:"% unrealized gain to activate trailing stop (e.g. 0.5 = +50%). Ignored if $ version is set."},
+  TRAIL_TRIGGER_DOLLARS: {label:"Trail Trigger $ (gain)",    unit:"$",        step:0.05, hint:"$ gain above entry to activate trailing stop. Overrides % trigger when > 0. (e.g. 0.60 = triggers at entry + $0.60)"},
+  TRAIL_DISTANCE_PCT:    {label:"Trail Distance % (below peak)",unit:"× peak",step:0.05, hint:"% below peak to place trailing stop. Dynamic when GEX magnet available. Ignored if $ version is set."},
+  TRAIL_DISTANCE_DOLLARS:{label:"Trail Distance $ (below peak)",unit:"$",     step:0.05, hint:"$ below peak to place trailing stop. Overrides % distance when > 0."},
+  GEX_BUFFER:            {label:"GEX Wall Buffer",           unit:"$",        step:0.25, hint:"don't enter within this $ of a GEX wall"},
+  SIGNAL_MODE:           {label:"Signal Mode",               enum:true},
+  MAX_TRADES_DAY:        {label:"Max Trades / Session",      unit:"",         step:1,    hint:"0 = auto-adjust: up to 5 trades when DEX > 50B bullish + session P&L > 0, otherwise 3. Set manually to override."},
 };
 
 let settingsSchema = {};
@@ -891,7 +891,11 @@ async function loadStatus() {
     if (s.riskBudget) {
       riskBudget = parseFloat(s.riskBudget.replace("$",""))||2000;
     }
-    if (s.tp1Config) tp1Config = s.tp1Config.value||"3x";
+    if (s.trailingStop) {
+      tp1Config = s.trailingStop.triggerPct+" gain";
+      const el = document.getElementById("cfg-tp1");
+      if (el) el.textContent = tp1Config;
+    }
     if (s.signalMode) signalMode = s.signalMode;
     if (s.tradesDay) document.getElementById("cfg-trades").textContent = s.tradesDay;
     updateStats();
