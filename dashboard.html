@@ -65,11 +65,13 @@
     .log-msg{color:#a8c4d8;word-break:break-all;font-size:14px}
 
     /* Journal */
-    .j-row{background:#0d1219;border:1px solid #1e2d3d;border-radius:7px;
-      padding:10px 14px;margin-bottom:7px;display:grid;
-      grid-template-columns:80px 120px 72px 72px 72px 72px 1fr;gap:9px;align-items:center}
-    .j-k{color:#7a9db8;font-size:14px;margin-bottom:2px;text-transform:uppercase;letter-spacing:.8px}
-    .j-v{font-size:14px}
+    .j-card{background:#0d1219;border:1px solid #1e2d3d;border-radius:8px;
+      padding:12px 15px;margin-bottom:9px}
+    .j-header{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:9px}
+    .j-prices{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:7px;margin-bottom:7px}
+    .j-cell{background:#07090c;border-radius:5px;padding:8px 10px;border:1px solid #1e2d3d}
+    .j-k{color:#7a9db8;font-size:10px;margin-bottom:3px;text-transform:uppercase;letter-spacing:.8px}
+    .j-v{font-size:13px;font-weight:600}
 
     /* Config sidebar */
     .cfg-row{display:flex;justify-content:space-between;margin-bottom:7px;align-items:baseline}
@@ -87,7 +89,7 @@
     @media(max-width:700px){
       .two-col{grid-template-columns:1fr}
       #statsbar{grid-template-columns:repeat(3,1fr)}
-      .j-row{grid-template-columns:1fr 1fr 1fr}
+      .j-prices{grid-template-columns:repeat(2,1fr)}
     }
   </style>
 </head>
@@ -419,12 +421,12 @@ function renderSignals() {
 
       <div style="color:${C.textDim};font-size:13px;margin-bottom:8px">${sig.trigger||"Signal Engine"} · ${sig.time} ET</div>
 
-      ${sig.optionSymbol?`<div style="margin-bottom:8px;padding:4px 9px;background:#07090c;
-        border-radius:4px;border:1px solid ${C.border}">
-        <span style="color:${C.muted};font-size:10px">CONTRACT </span>
-        <span style="color:${C.purple};font-size:14px">${sig.optionSymbol}</span>
-        ${sig.contracts?`<span style="color:${C.text};font-size:14px"> ×${sig.contracts}</span>`:""}
-        ${sig.totalCost?`<span style="color:${C.yellow};font-size:14px"> · $${sig.totalCost} cost</span>`:""}
+      ${sig.optionSymbol?`<div style="margin-bottom:8px;padding:7px 11px;background:#07090c;
+        border-radius:5px;border:1px solid ${C.border};display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <span style="color:${C.purple};font-size:15px;font-weight:700">${parseContract(sig.optionSymbol)}</span>
+        ${sig.contracts?`<span style="color:${C.textDim};font-size:14px">×${sig.contracts}</span>`:""}
+        ${sig.totalCost?`<span style="color:${C.yellow};font-size:14px">$${sig.totalCost} cost</span>`:""}
+        <span style="color:${C.dim};font-size:11px;margin-left:auto">${sig.optionSymbol}</span>
       </div>`:""}
 
       <div class="grid4">
@@ -611,6 +613,20 @@ function renderGEXSummary() {
       </div>`).join("")}`;
 }
 
+// ── OCC symbol parser: "SPY260630C00744000" → "SPY JUN30 744C" ───────────────
+function parseContract(sym) {
+  if (!sym || sym.length < 15) return sym || "—";
+  try {
+    const MONTHS = ["","JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"];
+    const mm  = parseInt(sym.slice(5,7));
+    const dd  = sym.slice(7,9);
+    const right = sym[9];                          // C or P
+    const strike = parseInt(sym.slice(10)) / 1000;
+    const strikeStr = strike % 1 === 0 ? strike.toFixed(0) : strike.toFixed(1);
+    return `SPY ${MONTHS[mm]||"?"}${dd} ${strikeStr}${right}`;
+  } catch(_) { return sym; }
+}
+
 // ── Render journal ────────────────────────────────────────────────────────────
 function renderJournal() {
   const jc = document.getElementById("j-count");
@@ -620,14 +636,14 @@ function renderJournal() {
     const js = document.getElementById("j-stats");
     js.style.display="block";
     const pnl=jStats.total_pnl||0, pc=pnl>=0?C.bull:C.bear;
-    js.innerHTML = `<div style="display:grid;grid-template-columns:repeat(7,1fr);gap:4px">
+    js.innerHTML = `<div style="display:grid;grid-template-columns:repeat(7,1fr);gap:5px">
       ${[["TOTAL",jStats.total_trades,C.text],["WINS",jStats.wins,C.bull],
          ["LOSSES",jStats.losses,C.bear],["WIN%",(jStats.win_rate||0)+"%",C.yellow],
          ["TOTAL P&L",fp(pnl),pc],["AVG WIN","$"+(jStats.avg_win||0).toFixed(0),C.bull],
          ["AVG LOSS","$"+Math.abs(jStats.avg_loss||0).toFixed(0),C.bear]
-      ].map(([k,v,c])=>`<div style="text-align:center">
-        <div style="color:${C.dim};font-size:7px;letter-spacing:1px;margin-bottom:3px">${k}</div>
-        <div style="color:${c};font-size:14px;font-weight:700">${v}</div></div>`).join("")}
+      ].map(([k,v,c])=>`<div style="text-align:center;background:#07090c;border:1px solid ${C.border};border-radius:5px;padding:8px 4px">
+        <div style="color:${C.muted};font-size:10px;letter-spacing:1px;margin-bottom:4px">${k}</div>
+        <div style="color:${c};font-size:15px;font-weight:700">${v}</div></div>`).join("")}
     </div>`;
   }
 
@@ -638,18 +654,42 @@ function renderJournal() {
   }
 
   el.innerHTML = journal.map(t=>{
-    const c=t.outcome==="WIN"?C.bull:t.outcome==="LOSS"?C.bear:C.muted;
-    return `<div class="j-row" style="border-left:3px solid ${c};grid-template-columns:75px 100px 55px 55px 55px 55px 60px 65px 1fr">
-      <div><div class="j-k">${t.date}</div><div class="j-v" style="color:${C.muted}">${t.time}</div></div>
-      <div><div class="j-k">${t.symbol}</div><div class="j-v" style="color:${C.muted}">${t.direction} $${t.strike}</div></div>
-      <div><div class="j-k">ENTRY</div><div class="j-v">$${t.fill_price?.toFixed(2)??"—"}</div></div>
-      <div><div class="j-k">EXIT</div><div class="j-v">$${t.close_price!=null?t.close_price.toFixed(2):"—"}</div></div>
-      <div><div class="j-k">MAX</div><div class="j-v" style="color:${C.bull}">$${t.max_price!=null?t.max_price.toFixed(2):"—"}</div></div>
-      <div><div class="j-k">MIN</div><div class="j-v" style="color:${C.bear}">$${t.min_price!=null?t.min_price.toFixed(2):"—"}</div></div>
-      <div><div class="j-k">QTY</div><div class="j-v">×${t.contracts}</div></div>
-      <div><div class="j-k">P&L</div><div class="j-v" style="color:${c};font-weight:700">${fp(t.pnl)}</div></div>
-      <div><div class="j-v" style="color:${c};font-weight:700">${t.outcome} ${fpct(t.pnl_pct)}</div>
-        <div style="color:${C.dim};font-size:10px">${t.close_reason} · ${t.signal_mode}${t.max_pnl_pct!=null?" · peak "+(t.max_pnl_pct>=0?"+":"")+t.max_pnl_pct+"%":""}</div></div>
+    const c   = t.outcome==="WIN"?C.bull:t.outcome==="LOSS"?C.bear:C.muted;
+    const contract = parseContract(t.symbol);
+    const dc  = t.direction==="LONG"?C.bull:C.bear;
+    const peakStr = t.max_pnl_pct!=null ? ` · peak ${t.max_pnl_pct>=0?"+":""}${t.max_pnl_pct}%` : "";
+    const durStr  = t.duration_min ? ` · ${t.duration_min}m` : "";
+
+    return `<div class="j-card" style="border-left:3px solid ${c}">
+
+      <div class="j-header">
+        <div>
+          <div style="font-size:15px;font-weight:700;color:${C.text};letter-spacing:.5px">${contract}</div>
+          <div style="font-size:11px;color:${C.muted};margin-top:2px">${t.date} · ${t.time}</div>
+        </div>
+        <span class="badge" style="background:${dc}18;color:${dc};border:1px solid ${dc}33">${t.direction}</span>
+        <span style="color:${C.textDim};font-size:13px">×${t.contracts}</span>
+        <div style="margin-left:auto;display:flex;align-items:center;gap:8px">
+          <span style="color:${c};font-size:16px;font-weight:700">${fp(t.pnl)}</span>
+          <span class="badge" style="background:${c}18;color:${c};border:1px solid ${c}33">${t.outcome} ${fpct(t.pnl_pct)}</span>
+        </div>
+      </div>
+
+      <div class="j-prices">
+        ${[["ENTRY", t.fill_price,  C.text],
+           ["EXIT",  t.close_price, C.text],
+           ["MAX",   t.max_price,   C.bull],
+           ["MIN",   t.min_price,   C.bear]
+          ].map(([k,v,col])=>`<div class="j-cell">
+            <div class="j-k">${k}</div>
+            <div class="j-v" style="color:${col}">${v!=null?"$"+v.toFixed(2):"—"}</div>
+          </div>`).join("")}
+      </div>
+
+      <div style="font-size:11px;color:${C.muted};padding:4px 0">
+        ${t.close_reason||"—"} · ${t.signal_mode||"—"}${peakStr}${durStr}
+      </div>
+
     </div>`;
   }).join("");
 }
