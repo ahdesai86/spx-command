@@ -65,6 +65,10 @@ let TRAIL_DISTANCE_DOLLARS= parseFloat(process.env.TRAIL_DISTANCE_DOLLARS|| "0")
 let GEX_BUFFER         = parseFloat(process.env.GEX_BUFFER       || "1.0");
 let SIGNAL_MODE        = (process.env.SIGNAL_MODE || "MODERATE").toUpperCase().split(" ")[0]; // MODERATE or STRICT
 let MAX_TRADES_DAY     = parseInt(process.env.MAX_TRADES_DAY || "3");
+let RSI_LONG_MAX       = parseFloat(process.env.RSI_LONG_MAX  || "65"); // RSI ceiling for LONG entries (avoid overbought)
+let RSI_SHORT_MIN      = parseFloat(process.env.RSI_SHORT_MIN || "35"); // RSI floor for SHORT entries (avoid oversold)
+let DIRECTION_COOLDOWN = (process.env.DIRECTION_COOLDOWN || "ON").toUpperCase(); // ON/OFF — block direction after 2 consecutive stops
+let DIRECTION_COOLDOWN_MINS = parseInt(process.env.DIRECTION_COOLDOWN_MINS || "60");
 
 // Definitions used to validate/clamp incoming POST /settings updates
 const SETTINGS_SCHEMA = {
@@ -82,6 +86,10 @@ const SETTINGS_SCHEMA = {
   GEX_BUFFER:            { type:"number", min:0,    max:20,   set:v=>GEX_BUFFER=v },
   SIGNAL_MODE:           { type:"enum",   values:["MODERATE","STRICT"], set:v=>SIGNAL_MODE=v },
   MAX_TRADES_DAY:        { type:"number", min:0,    max:50, integer:true, set:v=>MAX_TRADES_DAY=v },
+  RSI_LONG_MAX:          { type:"number", min:40,   max:90,  set:v=>RSI_LONG_MAX=v },
+  RSI_SHORT_MIN:         { type:"number", min:10,   max:60,  set:v=>RSI_SHORT_MIN=v },
+  DIRECTION_COOLDOWN:    { type:"enum",   values:["ON","OFF"], set:v=>DIRECTION_COOLDOWN=v },
+  DIRECTION_COOLDOWN_MINS:{ type:"number",min:5,   max:240, integer:true, set:v=>DIRECTION_COOLDOWN_MINS=v },
 };
 
 function getSettingsSnapshot(){
@@ -91,6 +99,8 @@ function getSettingsSnapshot(){
     TRAIL_TRIGGER_PCT, TRAIL_DISTANCE_PCT,
     TRAIL_TRIGGER_DOLLARS, TRAIL_DISTANCE_DOLLARS,
     GEX_BUFFER, SIGNAL_MODE, MAX_TRADES_DAY,
+    RSI_LONG_MAX, RSI_SHORT_MIN,
+    DIRECTION_COOLDOWN, DIRECTION_COOLDOWN_MINS,
   };
 }
 
@@ -531,10 +541,10 @@ function evaluateSignal(ind) {
   else if (!isLong && ind.price < ind.vwap) passed.push("VWAP below");
   else failed.push("VWAP "+( isLong ? "price below VWAP" : "price above VWAP"));
 
-  // RSI — avoid extremes
-  const rsiOk = isLong ? ind.rsi<75&&ind.rsi>40 : ind.rsi>25&&ind.rsi<60;
+  // RSI — avoid extremes (thresholds tunable via RSI_LONG_MAX / RSI_SHORT_MIN settings)
+  const rsiOk = isLong ? ind.rsi < RSI_LONG_MAX && ind.rsi > 40 : ind.rsi > RSI_SHORT_MIN && ind.rsi < 60;
   if (rsiOk) passed.push("RSI "+ind.rsi);
-  else failed.push("RSI "+ind.rsi+" ("+(isLong?"overbought >75 or weak <40":"oversold <25 or weak >60")+")");
+  else failed.push("RSI "+ind.rsi+" ("+(isLong?"overbought >"+RSI_LONG_MAX+" or weak <40":"oversold <"+RSI_SHORT_MIN+" or weak >60")+")");
 
   // EMA (STRICT mode only)
   if (SIGNAL_MODE==="STRICT") {
@@ -705,7 +715,7 @@ function applyGEX(direction, entry) {
   if (direction === "LONG") {
     const walls = (gc.callWalls || []).filter(w => w.price > entry + GEX_BUFFER).sort((a, b) => a.price - b.price);
     const callWall = gc.callWall && gc.callWall > entry + GEX_BUFFER ? gc.callWall : (walls[0]?.price || null);
-    if (!callWall) return { allowed: true, reason: "No call wall above", tp1: magnet && magnet > entry ? magnet : entry + 2, tp2: entry + 4, target: magnet };
+    if (!callWall) return { allowed: false, reason: "SPY above all GEX call walls — no upside target", tp1: entry, tp2: entry, target: null };
     if (callWall - entry < GEX_BUFFER) return { allowed: false, reason: "LONG blocked — at call wall $" + callWall, tp1: callWall, tp2: callWall, target: callWall };
     const tp1 = magnet && magnet > entry && magnet < callWall ? magnet : callWall;
     const tp2 = callWall > tp1 ? callWall : (walls[1]?.price || callWall);
@@ -717,7 +727,7 @@ function applyGEX(direction, entry) {
   if (direction === "SHORT") {
     const walls = (gc.putWalls || []).filter(w => w.price < entry - GEX_BUFFER).sort((a, b) => b.price - a.price);
     const putWall = gc.putWall && gc.putWall < entry - GEX_BUFFER ? gc.putWall : (walls[0]?.price || null);
-    if (!putWall) return { allowed: true, reason: "No put wall below", tp1: magnet && magnet < entry ? magnet : entry - 2, tp2: entry - 4, target: magnet };
+    if (!putWall) return { allowed: false, reason: "SPY below all GEX put walls — no downside target", tp1: entry, tp2: entry, target: null };
     if (entry - putWall < GEX_BUFFER) return { allowed: false, reason: "SHORT blocked — at put wall $" + putWall, tp1: putWall, tp2: putWall, target: putWall };
     const tp1 = magnet && magnet < entry && magnet > putWall ? magnet : putWall;
     const tp2 = putWall < tp1 ? putWall : (walls[1]?.price || putWall);
@@ -825,6 +835,12 @@ function buildSymbol(strike,right,date) {
 }
 function getETDate(){return new Date(new Date().toLocaleString("en-US",{timeZone:"America/New_York"}));}
 function getExpiry(){const d=getETDate();return d.getFullYear()+String(d.getMonth()+1).padStart(2,"0")+String(d.getDate()).padStart(2,"0");}
+function getNextTradingDay(){
+  const d=getETDate();
+  d.setDate(d.getDate()+1);
+  while(d.getDay()===0||d.getDay()===6) d.setDate(d.getDate()+1); // skip weekends
+  return d;
+}
 
 async function getMidPrice(symbol){
   try{
@@ -933,7 +949,22 @@ function startMonitor(signal, indicators) {
         signal.outcome=pnl>=0?"WIN":"LOSS";
         // Cooldown only applies to genuine losses on the initial fixed stop — a trailing
         // stop exit in profit isn't evidence the thesis failed, so don't block re-entry.
-        if(!signal.trailingActive) lastStopTime=Date.now();
+        if(!signal.trailingActive){
+          lastStopTime=Date.now();
+          // Direction-specific cooldown: count consecutive fixed stops per direction
+          const dir=signal.direction;
+          if(dir==="LONG"||dir==="SHORT"){
+            dirStops[dir]=(dirStops[dir]||0)+1;
+            if(dirStops[dir]>=2 && DIRECTION_COOLDOWN==="ON"){
+              dirCooldownUntil[dir]=Date.now()+DIRECTION_COOLDOWN_MINS*60000;
+              log("SAFETY","Direction cooldown: "+dir+" blocked for "+DIRECTION_COOLDOWN_MINS+" min after "+dirStops[dir]+" consecutive stops");
+            }
+          }
+        } else {
+          // Winning trail-stop exit resets the consecutive-stop counter for this direction
+          const dir=signal.direction;
+          if(dir==="LONG"||dir==="SHORT") dirStops[dir]=0;
+        }
         sessionPnL+=pnl; dailyLoss+=Math.abs(Math.min(0,pnl));
         broadcast({type:"signal_update",id:signal.id,status:"STOPPED",closeReason:reason,pnl});
         saveTradeToDB(signal,signal._dbId,indicators);
@@ -980,7 +1011,10 @@ async function executeTrade(direction, price, indicators, gexResult) {
   if(dailyLoss>=ACCOUNT_SIZE*MAX_DAILY_LOSS){log("GUARD","Daily loss limit reached");return;}
 
   const right = direction==="LONG"?"C":"P";
-  const date  = getETDate();
+  const now2  = getETDate();
+  const isLateSession = now2.getHours() > 14 || (now2.getHours() === 14 && now2.getMinutes() >= 30);
+  const date  = isLateSession ? getNextTradingDay() : now2;
+  if (isLateSession) log("SIGNAL","After 2:30 PM — using 1DTE expiry ("+date.toLocaleDateString("en-CA")+") for theta protection");
   const si    = selectStrike(price, direction, gexResult?.target);
 
   const sig = {
@@ -994,7 +1028,9 @@ async function executeTrade(direction, price, indicators, gexResult) {
     stop:        indicators.orbLow,
     tp1:         gexResult.tp1, tp2:gexResult.tp2,
     gexTarget:   gexResult.target, gexReason:gexResult.reason,
-    expiry:      getExpiry(), riskBudget:getRiskBudget(),
+    expiry:      date.getFullYear()+String(date.getMonth()+1).padStart(2,"0")+String(date.getDate()).padStart(2,"0"),
+    is1DTE:      isLateSession,
+    riskBudget:getRiskBudget(),
     contracts:null, midPrice:null, totalCost:null,
     fillPrice:null, stopPrice:null, tp1Price:null,
     optionSymbol:null, closePnl:null,
@@ -1086,6 +1122,9 @@ async function pollFill(orderId,maxMs){
 let lastSignalBar = null;
 let lastStopTime  = 0;
 const COOLDOWN_MS = 600000; // 10 min cooldown after stop before re-entering
+// Direction-specific cooldown — block a direction after 2 consecutive losses in that direction
+const dirStops = { LONG: 0, SHORT: 0 }; // consecutive fixed-stop count per direction
+const dirCooldownUntil = { LONG: 0, SHORT: 0 }; // epoch ms until direction is unblocked
 
 async function runSignalEngine() {
   if(scanActive) return;
@@ -1146,6 +1185,16 @@ async function runSignalEngine() {
       scanActive=false;return;
     }
 
+    // Direction-specific cooldown check
+    if(DIRECTION_COOLDOWN==="ON"){
+      const cd=dirCooldownUntil[eval_result.direction]||0;
+      if(Date.now()<cd){
+        const remain=Math.ceil((cd-Date.now())/60000);
+        log("SCAN","Direction cooldown: "+eval_result.direction+" blocked ("+remain+" min) — 2 consecutive stops");
+        scanActive=false;return;
+      }
+    }
+
     // Apply GEX filter
     const gexResult=applyGEX(eval_result.direction,currentPrice);
     if(!gexResult.allowed){
@@ -1163,11 +1212,50 @@ async function runSignalEngine() {
   scanActive=false;
 }
 
+// ── Recover open positions on restart ─────────────────────────────────────────
+// When the bot restarts mid-day (e.g. redeploy), any 1DTE positions bought after 2:30 PM
+// the prior day will still be open in Alpaca. Re-attach monitors so they can be stopped out
+// or trailed rather than running unmonitored until the position is closed manually.
+async function recoverPositions(){
+  try{
+    const positions=await aGet("/v2/positions");
+    const spyOpts=positions.filter(p=>/^SPY\d{6}[CP]\d{8}$/.test(p.symbol));
+    if(!spyOpts.length){log("RECOVER","No open SPY option positions");return;}
+    log("RECOVER","Found "+spyOpts.length+" open SPY option position(s) — re-attaching monitors");
+    for(const pos of spyOpts){
+      const alreadyTracked=signalHistory.find(s=>s.optionSymbol===pos.symbol&&["FILLED"].includes(s.status));
+      if(alreadyTracked) continue; // already monitored
+      const avgEntry=parseFloat(pos.avg_entry_price||0);
+      if(!avgEntry) continue;
+      const right=pos.symbol[9];
+      const dir=right==="C"?"LONG":"SHORT";
+      const contracts=parseInt(pos.qty||1);
+      const stop=parseFloat((avgEntry*(1-PREMIUM_STOP_PCT)).toFixed(2));
+      const tp1=calcTP1(avgEntry);
+      const recovered={
+        id:Date.now(),
+        time:new Date().toLocaleTimeString("en-US",{hour12:false,timeZone:"America/New_York"}),
+        symbol:"SPY", direction:dir, right,
+        optionSymbol:pos.symbol, contracts,
+        fillPrice:avgEntry, midPrice:avgEntry,
+        stopPrice:stop, tp1Price:tp1,
+        status:"FILLED", trigger:"Recovered on restart",
+        is1DTE:true, expiry:pos.symbol.slice(3,9),
+        confidence:"MEDIUM", indicators:{},
+      };
+      signalHistory.unshift(recovered);
+      log("RECOVER","Re-monitoring "+pos.symbol+" x"+contracts+" @ $"+avgEntry+" | stop $"+stop);
+      startMonitor(recovered, {});
+    }
+  }catch(e){ log("RECOVER ERR","recoverPositions: "+e.message); }
+}
+
 // ── EOD force close ───────────────────────────────────────────────────────────
 async function forceCloseAll(){
-  const active=signalHistory.filter(s=>["FILLED","SENT"].includes(s.status));
-  if(!active.length){log("EOD","No open positions");return;}
-  log("EOD","Force closing "+active.length+" position(s)");
+  // Skip 1DTE positions at EOD — they expire tomorrow, intentionally held overnight
+  const active=signalHistory.filter(s=>["FILLED","SENT"].includes(s.status)&&!s.is1DTE);
+  if(!active.length){log("EOD","No 0DTE positions to close");return;}
+  log("EOD","Force closing "+active.length+" 0DTE position(s) (1DTE positions held overnight)");
   for(const sig of active){
     if(sig._monitorInterval) clearInterval(sig._monitorInterval);
     try{
@@ -1231,7 +1319,7 @@ app.options("*",cors());
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"11.5-smart-exits",status:"running",
+  service:"SPX COMMAND",version:"11.6-smart-risk",status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -1398,7 +1486,7 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"11.5-smart-exits", mode:IS_PAPER?"PAPER":"LIVE",
+    version:"11.6-smart-risk", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, noTradingView:true,
     exitStrategy:"price-monitor + DELETE /v2/positions",
     riskBudget:"$"+getRiskBudget(),
@@ -1437,6 +1525,8 @@ setInterval(async()=>{
   if(h===9&&m===30) {
     tradesDay=0; sessionPnL=0; dailyLoss=0;
     orbState=null; lastBarTime=null;
+    dirStops.LONG=0; dirStops.SHORT=0;
+    dirCooldownUntil.LONG=0; dirCooldownUntil.SHORT=0;
     log("DAY","New trading day — counters reset");
     await fetchDailyEMAs();
   }
@@ -1472,7 +1562,7 @@ setInterval(async()=>{
 app.listen(PORT,async()=>{
   console.log(`
  ╔══════════════════════════════════════════════════════╗
- ║  SPX COMMAND v11.5 · FlashAlpha · Smart Exits        ║
+ ║  SPX COMMAND v11.6 · FlashAlpha · Smart Risk        ║
  ╠══════════════════════════════════════════════════════╣
  ║  Signal engine : 5-min bar close scan               ║
  ║  Indicators    : ORB(15m) + VWAP + RSI + EMA        ║
@@ -1496,6 +1586,7 @@ app.listen(PORT,async()=>{
   initDB();
   await checkAccount();
   await fetchDailyEMAs(); // seed EMA9/21 from prior closes — always available from first bar
+  await recoverPositions(); // re-attach monitors to any open 1DTE positions from prior session
   const now=new Date(new Date().toLocaleString("en-US",{timeZone:"America/New_York"}));
   const h=now.getHours(),m=now.getMinutes();
   if((h>9||(h===9&&m>=30))&&h<16){

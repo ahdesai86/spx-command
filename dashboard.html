@@ -751,6 +751,10 @@ const SETTINGS_META = {
   GEX_BUFFER:            {label:"GEX Wall Buffer",           unit:"$",        step:0.25, hint:"don't enter within this $ of a GEX wall"},
   SIGNAL_MODE:           {label:"Signal Mode",               enum:true},
   MAX_TRADES_DAY:        {label:"Max Trades / Session",      unit:"",         step:1,    hint:"0 = auto-adjust: up to 5 trades when DEX > 50B bullish + session P&L > 0, otherwise 3. Set manually to override."},
+  RSI_LONG_MAX:          {label:"RSI LONG Max",              unit:"",         step:1,    hint:"Block LONG entries when RSI >= this. Default 65 (was 75). Lower = fewer overbought entries."},
+  RSI_SHORT_MIN:         {label:"RSI SHORT Min",             unit:"",         step:1,    hint:"Block SHORT entries when RSI <= this. Default 35 (was 25). Higher = fewer oversold entries."},
+  DIRECTION_COOLDOWN:    {label:"Direction Cooldown",        enum:true,                  hint:"ON: block a direction for COOLDOWN_MINS after 2 consecutive fixed stops. OFF: disable for volatile days."},
+  DIRECTION_COOLDOWN_MINS:{label:"Direction Cooldown (min)", unit:"min",      step:5,    hint:"How long to block the losing direction after 2 consecutive stops (default 60 min)."},
 };
 
 let settingsSchema = {};
