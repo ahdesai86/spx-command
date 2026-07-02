@@ -102,7 +102,7 @@
       <div style="font-size:15px;font-weight:700;letter-spacing:.5px">
         <span style="color:#2dd4a0">SPX</span> COMMAND
       </div>
-      <div style="color:#7a9cb5;font-size:13px;letter-spacing:1.5px">SPY 0DTE · PAPER · v11 · FLASHALPHA</div>
+      <div style="color:#7a9cb5;font-size:13px;letter-spacing:1.5px">SPY 0DTE · PAPER · <span id="hdr-version">v11.6</span> · FLASHALPHA</div>
     </div>
     <div class="tabs" id="tabs">
       <button class="tab active" onclick="setTab('signals')">SIGNALS</button>
@@ -932,6 +932,11 @@ async function loadStatus() {
   try {
     const r = await fetch(SERVER+"/status");
     const s = await r.json();
+    if (s.version) {
+      const el = document.getElementById("hdr-version");
+      if (el) el.textContent = "v"+s.version;
+      document.title = "SPX COMMAND v"+s.version;
+    }
     if (s.riskBudget) {
       riskBudget = parseFloat(s.riskBudget.replace("$",""))||2000;
     }
