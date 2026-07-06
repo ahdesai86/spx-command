@@ -158,6 +158,25 @@
           <span style="color:#7a9db8;font-size:13px;letter-spacing:2px">LIVE SIGNALS</span>
           <span id="sig-count" style="color:#4a6680;font-size:13px">0 today · auto-close 3:45 PM ET</span>
         </div>
+        <!-- Day P&L summary bar -->
+        <div id="day-pnl-bar" style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:10px">
+          <div style="background:#0d1219;border:1px solid #1e2d3d;border-radius:7px;padding:10px 12px;text-align:center">
+            <div style="color:#7a9db8;font-size:10px;letter-spacing:1px;margin-bottom:4px">DAY P&L</div>
+            <div id="dp-pnl" style="font-size:18px;font-weight:700;color:#2dd4a0">+$0</div>
+          </div>
+          <div style="background:#0d1219;border:1px solid #1e2d3d;border-radius:7px;padding:10px 12px;text-align:center">
+            <div style="color:#7a9db8;font-size:10px;letter-spacing:1px;margin-bottom:4px">TRADES TODAY</div>
+            <div id="dp-trades" style="font-size:18px;font-weight:700;color:#e2eef8">0</div>
+          </div>
+          <div style="background:#0d1219;border:1px solid #1e2d3d;border-radius:7px;padding:10px 12px;text-align:center">
+            <div style="color:#7a9db8;font-size:10px;letter-spacing:1px;margin-bottom:4px">WINS</div>
+            <div id="dp-wins" style="font-size:18px;font-weight:700;color:#2dd4a0">0</div>
+          </div>
+          <div style="background:#0d1219;border:1px solid #1e2d3d;border-radius:7px;padding:10px 12px;text-align:center">
+            <div style="color:#7a9db8;font-size:10px;letter-spacing:1px;margin-bottom:4px">LOSSES</div>
+            <div id="dp-losses" style="font-size:18px;font-weight:700;color:#f05b6d">0</div>
+          </div>
+        </div>
         <div id="signals-list">
           <div class="empty">Waiting for signal engine scan...<br><br>
             <span style="font-size:14px;color:#4a6680">Scans every 5 min · ORB builds 9:30–9:45 AM ET</span>
@@ -357,6 +376,20 @@ function updateStats() {
   } else { ab.style.display="none"; ca.style.display="none"; }
 
   document.getElementById("sig-count").textContent = signals.length+" today · auto-close 3:45 PM ET";
+
+  // Day P&L bar (signals tab) — derived from closed signals this session
+  const closed   = signals.filter(s=>s.closePnl!=null);
+  const todayW   = closed.filter(s=>s.outcome==="WIN").length;
+  const todayL   = closed.filter(s=>s.outcome==="LOSS").length;
+  const dpEl     = document.getElementById("dp-pnl");
+  const dpC      = sessionPnL>=0?C.bull:C.bear;
+  if(dpEl){
+    dpEl.style.color = dpC;
+    dpEl.textContent = fp(sessionPnL);
+    document.getElementById("dp-trades").textContent = signals.length;
+    document.getElementById("dp-wins").textContent   = todayW;
+    document.getElementById("dp-losses").textContent = todayL;
+  }
 }
 
 // ── Load journal from server ──────────────────────────────────────────────────
@@ -640,11 +673,36 @@ function renderJournal() {
   const jc = document.getElementById("j-count");
   jc.textContent = journal.length>0?" "+journal.length:"";
 
+  // Today's summary — derive from journal entries matching today's date
+  const todayStr = new Date().toLocaleDateString("en-CA",{timeZone:"America/New_York"});
+  const todayTrades = journal.filter(t=>t.date===todayStr && t.close_reason);
+  const todayW   = todayTrades.filter(t=>t.outcome==="WIN");
+  const todayL   = todayTrades.filter(t=>t.outcome==="LOSS");
+  const todayPnl = todayTrades.reduce((a,t)=>a+(t.pnl||0),0);
+  const tpc = todayPnl>=0?C.bull:C.bear;
+  const js = document.getElementById("j-stats");
+  js.style.display="block";
+
+  // Today row
+  const todayRow = `<div style="margin-bottom:8px">
+    <div style="color:${C.muted};font-size:10px;letter-spacing:1.5px;margin-bottom:5px">TODAY</div>
+    <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:5px">
+      ${[
+        ["DAY P&L",    fp(todayPnl),          tpc],
+        ["TRADES",     todayTrades.length,     C.text],
+        ["WINS",       todayW.length,          C.bull],
+        ["LOSSES",     todayL.length,          C.bear],
+        ["WIN %",      todayTrades.length>0?(todayW.length/todayTrades.length*100).toFixed(0)+"%":"—", C.yellow],
+      ].map(([k,v,c])=>`<div style="text-align:center;background:#07090c;border:1px solid ${C.border};border-radius:5px;padding:8px 4px">
+        <div style="color:${C.muted};font-size:10px;letter-spacing:1px;margin-bottom:4px">${k}</div>
+        <div style="color:${c};font-size:16px;font-weight:700">${v}</div></div>`).join("")}
+    </div>
+  </div>`;
+
   if (jStats.total_trades) {
-    const js = document.getElementById("j-stats");
-    js.style.display="block";
     const pnl=jStats.total_pnl||0, pc=pnl>=0?C.bull:C.bear;
-    js.innerHTML = `<div style="display:grid;grid-template-columns:repeat(7,1fr);gap:5px">
+    js.innerHTML = todayRow + `<div style="color:${C.muted};font-size:10px;letter-spacing:1.5px;margin-bottom:5px">ALL TIME</div>
+    <div style="display:grid;grid-template-columns:repeat(7,1fr);gap:5px">
       ${[["TOTAL",jStats.total_trades,C.text],["WINS",jStats.wins,C.bull],
          ["LOSSES",jStats.losses,C.bear],["WIN%",(jStats.win_rate||0)+"%",C.yellow],
          ["TOTAL P&L",fp(pnl),pc],["AVG WIN","$"+(jStats.avg_win||0).toFixed(0),C.bull],
@@ -653,6 +711,8 @@ function renderJournal() {
         <div style="color:${C.muted};font-size:10px;letter-spacing:1px;margin-bottom:4px">${k}</div>
         <div style="color:${c};font-size:15px;font-weight:700">${v}</div></div>`).join("")}
     </div>`;
+  } else {
+    js.innerHTML = todayRow;
   }
 
   const el = document.getElementById("journal-list");
