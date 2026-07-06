@@ -28,6 +28,19 @@
  */
 
 "use strict";
+
+// ── Global crash guards ───────────────────────────────────────────────────────
+// Railway runs Node 18+ where unhandled rejections kill the process by default.
+// Without these, a single unexpected throw anywhere in an async scheduler
+// (network glitch, Alpaca 5xx, unexpected data shape) will crash the server and
+// take the dashboard URL offline until Railway restarts it (backoff: up to 60s).
+process.on("uncaughtException", err => {
+  console.error("[CRASH GUARD] uncaughtException — server kept alive:", err.message, err.stack);
+});
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("[CRASH GUARD] unhandledRejection — server kept alive:", reason);
+});
+
 require("dotenv").config();
 const express = require("express");
 const cors    = require("cors");
@@ -1319,7 +1332,7 @@ app.options("*",cors());
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"11.6-smart-risk",status:"running",
+  service:"SPX COMMAND",version:"11.6.1-stable",status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -1486,7 +1499,7 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"11.6-smart-risk", mode:IS_PAPER?"PAPER":"LIVE",
+    version:"11.6.1-stable", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, noTradingView:true,
     exitStrategy:"price-monitor + DELETE /v2/positions",
     riskBudget:"$"+getRiskBudget(),
@@ -1514,55 +1527,61 @@ function isWeekday(etDate){ const d=etDate.getDay(); return d>=1&&d<=5; }
 
 // Signal engine: runs on 5-min bar close (every minute, fires when new bar available)
 setInterval(async()=>{
-  const now=new Date(new Date().toLocaleString("en-US",{timeZone:"America/New_York"}));
-  if(!isWeekday(now)) return;
-  const h=now.getHours(),m=now.getMinutes();
-  // 5-min bars close at :00, :05, :10, :15, :20, :25, :30, :35, :40, :45, :50, :55
-  if(m%5===0){
-    await runSignalEngine();
-  }
-  // Reset daily counters at market open and refresh daily EMA seed with yesterday's close
-  if(h===9&&m===30) {
-    tradesDay=0; sessionPnL=0; dailyLoss=0;
-    orbState=null; lastBarTime=null;
-    dirStops.LONG=0; dirStops.SHORT=0;
-    dirCooldownUntil.LONG=0; dirCooldownUntil.SHORT=0;
-    log("DAY","New trading day — counters reset");
-    await fetchDailyEMAs();
-  }
+  try {
+    const now=new Date(new Date().toLocaleString("en-US",{timeZone:"America/New_York"}));
+    if(!isWeekday(now)) return;
+    const h=now.getHours(),m=now.getMinutes();
+    // 5-min bars close at :00, :05, :10, :15, :20, :25, :30, :35, :40, :45, :50, :55
+    if(m%5===0){
+      await runSignalEngine();
+    }
+    // Reset daily counters at market open and refresh daily EMA seed with yesterday's close
+    if(h===9&&m===30) {
+      tradesDay=0; sessionPnL=0; dailyLoss=0;
+      orbState=null; lastBarTime=null;
+      dirStops.LONG=0; dirStops.SHORT=0;
+      dirCooldownUntil.LONG=0; dirCooldownUntil.SHORT=0;
+      log("DAY","New trading day — counters reset");
+      await fetchDailyEMAs();
+    }
+  } catch(e) { console.error("[SCHEDULER ERR] signal engine tick:", e.message); }
 },60000);
 
 // GEX scheduler
 setInterval(async()=>{
-  const now=new Date(new Date().toLocaleString("en-US",{timeZone:"America/New_York"}));
-  if(!isWeekday(now)) return;
-  const h=now.getHours(),m=now.getMinutes();
-  const today=now.toLocaleDateString("en-CA");
-  if(!((h>9||(h===9&&m>=25))&&h<16)) return;
-  const key=today+"_"+h+"_"+m;
-  if(GEX_SCHEDULE.some(s=>s.h===h&&s.m===m)&&!gexFired.has(key)){
-    gexFired.add(key);
-    log("GEX","Scheduled refresh "+String(h).padStart(2,"0")+":"+String(m).padStart(2,"0"));
-    await getGEX(true);
-  }
+  try {
+    const now=new Date(new Date().toLocaleString("en-US",{timeZone:"America/New_York"}));
+    if(!isWeekday(now)) return;
+    const h=now.getHours(),m=now.getMinutes();
+    const today=now.toLocaleDateString("en-CA");
+    if(!((h>9||(h===9&&m>=25))&&h<16)) return;
+    const key=today+"_"+h+"_"+m;
+    if(GEX_SCHEDULE.some(s=>s.h===h&&s.m===m)&&!gexFired.has(key)){
+      gexFired.add(key);
+      log("GEX","Scheduled refresh "+String(h).padStart(2,"0")+":"+String(m).padStart(2,"0"));
+      await getGEX(true);
+    }
+  } catch(e) { console.error("[SCHEDULER ERR] GEX tick:", e.message); }
 },60000);
 
 // EOD 3:45 PM
 setInterval(async()=>{
-  const now=new Date(new Date().toLocaleString("en-US",{timeZone:"America/New_York"}));
-  if(!isWeekday(now)) return;
-  const h=now.getHours(),m=now.getMinutes();
-  if(h===15&&m===45){
-    const key=now.toLocaleDateString("en-CA")+"_eod";
-    if(!gexFired.has(key)){gexFired.add(key);await forceCloseAll();}
-  }
+  try {
+    const now=new Date(new Date().toLocaleString("en-US",{timeZone:"America/New_York"}));
+    if(!isWeekday(now)) return;
+    const h=now.getHours(),m=now.getMinutes();
+    if(h===15&&m===45){
+      const key=now.toLocaleDateString("en-CA")+"_eod";
+      if(!gexFired.has(key)){gexFired.add(key);await forceCloseAll();}
+    }
+  } catch(e) { console.error("[SCHEDULER ERR] EOD tick:", e.message); }
 },60000);
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 app.listen(PORT,async()=>{
   console.log(`
  ╔══════════════════════════════════════════════════════╗
- ║  SPX COMMAND v11.6 · FlashAlpha · Smart Risk        ║
+ ║  SPX COMMAND v11.6.1 · FlashAlpha · Stable        ║
  ╠══════════════════════════════════════════════════════╣
  ║  Signal engine : 5-min bar close scan               ║
  ║  Indicators    : ORB(15m) + VWAP + RSI + EMA        ║
