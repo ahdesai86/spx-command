@@ -241,7 +241,8 @@ function saveTradeToDB(trade, signalDbId, indicators) {
       timestamp:      new Date().toISOString(),
       date:           new Date().toLocaleDateString("en-CA",{timeZone:"America/New_York"}),
       time:           new Date().toLocaleTimeString("en-US",{hour12:false,timeZone:"America/New_York"}),
-      bot:            "SPX-COMMAND-v9",
+      bot:            "SPX-COMMAND",
+      source:         "bot",
       symbol:         trade.optionSymbol,
       direction:      trade.direction,
       right_type:     trade.right,
@@ -1332,7 +1333,7 @@ app.options("*",cors());
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"11.6.1-stable",status:"running",
+  service:"SPX COMMAND",version:"11.7-journal",status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -1452,6 +1453,138 @@ app.get("/db/stats",(req,res)=>{
   res.json({stats,byMode:byModeArr,byReason:byReasonArr});
 });
 
+// ── Historical backfill from Alpaca account activity ──────────────────────────
+// Fetches the last 14 days of FILL activity from Alpaca, pairs SPY option buys
+// with their corresponding sells to reconstruct round-trip trades, and inserts
+// them into trades.json. Deduplicates by order_id so re-running is safe.
+// Bot trades going forward are inserted by saveTradeToDB() — source:"bot".
+async function backfillFromAlpaca(days=14) {
+  const after = new Date(Date.now() - days*24*60*60*1000).toISOString();
+  // Alpaca paginates fills via page_token; collect all pages
+  let fills = [];
+  let url = "/v2/account/activities?activity_types=FILL&after="+encodeURIComponent(after)+"&direction=asc&page_size=100";
+  for (let page=0; page<20; page++) { // cap at 2000 fills
+    const data = await aGet(url);
+    const items = Array.isArray(data) ? data : [];
+    fills = fills.concat(items);
+    if (items.length < 100) break;
+    url = "/v2/account/activities?activity_types=FILL&after="+encodeURIComponent(after)+"&direction=asc&page_size=100&page_token="+items[items.length-1].id;
+  }
+
+  // Filter to SPY options only
+  const spyFills = fills.filter(f => /^SPY\d{6}[CP]\d{8}$/.test(f.symbol));
+
+  // Group by (symbol, date) so we can pair buys and sells per day
+  const groups = {};
+  for (const f of spyFills) {
+    const date = (f.transaction_time||"").slice(0,10);
+    const key  = f.symbol+"_"+date;
+    if (!groups[key]) groups[key] = { symbol:f.symbol, date, buys:[], sells:[] };
+    if (f.side==="buy")  groups[key].buys.push(f);
+    if (f.side==="sell") groups[key].sells.push(f);
+  }
+
+  const existing = loadDB("trades");
+  const existingOrderIds = new Set(existing.map(t=>t.alpaca_order_id).filter(Boolean));
+  const inserted = [];
+
+  for (const g of Object.values(groups)) {
+    // Sort chronologically
+    g.buys.sort((a,b)=>new Date(a.transaction_time)-new Date(b.transaction_time));
+    g.sells.sort((a,b)=>new Date(a.transaction_time)-new Date(b.transaction_time));
+
+    // Walk buys, pair each with the next available sell
+    const sells = [...g.sells];
+    for (const buy of g.buys) {
+      if (existingOrderIds.has(buy.order_id)) continue; // already in DB
+
+      const entryPrice  = parseFloat(buy.price||0);
+      const contracts   = parseInt(buy.qty||1);
+      const totalCost   = parseFloat((entryPrice*100*contracts).toFixed(2));
+      const sym         = buy.symbol;
+      const right       = sym[9]; // C or P
+      const direction   = right==="C"?"LONG":"SHORT";
+      // Parse OCC expiry YYMMDD → YYYYMMDD
+      const yy=sym.slice(3,5), mm=sym.slice(5,7), dd=sym.slice(7,9);
+      const expiry = "20"+yy+mm+dd;
+      const strikeRaw = parseInt(sym.slice(10))/1000;
+
+      // Find matching sell (next sell not yet consumed)
+      const sellIdx = sells.findIndex(s=>parseInt(s.qty||0)<=contracts);
+      const sell = sellIdx>=0 ? sells.splice(sellIdx,1)[0] : null;
+
+      let closePrice=null, pnl=null, pnlPct=null, durationMin=null, outcome=null, closeReason=null;
+      if (sell) {
+        closePrice = parseFloat(sell.price||0);
+        pnl = parseFloat(((closePrice-entryPrice)*100*contracts).toFixed(2));
+        pnlPct = totalCost>0 ? parseFloat(((pnl/totalCost)*100).toFixed(1)) : null;
+        const ms = new Date(sell.transaction_time)-new Date(buy.transaction_time);
+        durationMin = parseFloat((ms/60000).toFixed(1));
+        outcome = pnl>=0?"WIN":"LOSS";
+        closeReason = "ALPACA_HISTORICAL";
+      }
+
+      const row = {
+        signal_id:      null,
+        timestamp:      buy.transaction_time,
+        date:           g.date,
+        time:           (buy.transaction_time||"").slice(11,19),
+        bot:            "ALPACA-ACCOUNT",
+        source:         "alpaca-historical",
+        alpaca_order_id:buy.order_id,
+        symbol:         sym,
+        direction,
+        right_type:     right,
+        strike:         strikeRaw,
+        expiry,
+        contracts,
+        fill_price:     entryPrice,
+        total_cost:     totalCost,
+        stop_price:     null,
+        tp1_price:      null,
+        close_price:    closePrice,
+        close_reason:   closeReason,
+        max_price:      null, // not available for historical trades
+        min_price:      null,
+        max_pnl_pct:    null,
+        min_pnl_pct:    null,
+        pnl,
+        pnl_pct:        pnlPct,
+        duration_min:   durationMin,
+        outcome,
+        gex_regime:     null,
+        gex_flip:       null,
+        orb_high:       null,
+        orb_low:        null,
+        vwap_at_entry:  null,
+        rsi_at_entry:   null,
+        ema9_at_entry:  null,
+        ema21_at_entry: null,
+        tp1_mode:       null,
+        risk_budget:    null,
+        signal_mode:    null,
+      };
+      insertDB("trades", row);
+      existingOrderIds.add(buy.order_id);
+      inserted.push(sym+"_"+g.date);
+    }
+  }
+  return { fills_fetched:spyFills.length, groups:Object.keys(groups).length, inserted:inserted.length, trades:inserted };
+}
+
+app.post("/admin/backfill-alpaca", async(req,res)=>{
+  try {
+    const days = parseInt(req.query.days||"14");
+    log("ADMIN","Backfill requested — last "+days+" days of Alpaca activity");
+    const result = await backfillFromAlpaca(days);
+    log("ADMIN","Backfill complete — "+result.inserted+" new trades inserted from "+result.fills_fetched+" SPY fills");
+    res.json({ok:true,...result});
+  } catch(e) {
+    log("ADMIN ERR","Backfill failed: "+e.message);
+    res.status(500).json({ok:false,error:e.message});
+  }
+});
+
 app.get("/db/export",(req,res)=>{
   const trades=loadDB("trades").reverse();
   if(!trades.length) return res.json({error:"No trades"});
@@ -1499,7 +1632,7 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"11.6.1-stable", mode:IS_PAPER?"PAPER":"LIVE",
+    version:"11.7-journal", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, noTradingView:true,
     exitStrategy:"price-monitor + DELETE /v2/positions",
     riskBudget:"$"+getRiskBudget(),
@@ -1581,7 +1714,7 @@ setInterval(async()=>{
 app.listen(PORT,async()=>{
   console.log(`
  ╔══════════════════════════════════════════════════════╗
- ║  SPX COMMAND v11.6.1 · FlashAlpha · Stable        ║
+ ║  SPX COMMAND v11.7 · FlashAlpha · Journal        ║
  ╠══════════════════════════════════════════════════════╣
  ║  Signal engine : 5-min bar close scan               ║
  ║  Indicators    : ORB(15m) + VWAP + RSI + EMA        ║
