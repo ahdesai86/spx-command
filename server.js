@@ -1350,6 +1350,7 @@ app.get("/events",(req,res)=>{
   res.setHeader("Cache-Control","no-cache");
   res.setHeader("Connection","keep-alive");
   res.setHeader("Access-Control-Allow-Origin","*");
+  res.setHeader("X-Accel-Buffering","no"); // disable Nginx buffering on Railway — without this, SSE events are held in proxy buffer and the dashboard stays stuck on "connecting..."
   res.flushHeaders();
   sseClients.push(res);
   try {
