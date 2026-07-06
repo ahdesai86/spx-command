@@ -1408,9 +1408,10 @@ app.post("/closeposition/:symbol",async(req,res)=>{
 
 // DB query endpoints for data mining
 app.get("/db/trades",(req,res)=>{
-  const limit=parseInt(req.query.limit||"100");
-  const rows=loadDB("trades").reverse().slice(0,limit);
-  res.json({count:rows.length,trades:rows});
+  const all=loadDB("trades").reverse();
+  const limit=req.query.limit?parseInt(req.query.limit):null;
+  const rows=limit?all.slice(0,limit):all;
+  res.json({count:rows.length,total:all.length,trades:rows});
 });
 
 app.get("/db/signals",(req,res)=>{

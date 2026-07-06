@@ -365,6 +365,8 @@ async function loadJournal() {
     const r = await fetch(SERVER+"/db/trades");
     const d = await r.json();
     journal = d.trades||[];
+    // store total for badge
+    journal._total = d.total||journal.length;
     const rs = await fetch(SERVER+"/db/stats");
     const ds = await rs.json();
     jStats = ds.stats||{};
