@@ -1353,6 +1353,8 @@ app.get("/events",(req,res)=>{
   res.setHeader("X-Accel-Buffering","no"); // disable Nginx buffering on Railway — without this, SSE events are held in proxy buffer and the dashboard stays stuck on "connecting..."
   res.flushHeaders();
   sseClients.push(res);
+  // Send init — on any serialization error, fall back to a minimal payload so the
+  // client always receives *something* and transitions out of "CONNECTING..." state.
   try {
     const initPayload = sanitizeForBroadcast({
       type:"init",sessionPnL,dailyLoss,signals:signalHistory,
@@ -1361,7 +1363,14 @@ app.get("/events",(req,res)=>{
     });
     res.write("data: "+JSON.stringify(initPayload)+"\n\n");
   } catch(e) {
-    console.error("[SSE INIT ERR] "+e.message);
+    console.error("[SSE INIT ERR] "+e.message+" — sending minimal init");
+    try {
+      res.write("data: "+JSON.stringify({
+        type:"init",sessionPnL,dailyLoss,signals:[],
+        gex:null,expiry:getExpiry(),riskBudget:getRiskBudget(),
+        logs:[],orb:orbState,signalMode:SIGNAL_MODE,
+      })+"\n\n");
+    } catch(_) {}
   }
   const ping=setInterval(()=>{try{res.write(": ping\n\n");}catch(_){clearInterval(ping);}},30000);
   req.on("close",()=>{clearInterval(ping);sseClients=sseClients.filter(c=>c!==res);});
