@@ -82,6 +82,10 @@ let RSI_LONG_MAX       = parseFloat(process.env.RSI_LONG_MAX  || "65"); // RSI c
 let RSI_SHORT_MIN      = parseFloat(process.env.RSI_SHORT_MIN || "35"); // RSI floor for SHORT entries (avoid oversold)
 let DIRECTION_COOLDOWN = (process.env.DIRECTION_COOLDOWN || "ON").toUpperCase(); // ON/OFF — block direction after 2 consecutive stops
 let DIRECTION_COOLDOWN_MINS = parseInt(process.env.DIRECTION_COOLDOWN_MINS || "60");
+// Market mode auto-classifier — MARKET_MODE_AUTO=OFF means classify+log but don't apply
+let MARKET_MODE_AUTO = (process.env.MARKET_MODE_AUTO || "OFF").toUpperCase(); // ON | OFF
+// Optional hard override (skips classifier entirely when set)
+let MARKET_MODE_OVERRIDE = (process.env.MARKET_MODE_OVERRIDE || "").toUpperCase(); // TREND | CHOP | NEUTRAL | ""
 
 // Definitions used to validate/clamp incoming POST /settings updates
 const SETTINGS_SCHEMA = {
@@ -103,6 +107,8 @@ const SETTINGS_SCHEMA = {
   RSI_SHORT_MIN:         { type:"number", min:10,   max:60,  set:v=>RSI_SHORT_MIN=v },
   DIRECTION_COOLDOWN:    { type:"enum",   values:["ON","OFF"], set:v=>DIRECTION_COOLDOWN=v },
   DIRECTION_COOLDOWN_MINS:{ type:"number",min:5,   max:240, integer:true, set:v=>DIRECTION_COOLDOWN_MINS=v },
+  MARKET_MODE_AUTO:      { type:"enum",   values:["ON","OFF"], set:v=>MARKET_MODE_AUTO=v },
+  MARKET_MODE_OVERRIDE:  { type:"enum",   values:["","TREND","NEUTRAL","CHOP"], set:v=>MARKET_MODE_OVERRIDE=v },
 };
 
 function getSettingsSnapshot(){
@@ -114,6 +120,7 @@ function getSettingsSnapshot(){
     GEX_BUFFER, SIGNAL_MODE, MAX_TRADES_DAY,
     RSI_LONG_MAX, RSI_SHORT_MIN,
     DIRECTION_COOLDOWN, DIRECTION_COOLDOWN_MINS,
+    MARKET_MODE_AUTO, MARKET_MODE_OVERRIDE,
   };
 }
 
@@ -152,6 +159,11 @@ const MAX_LOGS      = 500;
 const GEX_SCHEDULE  = [{h:9,m:25},{h:10,m:0},{h:10,m:30},{h:11,m:0},{h:11,m:30},{h:12,m:0},{h:13,m:0},{h:14,m:0},{h:15,m:0}];
 let faLevelsCache   = null;
 let faZeroDteCache  = null;
+// Market mode classifier state
+let MARKET_MODE      = "NEUTRAL"; // active classification: TREND | CHOP | NEUTRAL
+let marketScore      = 0;         // last composite score
+let marketModeDate   = "";        // date mode was set (reset each day)
+let prevDayData      = null;      // { close, adr5, high, low } from prior session daily bars
 let faSummaryCache  = null;
 let faMaxPainCache  = null;
 let faCacheTime     = 0;
@@ -226,6 +238,7 @@ function saveSignalToDB(sig, indicators, fired, blockedReason) {
       nearest_wall:   sig.gexTarget||null,
       signal_strength:sig.strength||null,
       signal_mode:    SIGNAL_MODE,
+      market_mode:    MARKET_MODE,
       fired:          fired?1:0,
       blocked_reason: blockedReason||null,
     });
@@ -274,6 +287,7 @@ function saveTradeToDB(trade, signalDbId, indicators) {
       tp1_mode:       TRAIL_TRIGGER_DOLLARS>0?"trail-trigger-$"+TRAIL_TRIGGER_DOLLARS:"trail-trigger-"+(TRAIL_TRIGGER_PCT*100)+"%",
       risk_budget:    getRiskBudget(),
       signal_mode:    SIGNAL_MODE,
+      market_mode:    MARKET_MODE,
     });
   } catch(e) { log("DB ERR","saveTradeToDB: "+e.message); return null; }
 }
@@ -555,10 +569,13 @@ function evaluateSignal(ind) {
   else if (!isLong && ind.price < ind.vwap) passed.push("VWAP below");
   else failed.push("VWAP "+( isLong ? "price below VWAP" : "price above VWAP"));
 
-  // RSI — avoid extremes (thresholds tunable via RSI_LONG_MAX / RSI_SHORT_MIN settings)
-  const rsiOk = isLong ? ind.rsi < RSI_LONG_MAX && ind.rsi > 40 : ind.rsi > RSI_SHORT_MIN && ind.rsi < 60;
-  if (rsiOk) passed.push("RSI "+ind.rsi);
-  else failed.push("RSI "+ind.rsi+" ("+(isLong?"overbought >"+RSI_LONG_MAX+" or weak <40":"oversold <"+RSI_SHORT_MIN+" or weak >60")+")");
+  // RSI — thresholds from env vars; auto-adjusted by market mode when MARKET_MODE_AUTO=ON
+  const mp = MARKET_MODE_AUTO==="ON" ? getModeParams() : null;
+  const rsiLongMax  = mp ? mp.rsiLongMax  : RSI_LONG_MAX;
+  const rsiShortMin = mp ? mp.rsiShortMin : RSI_SHORT_MIN;
+  const rsiOk = isLong ? ind.rsi < rsiLongMax && ind.rsi > 40 : ind.rsi > rsiShortMin && ind.rsi < 60;
+  if (rsiOk) passed.push("RSI "+ind.rsi+" [mode:"+MARKET_MODE+"]");
+  else failed.push("RSI "+ind.rsi+" ("+(isLong?"overbought >"+rsiLongMax+" or weak <40":"oversold <"+rsiShortMin+" or weak >60")+") [mode:"+MARKET_MODE+"]");
 
   // EMA (STRICT mode only)
   if (SIGNAL_MODE==="STRICT") {
@@ -970,8 +987,9 @@ function startMonitor(signal, indicators) {
           if(dir==="LONG"||dir==="SHORT"){
             dirStops[dir]=(dirStops[dir]||0)+1;
             if(dirStops[dir]>=2 && DIRECTION_COOLDOWN==="ON"){
-              dirCooldownUntil[dir]=Date.now()+DIRECTION_COOLDOWN_MINS*60000;
-              log("SAFETY","Direction cooldown: "+dir+" blocked for "+DIRECTION_COOLDOWN_MINS+" min after "+dirStops[dir]+" consecutive stops");
+              const cdMins = MARKET_MODE_AUTO==="ON" ? getModeParams().cooldownMins : DIRECTION_COOLDOWN_MINS;
+              dirCooldownUntil[dir]=Date.now()+cdMins*60000;
+              log("SAFETY","Direction cooldown: "+dir+" blocked for "+cdMins+" min after "+dirStops[dir]+" consecutive stops [mode:"+MARKET_MODE+"]");
             }
           }
         } else {
@@ -1140,6 +1158,93 @@ const COOLDOWN_MS = 600000; // 10 min cooldown after stop before re-entering
 const dirStops = { LONG: 0, SHORT: 0 }; // consecutive fixed-stop count per direction
 const dirCooldownUntil = { LONG: 0, SHORT: 0 }; // epoch ms until direction is unblocked
 
+// ── Market Mode Classifier ─────────────────────────────────────────────────────
+// Fetches prior-session daily bars once at startup — gives overnight gap + 5-day ADR.
+// One lightweight Alpaca call, cached for the day.
+async function fetchPrevDayData() {
+  try {
+    const bars = await aGet("/v2/stocks/SPY/bars?timeframe=1Day&limit=7&feed=iex&adjustment=raw");
+    const daily = bars?.bars || [];
+    if (daily.length < 2) { log("MARKET","fetchPrevDayData: not enough bars"); return; }
+    const prev = daily[daily.length - 2]; // yesterday
+    // 5-day ADR from last 5 complete sessions
+    const last5 = daily.slice(-6, -1);
+    const adr5 = last5.length ? parseFloat((last5.reduce((s,b)=>s+(b.h-b.l),0)/last5.length).toFixed(2)) : null;
+    prevDayData = { close: prev.c, high: prev.h, low: prev.l, open: prev.o, adr5 };
+    log("MARKET","PrevDay loaded — close $"+prev.c+" | ADR5 $"+(adr5||"n/a"));
+  } catch(e) { log("MARKET ERR","fetchPrevDayData: "+e.message); }
+}
+
+// Returns per-mode parameter overrides. Only applied when MARKET_MODE_AUTO=ON.
+function getModeParams() {
+  const mode = MARKET_MODE_OVERRIDE || MARKET_MODE;
+  return {
+    TREND:   { rsiLongMax:67, rsiShortMin:33, cooldownMins:30,  fibEntryFilter:false },
+    NEUTRAL: { rsiLongMax:RSI_LONG_MAX, rsiShortMin:RSI_SHORT_MIN, cooldownMins:DIRECTION_COOLDOWN_MINS, fibEntryFilter:false },
+    CHOP:    { rsiLongMax:55, rsiShortMin:45, cooldownMins:90,  fibEntryFilter:true  },
+  }[mode] || { rsiLongMax:RSI_LONG_MAX, rsiShortMin:RSI_SHORT_MIN, cooldownMins:DIRECTION_COOLDOWN_MINS, fibEntryFilter:false };
+}
+
+// Scores market signals and sets MARKET_MODE. Safe to call repeatedly — idempotent within same day.
+// When MARKET_MODE_AUTO=OFF: classifies and logs but does not change any active parameters.
+function detectMarketMode() {
+  try {
+    let score = 0;
+    const reasons = [];
+
+    // Signal 1: GEX sign/magnitude (weight ×2) — most reliable signal
+    if (gexCache?.gex != null) {
+      const g = gexCache.gex;
+      if      (g < -1e9) { score += 2; reasons.push("GEX<-$1B (dealer short-gamma) +2"); }
+      else if (g < 0)    { score += 1; reasons.push("GEX neg (mild trend bias) +1"); }
+      else if (g > 5e9)  { score -= 2; reasons.push("GEX>$5B (strong pinning) -2"); }
+      else if (g > 2e9)  { score -= 1; reasons.push("GEX>$2B (mild pinning) -1"); }
+      else               { reasons.push("GEX neutral"); }
+    } else { reasons.push("GEX unavailable"); }
+
+    // Signal 2: VEX — vega exposure (vol buyer demand = trend expectation)
+    if (gexCache?.vex != null) {
+      const v = gexCache.vex;
+      // VEX > $500M = elevated; > $1B = high (thresholds will be calibrated from live data)
+      if      (v > 1e9)  { score += 2; reasons.push("VEX>$1B (large move priced) +2"); }
+      else if (v > 5e8)  { score += 1; reasons.push("VEX elevated +1"); }
+      else if (v < 0)    { score -= 1; reasons.push("VEX negative (pinning) -1"); }
+    }
+
+    // Signal 3: Overnight gap vs prior close (needs prevDayData)
+    if (prevDayData && orbState?.built) {
+      const todayOpen = orbState.open || (orbState.high + orbState.low) / 2;
+      const gapPct = Math.abs((todayOpen - prevDayData.close) / prevDayData.close * 100);
+      if      (gapPct > 0.5)  { score += 1; reasons.push("Gap "+gapPct.toFixed(2)+"% large +1"); }
+      else if (gapPct < 0.1)  { score -= 1; reasons.push("Gap "+gapPct.toFixed(2)+"% tiny -1"); }
+      else                    { reasons.push("Gap "+gapPct.toFixed(2)+"% neutral"); }
+    }
+
+    // Signal 4: ORB range as % of 5-day ADR
+    if (prevDayData?.adr5 && orbState?.built) {
+      const orbRange  = orbState.high - orbState.low;
+      const orbPctADR = orbRange / prevDayData.adr5;
+      if      (orbPctADR > 0.45) { score += 1; reasons.push("ORB "+(orbPctADR*100).toFixed(0)+"% ADR wide +1"); }
+      else if (orbPctADR < 0.20) { score -= 1; reasons.push("ORB "+(orbPctADR*100).toFixed(0)+"% ADR tight -1"); }
+      else                       { reasons.push("ORB "+(orbPctADR*100).toFixed(0)+"% ADR normal"); }
+    }
+
+    marketScore = score;
+    const classified = score >= 2 ? "TREND" : score <= -2 ? "CHOP" : "NEUTRAL";
+
+    const active = MARKET_MODE_OVERRIDE || (MARKET_MODE_AUTO === "ON" ? classified : "NEUTRAL");
+    const changed = active !== MARKET_MODE;
+    MARKET_MODE = active;
+    marketModeDate = new Date().toLocaleDateString("en-CA",{timeZone:"America/New_York"});
+
+    log("MARKET","Mode: "+classified+" (score:"+score+") — AUTO:"+MARKET_MODE_AUTO+" ACTIVE:"+active+" — "+reasons.join(" | "));
+    if (MARKET_MODE_AUTO === "OFF") log("MARKET","[DRY-RUN] Set MARKET_MODE_AUTO=ON in Railway env to activate dynamic parameters");
+
+    broadcast({ type:"market_mode", mode:active, classified, score, auto:MARKET_MODE_AUTO==="ON", reasons });
+    if (changed) log("MARKET","Mode changed → "+active+(MARKET_MODE_AUTO==="ON"?" (params applied)":" (dry-run, no effect)"));
+  } catch(e) { log("MARKET ERR","detectMarketMode: "+e.message); }
+}
+
 async function runSignalEngine() {
   if(scanActive) return;
   const now=new Date(new Date().toLocaleString("en-US",{timeZone:"America/New_York"}));
@@ -1156,6 +1261,10 @@ async function runSignalEngine() {
     // Build ORB if not built yet
     buildORB(bars);
     if(!orbState?.built){log("SCAN","ORB not built yet — waiting");scanActive=false;return;}
+
+    // Market mode: classify once after ORB builds, re-check at 11:00 AM
+    const today=now.toLocaleDateString("en-CA");
+    if(marketModeDate!==today || (h===11&&m===0)) detectMarketMode();
 
     // Get latest bar
     const latestBar=bars[bars.length-1];
@@ -1333,8 +1442,8 @@ app.options("*",cors());
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"11.7-journal",status:"running",
-  mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,
+  service:"SPX COMMAND",version:"11.8-automode",status:"running",
+  mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,marketMode:MARKET_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
 }));
@@ -1360,6 +1469,7 @@ app.get("/events",(req,res)=>{
       type:"init",sessionPnL,dailyLoss,signals:signalHistory,
       gex:gexCache,expiry:getExpiry(),riskBudget:getRiskBudget(),
       logs:logHistory,orb:orbState,signalMode:SIGNAL_MODE,
+      marketMode:MARKET_MODE,marketScore,marketModeAuto:MARKET_MODE_AUTO,
     });
     res.write("data: "+JSON.stringify(initPayload)+"\n\n");
   } catch(e) {
@@ -1643,8 +1753,9 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"11.7-journal", mode:IS_PAPER?"PAPER":"LIVE",
-    signalMode:SIGNAL_MODE, noTradingView:true,
+    version:"11.8-automode", mode:IS_PAPER?"PAPER":"LIVE",
+    signalMode:SIGNAL_MODE, marketMode:MARKET_MODE, marketScore, marketModeAuto:MARKET_MODE_AUTO,
+    noTradingView:true,
     exitStrategy:"price-monitor + DELETE /v2/positions",
     riskBudget:"$"+getRiskBudget(),
     optionsFeed:OPTIONS_FEED,
@@ -1685,8 +1796,10 @@ setInterval(async()=>{
       orbState=null; lastBarTime=null;
       dirStops.LONG=0; dirStops.SHORT=0;
       dirCooldownUntil.LONG=0; dirCooldownUntil.SHORT=0;
+      MARKET_MODE="NEUTRAL"; marketScore=0; marketModeDate="";
       log("DAY","New trading day — counters reset");
       await fetchDailyEMAs();
+      await fetchPrevDayData();
     }
   } catch(e) { console.error("[SCHEDULER ERR] signal engine tick:", e.message); }
 },60000);
@@ -1725,7 +1838,7 @@ setInterval(async()=>{
 app.listen(PORT,async()=>{
   console.log(`
  ╔══════════════════════════════════════════════════════╗
- ║  SPX COMMAND v11.7 · FlashAlpha · Journal        ║
+ ║  SPX COMMAND v11.8 · FlashAlpha · AutoMode       ║
  ╠══════════════════════════════════════════════════════╣
  ║  Signal engine : 5-min bar close scan               ║
  ║  Indicators    : ORB(15m) + VWAP + RSI + EMA        ║
@@ -1749,6 +1862,7 @@ app.listen(PORT,async()=>{
   initDB();
   await checkAccount();
   await fetchDailyEMAs(); // seed EMA9/21 from prior closes — always available from first bar
+  await fetchPrevDayData(); // prev session close + 5-day ADR for market mode classifier
   await recoverPositions(); // re-attach monitors to any open 1DTE positions from prior session
   const now=new Date(new Date().toLocaleString("en-US",{timeZone:"America/New_York"}));
   const h=now.getHours(),m=now.getMinutes();
