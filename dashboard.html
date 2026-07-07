@@ -876,6 +876,8 @@ const SETTINGS_META = {
   RSI_SHORT_MIN:         {label:"RSI SHORT Min",             unit:"",         step:1,    hint:"Block SHORT entries when RSI <= this. Default 35 (was 25). Higher = fewer oversold entries."},
   DIRECTION_COOLDOWN:    {label:"Direction Cooldown",        enum:true,                  hint:"ON: block a direction for COOLDOWN_MINS after 2 consecutive fixed stops. OFF: disable for volatile days."},
   DIRECTION_COOLDOWN_MINS:{label:"Direction Cooldown (min)", unit:"min",      step:5,    hint:"How long to block the losing direction after 2 consecutive stops (default 60 min)."},
+  MARKET_MODE_AUTO:      {label:"Market Mode Auto",          enum:true,                  hint:"ON: dynamically adjusts RSI thresholds and cooldown based on GEX+gap+ORB signals. OFF: logs classification only (dry-run)."},
+  MARKET_MODE_OVERRIDE:  {label:"Market Mode Override",      enum:true,                  hint:"Force a specific mode regardless of classifier. Leave blank for auto-detection. Use TREND/CHOP on known event days."},
 };
 
 let settingsSchema = {};
