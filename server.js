@@ -720,55 +720,79 @@ async function getGEX(force) {
 }
 
 function applyGEX(direction, entry) {
-  if (!gexCache) return { allowed: true, reason: "No GEX", tp1: entry * (direction === "LONG" ? 1.005 : 0.995), tp2: entry * (direction === "LONG" ? 1.01 : 0.99), target: null };
+  if (!gexCache) return { allowed: true, reason: "No GEX", tp1: entry * (direction === "LONG" ? 1.005 : 0.995), tp2: entry * (direction === "LONG" ? 1.01 : 0.99), target: null, dexBias: "NEUTRAL" };
 
   const gc = gexCache;
 
-  // Block trades with high pin risk (price likely stuck near current level)
+  // ── Pin risk block ────────────────────────────────────────────────────────────
   if (gc.pinRisk != null && gc.pinRisk > 70) {
-    return { allowed: false, reason: "Pin risk " + gc.pinRisk + "/100 — price likely pinned, skip 0DTE", tp1: entry, tp2: entry, target: null };
+    return { allowed: false, reason: "Pin risk " + gc.pinRisk + "/100 — price likely pinned", tp1: entry, tp2: entry, target: null, dexBias: "NEUTRAL" };
   }
 
-  // Use DEX to validate direction — only block on very strong opposing flow (>$10B)
-  // Daily DEX for SPY routinely runs $10B-$100B; $100M threshold was firing constantly on normal days
-  if (gc.dex != null) {
-    const dexBullish = gc.dex > 0;
-    const dexStrong = Math.abs(gc.dex) > 1e10; // $10B threshold — meaningful opposing flow
-    if (direction === "LONG" && !dexBullish && dexStrong) {
-      return { allowed: false, reason: "DEX strongly bearish (" + (gc.dex / 1e9).toFixed(1) + "B) — conflicts with LONG", tp1: entry, tp2: entry, target: null };
-    }
-    if (direction === "SHORT" && dexBullish && dexStrong) {
-      return { allowed: false, reason: "DEX strongly bullish (+" + (gc.dex / 1e9).toFixed(1) + "B) — conflicts with SHORT", tp1: entry, tp2: entry, target: null };
+  // ── Gamma flip proximity block ────────────────────────────────────────────────
+  // At the flip, MMs hedge both directions simultaneously — most unpredictable zone
+  if (gc.gammaFlip != null) {
+    const flipDist = Math.abs(entry - gc.gammaFlip);
+    if (flipDist < 0.50) {
+      return { allowed: false, reason: "SPY $" + entry.toFixed(2) + " within $0.50 of gamma flip $" + gc.gammaFlip + " — regime indeterminate", tp1: entry, tp2: entry, target: null, dexBias: "NEUTRAL" };
     }
   }
 
-  // Use max pain + 0DTE magnet as TP targets when available
+  // ── DEX — context log and conviction bias, NOT a hard direction block ─────────
+  // Positive DEX = MMs net long delta → hedge by selling → bearish pressure (headwind for LONG)
+  // Negative DEX = MMs net short delta → hedge by buying → bullish pressure (tailwind for LONG)
+  // This is counterintuitive: high positive DEX ≠ bullish. MMs must sell into rising price.
+  let dexBias = "NEUTRAL";
+  let dexNote = "";
+  if (gc.dex != null && Math.abs(gc.dex) > 1e10) { // only log when >$10B (signal, not noise)
+    const dexBullishMM = gc.dex > 0; // MMs net long → must sell to hedge → bearish pressure on SPY
+    // ALIGNED: DEX hedging flows in same direction as our trade (tailwinds)
+    // OPPOSED: DEX hedging works against our trade (headwinds)
+    const aligned = (direction === "LONG" && !dexBullishMM) || (direction === "SHORT" && dexBullishMM);
+    dexBias = aligned ? "ALIGNED" : "OPPOSED";
+    const mmAction = dexBullishMM ? "selling (headwind LONG)" : "buying (tailwind LONG)";
+    dexNote = " | DEX " + (gc.dex > 0 ? "+" : "") + (gc.dex / 1e9).toFixed(1) + "B → MMs " + mmAction + " [" + dexBias + "]";
+  } else if (gc.dex != null) {
+    dexNote = " | DEX " + (gc.dex / 1e9).toFixed(1) + "B (neutral)";
+  }
+
+  // ── 0DTE magnet entry proximity block ────────────────────────────────────────
+  // Don't enter when price is already at the magnet — no room to reach TP
   const magnet = gc.zeroDteMagnet || gc.maxPain || null;
+  const MIN_MAGNET_ROOM = 0.25;
+  if (magnet != null) {
+    if (direction === "LONG" && magnet > entry && (magnet - entry) < MIN_MAGNET_ROOM) {
+      return { allowed: false, reason: "LONG blocked — already at 0DTE magnet $" + magnet + " ($" + (magnet - entry).toFixed(2) + " room < $0.25)", tp1: magnet, tp2: magnet, target: magnet, dexBias };
+    }
+    if (direction === "SHORT" && magnet < entry && (entry - magnet) < MIN_MAGNET_ROOM) {
+      return { allowed: false, reason: "SHORT blocked — already at 0DTE magnet $" + magnet + " ($" + (entry - magnet).toFixed(2) + " room < $0.25)", tp1: magnet, tp2: magnet, target: magnet, dexBias };
+    }
+  }
 
+  // ── Call/put wall TP targets ──────────────────────────────────────────────────
   if (direction === "LONG") {
     const walls = (gc.callWalls || []).filter(w => w.price > entry + GEX_BUFFER).sort((a, b) => a.price - b.price);
     const callWall = gc.callWall && gc.callWall > entry + GEX_BUFFER ? gc.callWall : (walls[0]?.price || null);
-    if (!callWall) return { allowed: false, reason: "SPY above all GEX call walls — no upside target", tp1: entry, tp2: entry, target: null };
-    if (callWall - entry < GEX_BUFFER) return { allowed: false, reason: "LONG blocked — at call wall $" + callWall, tp1: callWall, tp2: callWall, target: callWall };
-    const tp1 = magnet && magnet > entry && magnet < callWall ? magnet : callWall;
-    const tp2 = callWall > tp1 ? callWall : (walls[1]?.price || callWall);
-    // Prefer zeroDteMagnet as the strike-selection target when it sits between price and wall
+    if (!callWall) return { allowed: false, reason: "SPY above all GEX call walls — no upside target", tp1: entry, tp2: entry, target: null, dexBias };
+    if (callWall - entry < GEX_BUFFER) return { allowed: false, reason: "LONG blocked — at call wall $" + callWall, tp1: callWall, tp2: callWall, target: callWall, dexBias };
+    const tp1    = magnet && magnet > entry && magnet < callWall ? magnet : callWall;
+    const tp2    = callWall > tp1 ? callWall : (walls[1]?.price || callWall);
     const target = magnet && magnet > entry && magnet < callWall ? magnet : callWall;
-    return { allowed: true, reason: "LONG → wall $" + callWall + (magnet ? " | magnet $" + magnet : ""), tp1, tp2, target };
+    return { allowed: true, reason: "LONG → wall $" + callWall + (magnet ? " | magnet $" + magnet : "") + dexNote, tp1, tp2, target, dexBias };
   }
 
   if (direction === "SHORT") {
     const walls = (gc.putWalls || []).filter(w => w.price < entry - GEX_BUFFER).sort((a, b) => b.price - a.price);
     const putWall = gc.putWall && gc.putWall < entry - GEX_BUFFER ? gc.putWall : (walls[0]?.price || null);
-    if (!putWall) return { allowed: false, reason: "SPY below all GEX put walls — no downside target", tp1: entry, tp2: entry, target: null };
-    if (entry - putWall < GEX_BUFFER) return { allowed: false, reason: "SHORT blocked — at put wall $" + putWall, tp1: putWall, tp2: putWall, target: putWall };
-    const tp1 = magnet && magnet < entry && magnet > putWall ? magnet : putWall;
-    const tp2 = putWall < tp1 ? putWall : (walls[1]?.price || putWall);
+    if (!putWall) return { allowed: false, reason: "SPY below all GEX put walls — no downside target", tp1: entry, tp2: entry, target: null, dexBias };
+    if (entry - putWall < GEX_BUFFER) return { allowed: false, reason: "SHORT blocked — at put wall $" + putWall, tp1: putWall, tp2: putWall, target: putWall, dexBias };
+    const tp1    = magnet && magnet < entry && magnet > putWall ? magnet : putWall;
+    const tp2    = putWall < tp1 ? putWall : (walls[1]?.price || putWall);
     const target = magnet && magnet < entry && magnet > putWall ? magnet : putWall;
-    return { allowed: true, reason: "SHORT → wall $" + putWall + (magnet ? " | magnet $" + magnet : ""), tp1, tp2, target };
+    return { allowed: true, reason: "SHORT → wall $" + putWall + (magnet ? " | magnet $" + magnet : "") + dexNote, tp1, tp2, target, dexBias };
   }
 
-  return { allowed: true, reason: "No GEX filter", tp1: entry, tp2: entry, target: null };
+  return { allowed: true, reason: "No GEX filter" + dexNote, tp1: entry, tp2: entry, target: null, dexBias };
 }
 
 // ── Strike selection (greeks-optimized when real data available) ─────────────
@@ -1061,7 +1085,7 @@ async function executeTrade(direction, price, indicators, gexResult) {
     strikeMethod:si.method||"heuristic",
     stop:        indicators.orbLow,
     tp1:         gexResult.tp1, tp2:gexResult.tp2,
-    gexTarget:   gexResult.target, gexReason:gexResult.reason,
+    gexTarget:   gexResult.target, gexReason:gexResult.reason, dexBias:gexResult.dexBias||"NEUTRAL",
     expiry:      date.getFullYear()+String(date.getMonth()+1).padStart(2,"0")+String(date.getDate()).padStart(2,"0"),
     is1DTE:      isLateSession,
     riskBudget:getRiskBudget(),
@@ -1320,7 +1344,27 @@ async function runSignalEngine() {
       }
     }
 
-    // Apply GEX filter
+    // CHEX EOD bias filter — after 1 PM, charm decay forces directional MM hedging into close
+    // Positive CHEX: MMs gain delta as time passes → must sell to stay neutral → headwind for LONGs
+    // Negative CHEX: MMs lose delta as time passes → must buy to stay neutral → headwind for SHORTs
+    if(h>=13 && gexCache?.chex!=null){
+      const CHEX_THRESHOLD=5e9; // $5B — filters only meaningful charm flow, not noise
+      const chex=gexCache.chex;
+      if(eval_result.direction==="LONG" && chex>CHEX_THRESHOLD){
+        const reason="CHEX +" + (chex/1e9).toFixed(1)+"B after 1PM — MM charm decay selling into close";
+        log("GEX","CHEX EOD filter: LONG skipped — "+reason);
+        saveSignalToDB({direction:eval_result.direction,spyEntry:currentPrice,gexTarget:null,strength:eval_result.strength},{...ind},false,"CHEX: "+reason);
+        scanActive=false;return;
+      }
+      if(eval_result.direction==="SHORT" && chex<-CHEX_THRESHOLD){
+        const reason="CHEX "+(chex/1e9).toFixed(1)+"B after 1PM — MM charm decay buying into close";
+        log("GEX","CHEX EOD filter: SHORT skipped — "+reason);
+        saveSignalToDB({direction:eval_result.direction,spyEntry:currentPrice,gexTarget:null,strength:eval_result.strength},{...ind},false,"CHEX: "+reason);
+        scanActive=false;return;
+      }
+    }
+
+    // Apply GEX filter (walls, flip, magnet, DEX bias)
     const gexResult=applyGEX(eval_result.direction,currentPrice);
     if(!gexResult.allowed){
       log("GEX","Signal BLOCKED — "+gexResult.reason);
@@ -1444,7 +1488,7 @@ app.options("*",cors());
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"11.10-dex-threshold",status:"running",
+  service:"SPX COMMAND",version:"11.11-gex-signals",status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,marketMode:MARKET_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -1755,7 +1799,7 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"11.10-dex-threshold", mode:IS_PAPER?"PAPER":"LIVE",
+    version:"11.11-gex-signals", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, marketMode:MARKET_MODE, marketScore, marketModeAuto:MARKET_MODE_AUTO,
     noTradingView:true,
     exitStrategy:"price-monitor + DELETE /v2/positions",
