@@ -292,6 +292,40 @@ function saveTradeToDB(trade, signalDbId, indicators) {
   } catch(e) { log("DB ERR","saveTradeToDB: "+e.message); return null; }
 }
 
+// Computes percentile rank of currentValue within the historical series (0-100).
+// pctRank=75 means currentValue is higher than 75% of past readings — i.e., elevated.
+function pctRank(series, currentValue) {
+  if (!series || series.length < 5) return null; // need at least 5 data points
+  const below = series.filter(v => v < currentValue).length;
+  return Math.round((below / series.length) * 100);
+}
+
+// Enriches a GEX result object with rolling percentile ranks for VEX, DEX, and CHEX.
+// Uses last 5 trading days of snapshots (~45 records at 9 fetches/day).
+// Percentile interpretation:
+//   VEX p80+ = vol buyers active → large move expected → TREND signal
+//   VEX p20- = vol suppressed → pinning → CHOP signal
+//   DEX p80+ = MMs very net long → strong selling hedging pressure
+//   CHEX p80+ = strong charm decay selling into close (after 1PM, skip LONGs)
+function enrichWithPercentiles(result) {
+  try {
+    const snapshots = loadDB("gex_snapshots").slice(-45); // ~5 trading days
+    const vexSeries  = snapshots.filter(s => s.vex  != null).map(s => s.vex);
+    const dexSeries  = snapshots.filter(s => s.dex  != null).map(s => s.dex);
+    const chexSeries = snapshots.filter(s => s.chex != null).map(s => s.chex);
+
+    result.vexPctRank  = result.vex  != null ? pctRank(vexSeries,  result.vex)  : null;
+    result.dexPctRank  = result.dex  != null ? pctRank(dexSeries,  result.dex)  : null;
+    result.chexPctRank = result.chex != null ? pctRank(chexSeries, result.chex) : null;
+
+    // Descriptive labels for dashboard/logs
+    const label = pct => pct == null ? "—" : pct >= 80 ? "HIGH" : pct >= 60 ? "ELEVATED" : pct <= 20 ? "LOW" : "NORMAL";
+    result.vexLabel  = label(result.vexPctRank);
+    result.dexLabel  = label(result.dexPctRank);
+    result.chexLabel = label(result.chexPctRank);
+  } catch(e) { log("GEX ERR", "enrichWithPercentiles: " + e.message); }
+}
+
 function saveGEXSnapshot(g) {
   try {
     insertDB("gex_snapshots", {
@@ -697,11 +731,12 @@ async function calcGEX() {
       " | PinRisk:" + (result.pinRisk || "—") +
       " | 0DTE magnet:$" + (result.zeroDteMagnet || "—"));
 
-    if (result.vex != null || result.dex != null) {
-      log("GEX", "DEX:" + ((result.dex || 0) / 1e6).toFixed(1) + "M" +
-        " | VEX:" + ((result.vex || 0) / 1e6).toFixed(1) + "M" +
-        " | CHEX:" + ((result.chex || 0) / 1e6).toFixed(1) + "M");
-    }
+    // Compute rolling percentile ranks from historical snapshots before broadcasting
+    enrichWithPercentiles(result);
+
+    log("GEX", "FlashAlpha -- DEX:" + ((result.dex||0)/1e9).toFixed(1) + "B p" + (result.dexPctRank??'—') +
+      " | VEX:" + ((result.vex||0)/1e9).toFixed(1) + "B p" + (result.vexPctRank??'—') +
+      " | CHEX:" + ((result.chex||0)/1e6).toFixed(1) + "M p" + (result.chexPctRank??'—'));
 
     broadcast({ type: "gex_update", ...result });
     saveGEXSnapshot(result);
@@ -1098,7 +1133,22 @@ async function executeTrade(direction, price, indicators, gexResult) {
     confidence:indicators.strength||"MEDIUM",
     status:"PENDING",
     indicators: {...indicators},
-    gexSnapshot: gexCache?{callWalls:(gexCache.callWalls||[]).slice(0,3),putWalls:(gexCache.putWalls||[]).slice(0,3),gammaFlip:gexCache.gammaFlip,regime:gexCache.regime}:null,
+    // Full greek context frozen at signal-fire time — displayed on signal card, stored for data mining
+    gexSnapshot: gexCache ? {
+      regime:       gexCache.regime,
+      gammaFlip:    gexCache.gammaFlip,
+      callWall:     gexCache.callWall,
+      putWall:      gexCache.putWall,
+      zeroDteMagnet:gexCache.zeroDteMagnet,
+      pinRisk:      gexCache.pinRisk,
+      dex:          gexCache.dex,        dexPctRank: gexCache.dexPctRank,  dexLabel: gexCache.dexLabel,
+      vex:          gexCache.vex,        vexPctRank: gexCache.vexPctRank,  vexLabel: gexCache.vexLabel,
+      chex:         gexCache.chex,       chexPctRank:gexCache.chexPctRank, chexLabel:gexCache.chexLabel,
+      marketMode:   MARKET_MODE,         marketScore: marketScore,
+      callWalls:    (gexCache.callWalls||[]).slice(0,3),
+      putWalls:     (gexCache.putWalls||[]).slice(0,3),
+      gexRationale: gexResult.reason,    dexBias:    gexResult.dexBias,
+    } : null,
   };
 
   signalHistory.unshift(sig);
@@ -1228,13 +1278,24 @@ function detectMarketMode() {
       else               { reasons.push("GEX neutral"); }
     } else { reasons.push("GEX unavailable"); }
 
-    // Signal 2: VEX — vega exposure (vol buyer demand = trend expectation)
+    // Signal 2: VEX — use percentile rank when available (normalised vs last 5 days),
+    // fall back to absolute thresholds only when there is insufficient history (<5 snapshots).
     if (gexCache?.vex != null) {
-      const v = gexCache.vex;
-      // VEX > $500M = elevated; > $1B = high (thresholds will be calibrated from live data)
-      if      (v > 1e9)  { score += 2; reasons.push("VEX>$1B (large move priced) +2"); }
-      else if (v > 5e8)  { score += 1; reasons.push("VEX elevated +1"); }
-      else if (v < 0)    { score -= 1; reasons.push("VEX negative (pinning) -1"); }
+      const pct = gexCache.vexPctRank; // null when <5 historical records exist
+      const vB  = (gexCache.vex / 1e9).toFixed(1);
+      if (pct != null) {
+        // Percentile path — context-aware
+        if      (pct >= 80) { score += 2; reasons.push("VEX "+vB+"B p"+pct+" HIGH (vol demand, big move) +2"); }
+        else if (pct >= 60) { score += 1; reasons.push("VEX "+vB+"B p"+pct+" ELEVATED +1"); }
+        else if (pct <= 20) { score -= 1; reasons.push("VEX "+vB+"B p"+pct+" LOW (vol suppressed) -1"); }
+        else                { reasons.push("VEX "+vB+"B p"+pct+" NORMAL"); }
+      } else {
+        // Fallback — absolute thresholds (used only until 5+ snapshots accumulate)
+        const v = gexCache.vex;
+        if      (v > 1e9)  { score += 2; reasons.push("VEX "+vB+"B HIGH (no history yet) +2"); }
+        else if (v > 5e8)  { score += 1; reasons.push("VEX "+vB+"B ELEVATED (no history yet) +1"); }
+        else if (v < 0)    { score -= 1; reasons.push("VEX "+vB+"B NEGATIVE (no history yet) -1"); }
+      }
     }
 
     // Signal 3: Overnight gap vs prior close (needs prevDayData)
@@ -1488,7 +1549,7 @@ app.options("*",cors());
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"11.11-gex-signals",status:"running",
+  service:"SPX COMMAND",version:"11.12-vex-percentile",status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,marketMode:MARKET_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -1799,7 +1860,7 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"11.11-gex-signals", mode:IS_PAPER?"PAPER":"LIVE",
+    version:"11.12-vex-percentile", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, marketMode:MARKET_MODE, marketScore, marketModeAuto:MARKET_MODE_AUTO,
     noTradingView:true,
     exitStrategy:"price-monitor + DELETE /v2/positions",

@@ -517,10 +517,31 @@ function renderSignals() {
         <span style="color:${C.purple};font-weight:700">STRIKE </span>
         <span style="color:${C.textDim}">${sig.strikeReason}</span></div>`:""}
 
-      ${sig.gexReason?`<div style="padding:4px 8px;margin-bottom:8px;background:${C.dim}44;
+      ${sig.gexReason?`<div style="padding:4px 8px;margin-bottom:5px;background:${C.dim}44;
         border-radius:4px;border:1px solid ${C.dim};font-size:13px">
         <span style="color:${C.muted}">GEX </span>
         <span style="color:${C.textDim}">${sig.gexReason}</span></div>`:""}
+
+      ${sig.gexSnapshot?(()=>{
+        const g = sig.gexSnapshot;
+        const fmt9 = v => v!=null ? (v>=0?"+":"")+( v/1e9).toFixed(1)+"B" : "—";
+        const fmt6 = v => v!=null ? (v>=0?"+":"")+( v/1e6).toFixed(0)+"M" : "—";
+        const pLabel = (v,p) => p!=null ? `${fmt9(v)} <span style="color:${p>=80?C.bull:p<=20?C.bear:C.muted};font-size:10px">p${p} ${g.vexLabel||""}</span>` : fmt9(v);
+        const modeC = g.marketMode==="TREND"?C.bull:g.marketMode==="CHOP"?C.bear:C.yellow;
+        const biasC = sig.dexBias==="ALIGNED"?C.bull:sig.dexBias==="OPPOSED"?C.bear:C.muted;
+        return `<div style="margin-bottom:8px;padding:8px 10px;background:#07090c;
+          border-radius:5px;border:1px solid ${C.border}20;font-size:11px">
+          <div style="color:${C.muted};letter-spacing:1px;margin-bottom:6px;font-size:10px">GREEK CONTEXT AT ENTRY</div>
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px 10px">
+            <div><span style="color:${C.dim}">GEX</span> <span style="color:${g.regime==="negative"?C.bull:C.bear}">${g.regime?.toUpperCase()||"—"}</span> <span style="color:${C.muted}">flip $${g.gammaFlip||"—"}</span></div>
+            <div><span style="color:${C.dim}">DEX</span> <span style="color:${biasC}">${fmt9(g.dex)}</span>${g.dexPctRank!=null?` <span style="color:${C.dim};font-size:10px">p${g.dexPctRank}</span>`:""} <span style="color:${biasC};font-size:10px">${sig.dexBias||""}</span></div>
+            <div><span style="color:${C.dim}">VEX</span> <span style="color:${g.vexPctRank>=80?C.bull:g.vexPctRank<=20?C.bear:C.textDim}">${fmt9(g.vex)}</span>${g.vexPctRank!=null?` <span style="color:${C.dim};font-size:10px">p${g.vexPctRank} ${g.vexLabel||""}</span>`:""}</div>
+            <div><span style="color:${C.dim}">CHEX</span> <span style="color:${C.textDim}">${fmt6(g.chex)}</span>${g.chexPctRank!=null?` <span style="color:${C.dim};font-size:10px">p${g.chexPctRank}</span>`:""}</div>
+            <div><span style="color:${C.dim}">MAGNET</span> <span style="color:${C.purple}">$${g.zeroDteMagnet||"—"}</span></div>
+            <div><span style="color:${C.dim}">MODE</span> <span style="color:${modeC}">${g.marketMode||"NEUTRAL"}</span><span style="color:${C.dim};font-size:10px"> score ${g.marketScore!=null?(g.marketScore>0?"+":"")+g.marketScore:"—"}</span></div>
+          </div>
+        </div>`;
+      })():""}
 
       ${sig.indicators?`<div style="padding:4px 8px;margin-bottom:8px;background:#07090c;
         border-radius:4px;border:1px solid ${C.border};font-size:13px;color:${C.muted}">
