@@ -729,14 +729,16 @@ function applyGEX(direction, entry) {
     return { allowed: false, reason: "Pin risk " + gc.pinRisk + "/100 — price likely pinned, skip 0DTE", tp1: entry, tp2: entry, target: null };
   }
 
-  // Use DEX to validate direction — if strong opposing flow, block
+  // Use DEX to validate direction — only block on very strong opposing flow (>$10B)
+  // Daily DEX for SPY routinely runs $10B-$100B; $100M threshold was firing constantly on normal days
   if (gc.dex != null) {
     const dexBullish = gc.dex > 0;
-    if (direction === "LONG" && !dexBullish && Math.abs(gc.dex) > 1e8) {
-      return { allowed: false, reason: "DEX bearish (" + (gc.dex / 1e6).toFixed(0) + "M) — conflicts with LONG", tp1: entry, tp2: entry, target: null };
+    const dexStrong = Math.abs(gc.dex) > 1e10; // $10B threshold — meaningful opposing flow
+    if (direction === "LONG" && !dexBullish && dexStrong) {
+      return { allowed: false, reason: "DEX strongly bearish (" + (gc.dex / 1e9).toFixed(1) + "B) — conflicts with LONG", tp1: entry, tp2: entry, target: null };
     }
-    if (direction === "SHORT" && dexBullish && Math.abs(gc.dex) > 1e8) {
-      return { allowed: false, reason: "DEX bullish (+" + (gc.dex / 1e6).toFixed(0) + "M) — conflicts with SHORT", tp1: entry, tp2: entry, target: null };
+    if (direction === "SHORT" && dexBullish && dexStrong) {
+      return { allowed: false, reason: "DEX strongly bullish (+" + (gc.dex / 1e9).toFixed(1) + "B) — conflicts with SHORT", tp1: entry, tp2: entry, target: null };
     }
   }
 
@@ -1442,7 +1444,7 @@ app.options("*",cors());
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"11.9-automode",status:"running",
+  service:"SPX COMMAND",version:"11.10-dex-threshold",status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,marketMode:MARKET_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -1753,7 +1755,7 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"11.9-automode", mode:IS_PAPER?"PAPER":"LIVE",
+    version:"11.10-dex-threshold", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, marketMode:MARKET_MODE, marketScore, marketModeAuto:MARKET_MODE_AUTO,
     noTradingView:true,
     exitStrategy:"price-monitor + DELETE /v2/positions",
