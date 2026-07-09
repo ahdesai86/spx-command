@@ -979,12 +979,15 @@ function startMonitor(signal, indicators) {
       // far from it (gives the position room to run toward the target).
       const gainPct  = (signal.maxPrice - entry) / entry;
       const gainDollars = signal.maxPrice - entry;
+      // Use params frozen at fill time — immune to mid-session mode changes
+      const sigTrailTriggerPct  = signal.trailTriggerPct  ?? TRAIL_TRIGGER_PCT;
+      const sigTrailDistancePct = signal.trailDistancePct ?? TRAIL_DISTANCE_PCT;
       const trailTriggered = TRAIL_TRIGGER_DOLLARS > 0
         ? gainDollars >= TRAIL_TRIGGER_DOLLARS
-        : gainPct >= TRAIL_TRIGGER_PCT;
+        : gainPct >= sigTrailTriggerPct;
       if (trailTriggered) {
         // Dynamic distance: tighten near GEX magnet/wall to lock in gains at target
-        let trailDist = TRAIL_DISTANCE_PCT;
+        let trailDist = sigTrailDistancePct;
         if (TRAIL_DISTANCE_DOLLARS > 0) {
           trailDist = TRAIL_DISTANCE_DOLLARS / signal.maxPrice;
         } else if (gexCache) {
@@ -993,11 +996,12 @@ function startMonitor(signal, indicators) {
             const headroom = signal.direction==="LONG"
               ? (magnet - price) / price
               : (price - magnet) / price;
-            if      (headroom <= 0) trailDist = 0.07;       // past magnet: very tight 7%
-            else if (headroom <= 0.003) trailDist = 0.10;   // within $0.20: 10%
-            else if (headroom <= 0.007) trailDist = 0.13;   // within $0.50: 13%
-            else if (headroom <= 0.015) trailDist = 0.18;   // within $1: 18%
-            else trailDist = Math.min(TRAIL_DISTANCE_PCT, 0.25); // far from target: max 25%
+            // Tighten near magnet — mode-aware baseline: TREND uses sigTrailDistancePct (10%) as floor
+            if      (headroom <= 0)     trailDist = 0.05;                           // past magnet: very tight
+            else if (headroom <= 0.003) trailDist = Math.min(sigTrailDistancePct, 0.08);  // within $0.20
+            else if (headroom <= 0.007) trailDist = Math.min(sigTrailDistancePct, 0.11);  // within $0.50
+            else if (headroom <= 0.015) trailDist = Math.min(sigTrailDistancePct, 0.16);  // within $1
+            else trailDist = sigTrailDistancePct;                                   // far: use mode default
           }
         }
         const trailStop = signal.maxPrice * (1 - trailDist);
@@ -1197,14 +1201,33 @@ async function executeTrade(direction, price, indicators, gexResult) {
     if(!filled){log("ORDER","Unfilled after 60s");sig.status="PENDING";return;}
 
     sig.fillPrice=parseFloat(filled.filled_avg_price||mid);
-    const stop=parseFloat((sig.fillPrice*(1-PREMIUM_STOP_PCT)).toFixed(2));
-    const tp1=calcTP1(sig.fillPrice); // trailing stop trigger price
+
+    // Freeze mode-specific exit params at fill time so mid-session mode changes don't affect open position
+    const mp = MARKET_MODE_AUTO==="ON" ? getModeParams() : null;
+    // Premium-conditional stop: only tighten TREND stop if fill > $0.70
+    // (below $0.70, 15% = ~$0.10 — narrower than typical 0DTE bid-ask spread, gets stopped by noise)
+    const effectiveStopPct = (mp?.premiumStopPct && sig.fillPrice > 0.70)
+      ? mp.premiumStopPct : PREMIUM_STOP_PCT;
+    const effectiveTrailTriggerPct  = mp?.trailTriggerPct  ?? TRAIL_TRIGGER_PCT;
+    const effectiveTrailDistancePct = mp?.trailDistancePct ?? TRAIL_DISTANCE_PCT;
+
+    const stop = parseFloat((sig.fillPrice*(1-effectiveStopPct)).toFixed(2));
+    const tp1  = TRAIL_TRIGGER_DOLLARS > 0
+      ? parseFloat((sig.fillPrice + TRAIL_TRIGGER_DOLLARS).toFixed(2))
+      : parseFloat((sig.fillPrice * (1 + effectiveTrailTriggerPct)).toFixed(2));
+
+    // Freeze onto signal so monitor uses same params regardless of future mode changes
+    sig.stopPct          = effectiveStopPct;
+    sig.trailTriggerPct  = effectiveTrailTriggerPct;
+    sig.trailDistancePct = effectiveTrailDistancePct;
+    sig.modeAtFill       = mp ? (MARKET_MODE_OVERRIDE || MARKET_MODE) : "NEUTRAL";
+
     sig.stopPrice=stop; sig.tp1Price=tp1; sig.status="FILLED";
     sig.entryTime=Date.now();
     tradesDay++;
 
-    broadcast({type:"signal_update",id:sig.id,status:"FILLED",fillPrice:sig.fillPrice,stopPrice:stop,tp1Price:tp1});
-    log("FILL","Filled @ $"+sig.fillPrice+" | stop $"+stop+" | tp1 $"+tp1+" | R:R "+((tp1-sig.fillPrice)/(sig.fillPrice-stop)).toFixed(1)+":1");
+    broadcast({type:"signal_update",id:sig.id,status:"FILLED",fillPrice:sig.fillPrice,stopPrice:stop,tp1Price:tp1,modeAtFill:sig.modeAtFill,stopPct:effectiveStopPct});
+    log("FILL","Filled @ $"+sig.fillPrice+" | stop $"+stop+" ("+Math.round(effectiveStopPct*100)+"%) | tp1 $"+tp1+" | R:R "+((tp1-sig.fillPrice)/(sig.fillPrice-stop)).toFixed(1)+":1 | mode:"+sig.modeAtFill);
     log("EXIT","Price monitor active — exits via DELETE /v2/positions (no sell orders)");
 
     startMonitor(sig, indicators);
@@ -1255,10 +1278,27 @@ async function fetchPrevDayData() {
 function getModeParams() {
   const mode = MARKET_MODE_OVERRIDE || MARKET_MODE;
   return {
-    TREND:   { rsiLongMax:67, rsiShortMin:33, cooldownMins:30,  fibEntryFilter:false },
-    NEUTRAL: { rsiLongMax:RSI_LONG_MAX, rsiShortMin:RSI_SHORT_MIN, cooldownMins:DIRECTION_COOLDOWN_MINS, fibEntryFilter:false },
-    CHOP:    { rsiLongMax:55, rsiShortMin:45, cooldownMins:90,  fibEntryFilter:true  },
-  }[mode] || { rsiLongMax:RSI_LONG_MAX, rsiShortMin:RSI_SHORT_MIN, cooldownMins:DIRECTION_COOLDOWN_MINS, fibEntryFilter:false };
+    // TREND: momentum-scalp profile — forgiving RSI, quick profit lock, tight trail
+    // premiumStopPct is conditional on fill price (applied in executeTrade, not here):
+    //   fill > $0.70 → 15% stop (safe above spread noise floor)
+    //   fill <= $0.70 → keep 25% (cheap contracts, spread noise too wide for 15%)
+    TREND: {
+      rsiLongMax:70, rsiShortMin:30, cooldownMins:30, fibEntryFilter:false,
+      premiumStopPct:0.15,   // tighter initial stop (conditional on fill price — see executeTrade)
+      trailTriggerPct:0.30,  // activate trailing at +30% gain (vs 50% default)
+      trailDistancePct:0.10, // trail 10% below peak (vs 20% default) — lock gains faster
+    },
+    // NEUTRAL: use env var settings unchanged
+    NEUTRAL: {
+      rsiLongMax:RSI_LONG_MAX, rsiShortMin:RSI_SHORT_MIN, cooldownMins:DIRECTION_COOLDOWN_MINS, fibEntryFilter:false,
+      premiumStopPct:null, trailTriggerPct:null, trailDistancePct:null,
+    },
+    // CHOP: wider stop (spread noise higher in choppy markets), slower to trigger trail
+    CHOP: {
+      rsiLongMax:55, rsiShortMin:45, cooldownMins:90, fibEntryFilter:true,
+      premiumStopPct:null, trailTriggerPct:null, trailDistancePct:null,
+    },
+  }[mode] || { rsiLongMax:RSI_LONG_MAX, rsiShortMin:RSI_SHORT_MIN, cooldownMins:DIRECTION_COOLDOWN_MINS, fibEntryFilter:false, premiumStopPct:null, trailTriggerPct:null, trailDistancePct:null };
 }
 
 // Scores market signals and sets MARKET_MODE. Safe to call repeatedly — idempotent within same day.
@@ -1549,7 +1589,7 @@ app.options("*",cors());
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"11.12-vex-percentile",status:"running",
+  service:"SPX COMMAND",version:"11.13-trend-adaptive",status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,marketMode:MARKET_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -1860,7 +1900,7 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"11.12-vex-percentile", mode:IS_PAPER?"PAPER":"LIVE",
+    version:"11.13-trend-adaptive", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, marketMode:MARKET_MODE, marketScore, marketModeAuto:MARKET_MODE_AUTO,
     noTradingView:true,
     exitStrategy:"price-monitor + DELETE /v2/positions",

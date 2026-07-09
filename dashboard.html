@@ -460,7 +460,7 @@ function renderSignals() {
         </div>
       </div>
 
-      <div style="color:${C.textDim};font-size:13px;margin-bottom:8px">${sig.trigger||"Signal Engine"} · ${sig.time} ET</div>
+      <div style="color:${C.textDim};font-size:13px;margin-bottom:8px">${sig.trigger||"Signal Engine"} · ${sig.time} ET${sig.modeAtFill&&sig.modeAtFill!=="NEUTRAL"?` · <span style="color:${sig.modeAtFill==="TREND"?C.bull:C.bear};font-size:11px;letter-spacing:1px">${sig.modeAtFill} MODE</span>`:""}${sig.stopPct?` · <span style="color:${C.muted};font-size:11px">stop ${Math.round(sig.stopPct*100)}%</span>`:""}</div>
 
       ${sig.optionSymbol?`<div style="margin-bottom:8px;padding:7px 11px;background:#07090c;
         border-radius:5px;border:1px solid ${C.border};display:flex;align-items:center;gap:10px;flex-wrap:wrap">
