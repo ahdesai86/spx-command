@@ -288,6 +288,16 @@ function saveTradeToDB(trade, signalDbId, indicators) {
       risk_budget:    getRiskBudget(),
       signal_mode:    SIGNAL_MODE,
       market_mode:    MARKET_MODE,
+      mode_at_fill:   trade.modeAtFill||null,
+      // Shadow trail counterfactuals — what each virtual config WOULD have exited at.
+      // Unexited shadows finalize at the real close price (they rode to the actual exit).
+      shadow_exits:   (trade.shadows||[]).map(sh=>({
+        name: sh.name,
+        exit_price: sh.exited ? sh.exitPrice : (trade.closePrice||null),
+        exited_early: sh.exited,
+        pnl: (sh.exited?sh.exitPrice:trade.closePrice)!=null && trade.fillPrice!=null
+          ? parseFloat((((sh.exited?sh.exitPrice:trade.closePrice)-trade.fillPrice)*100*(trade.contracts||0)).toFixed(2)) : null,
+      })),
     });
   } catch(e) { log("DB ERR","saveTradeToDB: "+e.message); return null; }
 }
@@ -982,9 +992,28 @@ async function closePosition(symbol){
 }
 
 // ── Price monitor ─────────────────────────────────────────────────────────────
+// Stepped ladder ratchet — widening variant. Peak gain (pts) → locked profit (pts):
+//   <15: not armed | 15-19: breakeven | 20-40: lock 5 per 5 (20→5 ... 40→25)
+//   >40: lock 5 per 10 of additional peak (50→30, 60→35 ...) — gap widens so runners breathe
+function ratchetLockPct(peakGainPct){
+  const p = peakGainPct*100;
+  if (p < 15) return null;
+  if (p < 20) return 0;
+  if (p <= 40) return 5*Math.floor((p-15)/5);
+  return 25 + 5*Math.floor((p-40)/10);
+}
+
+// Shadow trail configs — virtual only, never touch real exits. Journal records what
+// each WOULD have done so trail params can be reevaluated from data, not anecdotes.
+const SHADOW_TRAILS = [
+  { name:"trail_10_5", trigger:0.10, dist:0.05 },
+  { name:"trail_20_8", trigger:0.20, dist:0.08 },
+];
+
 function startMonitor(signal, indicators) {
   log("MONITOR","Watching "+signal.optionSymbol+" | stop $"+signal.stopPrice+" | tp1 $"+signal.tp1Price+" | poll: 30s");
   const entryTime=Date.now();
+  signal.shadows = SHADOW_TRAILS.map(c=>({name:c.name, trigger:c.trigger, dist:c.dist, active:false, stop:null, exited:false, exitPrice:null}));
   let consecutiveErrors = 0;
   const MAX_CONSECUTIVE_ERRORS = 5; // ~2.5 minutes of failures at 30s poll before giving up
 
@@ -1003,6 +1032,17 @@ function startMonitor(signal, indicators) {
       signal.minPrice = signal.minPrice!=null ? Math.min(signal.minPrice, price) : price;
       signal.maxPnlPct = signal.maxPrice!=null ? parseFloat((((signal.maxPrice-entry)/entry)*100).toFixed(1)) : null;
       signal.minPnlPct = signal.minPrice!=null ? parseFloat((((signal.minPrice-entry)/entry)*100).toFixed(1)) : null;
+
+      // Shadow trails — virtual bookkeeping only (see SHADOW_TRAILS)
+      for(const sh of (signal.shadows||[])){
+        if(sh.exited) continue;
+        if(!sh.active && (signal.maxPrice-entry)/entry >= sh.trigger) sh.active=true;
+        if(sh.active){
+          const shStop=Math.max(signal.maxPrice*(1-sh.dist), entry);
+          sh.stop = sh.stop!=null ? Math.max(sh.stop, shStop) : shStop;
+          if(price<=sh.stop){ sh.exited=true; sh.exitPrice=price; }
+        }
+      }
 
       // Trailing stop — activates once gain reaches trigger ($ or %).
       // Trail distance is dynamic: tightens when price is near the 0DTE magnet/wall
@@ -1047,7 +1087,38 @@ function startMonitor(signal, indicators) {
         }
       }
 
-      log("MONITOR",signal.optionSymbol+" $"+price+" | P&L "+pct+"% | stop $"+signal.stopPrice+(signal.trailingActive?" (trailing)":"")+" | tp1 $"+signal.tp1Price+" | max $"+signal.maxPrice+" | min $"+signal.minPrice);
+      // Stepped ladder ratchet — raises stop as peak gain climbs, never lowers it.
+      // Runs in every mode alongside the trail; whichever produces the higher stop wins.
+      const lock = ratchetLockPct(gainPct);
+      if (lock != null) {
+        const ratchetStop = parseFloat((entry*(1+lock/100)).toFixed(2));
+        if (ratchetStop > signal.stopPrice) {
+          signal.stopPrice   = ratchetStop;
+          signal.ratchetActive = true;
+          signal.ratchetLock   = lock;
+          log("RATCHET", signal.optionSymbol+" stop raised to $"+signal.stopPrice+
+            " (+"+lock+"% locked, peak "+signal.maxPnlPct+"%)");
+          broadcast({type:"signal_update",id:signal.id,stopPrice:signal.stopPrice,ratchetActive:true,ratchetLock:lock});
+        }
+      }
+
+      // TREND VWAP-cross exit — flagged by the scan loop on a 5-min close through VWAP
+      if (signal.vwapExit) {
+        clearInterval(iv);
+        log("TREND","Closing "+signal.optionSymbol+" on VWAP-cross exit at $"+price+
+          " | peak $"+signal.maxPrice+" ("+signal.maxPnlPct+"%)");
+        await closePosition(signal.optionSymbol);
+        const pnl=(price-entry)*100*signal.contracts;
+        signal.status="STOPPED"; signal.closePnl=pnl; signal.closePrice=price;
+        signal.closeReason="VWAP_TREND_EXIT"; signal.durationMin=((Date.now()-entryTime)/60000).toFixed(1);
+        signal.outcome=pnl>=0?"WIN":"LOSS";
+        sessionPnL+=pnl; dailyLoss+=Math.abs(Math.min(0,pnl));
+        broadcast({type:"signal_update",id:signal.id,status:"STOPPED",closeReason:"VWAP_TREND_EXIT",pnl});
+        saveTradeToDB(signal,signal._dbId,indicators);
+        return;
+      }
+
+      log("MONITOR",signal.optionSymbol+" $"+price+" | P&L "+pct+"% | stop $"+signal.stopPrice+(signal.trailingActive?" (trailing)":signal.ratchetActive?" (ratchet +"+signal.ratchetLock+"%)":"")+" | tp1 $"+signal.tp1Price+" | max $"+signal.maxPrice+" | min $"+signal.minPrice);
       broadcast({type:"signal_update",id:signal.id,currentPrice:price,maxPrice:signal.maxPrice,minPrice:signal.minPrice,maxPnlPct:signal.maxPnlPct,minPnlPct:signal.minPnlPct});
 
       if(price>=signal.tp1Price){
@@ -1065,7 +1136,7 @@ function startMonitor(signal, indicators) {
       }
       if(price<=signal.stopPrice){
         clearInterval(iv);
-        const reason=signal.trailingActive?"TRAIL_STOP_HIT":"STOP_HIT";
+        const reason=signal.trailingActive?"TRAIL_STOP_HIT":signal.ratchetActive?"RATCHET_STOP_HIT":"STOP_HIT";
         log(signal.trailingActive?"TRAIL":"STOP",
           (signal.trailingActive?"Trailing stop":"Stop")+" hit $"+price+" <= $"+signal.stopPrice+
           " | peak $"+signal.maxPrice+" ("+signal.maxPnlPct+"%) | trough $"+signal.minPrice+" ("+signal.minPnlPct+"%)");
@@ -1075,8 +1146,8 @@ function startMonitor(signal, indicators) {
         signal.closeReason=reason; signal.durationMin=((Date.now()-entryTime)/60000).toFixed(1);
         signal.outcome=pnl>=0?"WIN":"LOSS";
         // Cooldown only applies to genuine losses on the initial fixed stop — a trailing
-        // stop exit in profit isn't evidence the thesis failed, so don't block re-entry.
-        if(!signal.trailingActive){
+        // or ratchet stop exit at/above entry isn't evidence the thesis failed.
+        if(!signal.trailingActive && !signal.ratchetActive){
           lastStopTime=Date.now();
           // Direction-specific cooldown: count consecutive fixed stops per direction
           const dir=signal.direction;
@@ -1317,7 +1388,9 @@ function getModeParams() {
       rsiLongMax:70, rsiShortMin:30, cooldownMins:30, fibEntryFilter:false,
       premiumStopPct:0.15,   // tighter initial stop (conditional on fill price — see executeTrade)
       trailTriggerPct:0.30,  // activate trailing at +30% gain (vs 50% default)
-      trailDistancePct:0.10, // trail 10% below peak (vs 20% default) — lock gains faster
+      trailDistancePct:0.25, // WIDE catastrophe backstop — primary TREND exit is the VWAP-cross
+                             // (premium trails get noise-flicked by IV/theta on trend days);
+                             // magnet-proximity tightening in startMonitor still overrides near walls
     },
     // NEUTRAL: use env var settings unchanged
     NEUTRAL: {
@@ -1437,6 +1510,23 @@ async function runSignalEngine() {
     // Check if already in a trade
     const activeTrades=signalHistory.filter(s=>["FILLED","SENT","EXECUTING"].includes(s.status));
     if(activeTrades.length>0){
+      // TREND-mode structure exit: a 5-min bar close through VWAP against the position
+      // means the trend thesis is dead — flag it; the 30s monitor executes the close.
+      // RSI confirm (back through 50) filters single-bar VWAP fakeouts.
+      if(ind.vwap){
+        for(const t of activeTrades){
+          if(t.status!=="FILLED" || t.modeAtFill!=="TREND" || t.vwapExit) continue;
+          const barClose=latestBar.c;
+          const crossed = t.direction==="LONG"
+            ? (barClose < ind.vwap && (ind.rsi==null || ind.rsi < 50))
+            : (barClose > ind.vwap && (ind.rsi==null || ind.rsi > 50));
+          if(crossed){
+            t.vwapExit=true;
+            log("TREND","VWAP-cross exit flagged: "+t.optionSymbol+" — 5m close $"+barClose.toFixed(2)+
+              (t.direction==="LONG"?" below":" above")+" VWAP $"+ind.vwap.toFixed(2)+" | RSI "+ind.rsi);
+          }
+        }
+      }
       log("SCAN","Bar "+latestBar.t.slice(11,16)+" | SPY $"+currentPrice.toFixed(2)+" | Position open — skipping");
       scanActive=false;return;
     }
@@ -1620,7 +1710,7 @@ app.options("*",cors());
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"11.14-gex-classifier-fix-exposure-strikes",status:"running",
+  service:"SPX COMMAND",version:"11.15-ratchet-shadow-vwap-exit",status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,marketMode:MARKET_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -1931,7 +2021,7 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"11.14-gex-classifier-fix-exposure-strikes", mode:IS_PAPER?"PAPER":"LIVE",
+    version:"11.15-ratchet-shadow-vwap-exit", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, marketMode:MARKET_MODE, marketScore, marketModeAuto:MARKET_MODE_AUTO,
     noTradingView:true,
     exitStrategy:"price-monitor + DELETE /v2/positions",
