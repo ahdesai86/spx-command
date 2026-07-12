@@ -82,8 +82,8 @@ let RSI_LONG_MAX       = parseFloat(process.env.RSI_LONG_MAX  || "65"); // RSI c
 let RSI_SHORT_MIN      = parseFloat(process.env.RSI_SHORT_MIN || "35"); // RSI floor for SHORT entries (avoid oversold)
 let DIRECTION_COOLDOWN = (process.env.DIRECTION_COOLDOWN || "ON").toUpperCase(); // ON/OFF — block direction after 2 consecutive stops
 let DIRECTION_COOLDOWN_MINS = parseInt(process.env.DIRECTION_COOLDOWN_MINS || "60");
-// Market mode auto-classifier — MARKET_MODE_AUTO=OFF means classify+log but don't apply
-let MARKET_MODE_AUTO = (process.env.MARKET_MODE_AUTO || "OFF").toUpperCase(); // ON | OFF
+// Market mode auto-classifier — defaults ON; set OFF (env var or Settings tab) to classify+log only
+let MARKET_MODE_AUTO = (process.env.MARKET_MODE_AUTO || "ON").toUpperCase(); // ON | OFF
 // Optional hard override (skips classifier entirely when set)
 let MARKET_MODE_OVERRIDE = (process.env.MARKET_MODE_OVERRIDE || "").toUpperCase(); // TREND | CHOP | NEUTRAL | ""
 
@@ -1710,7 +1710,7 @@ app.options("*",cors());
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"11.15-ratchet-shadow-vwap-exit",status:"running",
+  service:"SPX COMMAND",version:"11.15.1-auto-mode-default-on",status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,marketMode:MARKET_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -2021,7 +2021,7 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"11.15-ratchet-shadow-vwap-exit", mode:IS_PAPER?"PAPER":"LIVE",
+    version:"11.15.1-auto-mode-default-on", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, marketMode:MARKET_MODE, marketScore, marketModeAuto:MARKET_MODE_AUTO,
     noTradingView:true,
     exitStrategy:"price-monitor + DELETE /v2/positions",
