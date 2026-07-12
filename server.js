@@ -841,8 +841,16 @@ function applyGEX(direction, entry) {
  * (overpriced contracts give worse R:R even if direction is correct).
  *
  * Falls back to the old OTM-by-distance heuristic if real greeks aren't cached.
+ *
+ * Exposure-aware adjustments (VEX/DEX/CHEX from FlashAlpha):
+ *   CHEX high (p70+) after 12:00 ET — charm decay accelerates OTM premium bleed into
+ *     close; penalize low-delta strikes so late entries favor ATM/ITM contracts.
+ *   VEX high (p80+) — vol demand implies a larger expected move; gamma-heavy OTM
+ *     strikes get a boost. VEX low (p20-) — pinning likely; penalize low delta.
+ *   DEX OPPOSED — MM hedging flows work against the trade; penalize low-delta
+ *     strikes (need the move to overcome the hedging headwind before OTM pays).
  */
-function selectStrike(price, direction, target) {
+function selectStrike(price, direction, target, dexBias) {
   const atm = Math.round(price);
 
   // No GEX cache at all → pure ATM fallback
@@ -879,20 +887,40 @@ function selectStrike(price, direction, target) {
       const ivs = candidates.map(c=>c.iv).filter(v=>v>0).sort((a,b)=>a-b);
       const medianIV = ivs.length ? ivs[Math.floor(ivs.length/2)] : 0;
 
+      // Exposure context for scoring adjustments
+      const etNow      = getETDate();
+      const charmHours = etNow.getHours() >= 12;
+      const chexHigh   = charmHours && gexCache.chexPctRank != null && gexCache.chexPctRank >= 70;
+      const vexHigh    = gexCache.vexPctRank != null && gexCache.vexPctRank >= 80;
+      const vexLow     = gexCache.vexPctRank != null && gexCache.vexPctRank <= 20;
+      const dexOpposed = dexBias === "OPPOSED";
+      const expNotes   = [];
+      if (chexHigh)   expNotes.push("CHEX p"+gexCache.chexPctRank+" charm decay — favoring ATM/ITM");
+      if (vexHigh)    expNotes.push("VEX p"+gexCache.vexPctRank+" big move expected — OTM boost");
+      if (vexLow)     expNotes.push("VEX p"+gexCache.vexPctRank+" pinning — favoring high delta");
+      if (dexOpposed) expNotes.push("DEX OPPOSED headwind — favoring high delta");
+
       const scored = candidates.map(c => {
         // Delta-gamma approximation of option price change to target
         const estMove = c.delta*Math.abs(move) + 0.5*c.gamma*Math.pow(move,2);
         const payoffScore = estMove / c.mid; // bigger = better R:R per $ paid
         const ivPenalty = medianIV>0 && c.iv > medianIV*1.3 ? 0.6 : 1.0; // discount overpriced IV
-        return {...c, score: payoffScore*ivPenalty};
+        let expAdj = 1.0;
+        if (chexHigh   && c.delta < 0.35) expAdj *= 0.65; // charm bleed hits far OTM hardest
+        if (vexLow     && c.delta < 0.40) expAdj *= 0.80;
+        if (dexOpposed && c.delta < 0.40) expAdj *= 0.80;
+        if (vexHigh    && c.delta < 0.40 && c.delta >= 0.20) expAdj *= 1.15;
+        return {...c, score: payoffScore*ivPenalty*expAdj};
       }).sort((a,b)=>b.score-a.score);
 
       const best = scored[0];
       if (best) {
+        if (expNotes.length) log("STRIKE","Exposure adj: "+expNotes.join(" | "));
         return {
           strike: best.strike,
           reason: "Greeks-optimized: δ"+best.delta.toFixed(2)+" γ"+best.gamma.toFixed(4)+
-                   " IV"+(best.iv*100).toFixed(0)+"% → best payoff/cost toward $"+target.toFixed(2),
+                   " IV"+(best.iv*100).toFixed(0)+"% → best payoff/cost toward $"+target.toFixed(2)+
+                   (expNotes.length ? " ["+expNotes.join("; ")+"]" : ""),
           delta: best.delta,
           gamma: best.gamma,
           impliedVol: best.iv,
@@ -905,17 +933,20 @@ function selectStrike(price, direction, target) {
   }
 
   // ── Heuristic fallback (no real greeks, or no candidates found) ─────────
+  // Charm clamp: high CHEX after 12:00 ET bleeds OTM premium into close — cap OTM at 1
+  const charmClamp = getETDate().getHours() >= 12 && gexCache.chexPctRank != null && gexCache.chexPctRank >= 70;
+  const otmCap = charmClamp ? 1 : 5;
   if(direction==="LONG"){
     const walls=(gexCache.callWalls||[]).filter(w=>w.price>price).sort((a,b)=>a.price-b.price);
     if(!walls.length) return {strike:atm+1,reason:"OTM+1",delta:0.45,otm:1,method:"heuristic"};
-    const dist=walls[0].price-price, otm=Math.min(5,Math.max(1,Math.round(dist*(isPos?0.30:0.15))));
-    return {strike:Math.min(Math.round(atm+otm),Math.round(walls[0].price-1)),reason:(isPos?"pos":"neg")+" GEX → "+otm+" OTM toward $"+walls[0].price,delta:Math.max(0.15,0.50-otm*0.08),otm,method:"heuristic"};
+    const dist=walls[0].price-price, otm=Math.min(otmCap,Math.max(1,Math.round(dist*(isPos?0.30:0.15))));
+    return {strike:Math.min(Math.round(atm+otm),Math.round(walls[0].price-1)),reason:(isPos?"pos":"neg")+" GEX → "+otm+" OTM toward $"+walls[0].price+(charmClamp?" [CHEX p"+gexCache.chexPctRank+" charm clamp]":""),delta:Math.max(0.15,0.50-otm*0.08),otm,method:"heuristic"};
   }
   if(direction==="SHORT"){
     const walls=(gexCache.putWalls||[]).filter(w=>w.price<price).sort((a,b)=>b.price-a.price);
     if(!walls.length) return {strike:atm-1,reason:"OTM+1",delta:0.45,otm:1,method:"heuristic"};
-    const dist=price-walls[0].price, otm=Math.min(5,Math.max(1,Math.round(dist*(isPos?0.30:0.15))));
-    return {strike:Math.max(Math.round(atm-otm),Math.round(walls[0].price+1)),reason:(isPos?"pos":"neg")+" GEX → "+otm+" OTM toward $"+walls[0].price,delta:Math.max(0.15,0.50-otm*0.08),otm,method:"heuristic"};
+    const dist=price-walls[0].price, otm=Math.min(otmCap,Math.max(1,Math.round(dist*(isPos?0.30:0.15))));
+    return {strike:Math.max(Math.round(atm-otm),Math.round(walls[0].price+1)),reason:(isPos?"pos":"neg")+" GEX → "+otm+" OTM toward $"+walls[0].price+(charmClamp?" [CHEX p"+gexCache.chexPctRank+" charm clamp]":""),delta:Math.max(0.15,0.50-otm*0.08),otm,method:"heuristic"};
   }
   return {strike:atm,reason:"ATM fallback",delta:0.50,otm:0,method:"heuristic"};
 }
@@ -1112,7 +1143,7 @@ async function executeTrade(direction, price, indicators, gexResult) {
   const isLateSession = now2.getHours() > 14 || (now2.getHours() === 14 && now2.getMinutes() >= 30);
   const date  = isLateSession ? getNextTradingDay() : now2;
   if (isLateSession) log("SIGNAL","After 2:30 PM — using 1DTE expiry ("+date.toLocaleDateString("en-CA")+") for theta protection");
-  const si    = selectStrike(price, direction, gexResult?.target);
+  const si    = selectStrike(price, direction, gexResult?.target, gexResult?.dexBias);
 
   const sig = {
     id:          Date.now(),
@@ -1309,8 +1340,8 @@ function detectMarketMode() {
     const reasons = [];
 
     // Signal 1: GEX sign/magnitude (weight ×2) — most reliable signal
-    if (gexCache?.gex != null) {
-      const g = gexCache.gex;
+    if (gexCache?.netGex != null) {
+      const g = gexCache.netGex;
       if      (g < -1e9) { score += 2; reasons.push("GEX<-$1B (dealer short-gamma) +2"); }
       else if (g < 0)    { score += 1; reasons.push("GEX neg (mild trend bias) +1"); }
       else if (g > 5e9)  { score -= 2; reasons.push("GEX>$5B (strong pinning) -2"); }
@@ -1589,7 +1620,7 @@ app.options("*",cors());
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"11.13-trend-adaptive",status:"running",
+  service:"SPX COMMAND",version:"11.14-gex-classifier-fix-exposure-strikes",status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,marketMode:MARKET_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -1900,7 +1931,7 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"11.13-trend-adaptive", mode:IS_PAPER?"PAPER":"LIVE",
+    version:"11.14-gex-classifier-fix-exposure-strikes", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, marketMode:MARKET_MODE, marketScore, marketModeAuto:MARKET_MODE_AUTO,
     noTradingView:true,
     exitStrategy:"price-monitor + DELETE /v2/positions",
