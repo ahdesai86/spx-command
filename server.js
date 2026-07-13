@@ -153,6 +153,7 @@ let gexFired        = new Set();
 let gexLastDate     = "";
 let orbState        = null;   // { high, low, built, date }
 let lastBarTime     = null;   // last processed 5-min bar timestamp
+let lastVwap        = null;   // most recent session VWAP (for classifier pin-floor guard)
 let scanActive      = false;
 let tradesDay       = 0;
 const MAX_LOGS      = 500;
@@ -676,6 +677,7 @@ function calcIndicators(bars, currentPrice) {
   const ema21Final = ema21 ?? dailyEMA21;
   const squeeze = calcSqueeze(bars);   // logged context + classifier input
   const flag    = detectFlag(bars);    // LOG-ONLY pilot — never gates entries
+  if (vwap != null) lastVwap = vwap;   // expose latest VWAP for classifier pin-floor
   return { price, orbHigh:orb?.high||null, orbLow:orb?.low||null,
     vwap, rsi, ema9:ema9Final, ema21:ema21Final, orbBreak, squeeze, flag };
 }
@@ -895,8 +897,11 @@ function wallHardness(wallPrice) {
   return meanAbs ? parseFloat((Math.abs(wall.netGex)/meanAbs).toFixed(1)) : null;
 }
 
-function applyGEX(direction, entry) {
-  if (!gexCache) return { allowed: true, reason: "No GEX", tp1: entry * (direction === "LONG" ? 1.005 : 0.995), tp2: entry * (direction === "LONG" ? 1.01 : 0.99), target: null, dexBias: "NEUTRAL" };
+function applyGEX(direction, entry, vwap) {
+  // Fail-CLOSED when GEX is unavailable: without the flip/wall map we can't tell a
+  // pin from a clean breakout, and pins are where directional entries die. Allow the
+  // trade only when we at least have a fresh flip to check; otherwise block.
+  if (!gexCache) return { allowed: false, reason: "No GEX cache — blocking directional entry (fail-closed, cannot verify flip/pin)", tp1: entry, tp2: entry, target: null, dexBias: "NEUTRAL" };
 
   const gc = gexCache;
 
@@ -905,12 +910,19 @@ function applyGEX(direction, entry) {
     return { allowed: false, reason: "Pin risk " + gc.pinRisk + "/100 — price likely pinned", tp1: entry, tp2: entry, target: null, dexBias: "NEUTRAL" };
   }
 
-  // ── Gamma flip proximity block ────────────────────────────────────────────────
-  // At the flip, MMs hedge both directions simultaneously — most unpredictable zone
+  // ── Gamma flip proximity / VWAP-on-flip pin block ─────────────────────────────
+  // At the flip, MMs hedge both directions simultaneously — most unpredictable zone.
+  // Instantaneous price lies: a breakout tick pokes >$0.50 past the flip, passes this
+  // check, then snaps back onto the flip and whipsaws (cost 2 stop-outs on 2026-07-13).
+  // VWAP-on-flip is the honest pin signal — it means the whole session is centered on
+  // the flip. Block on EITHER instantaneous price OR VWAP being within the buffer.
   if (gc.gammaFlip != null) {
     const flipDist = Math.abs(entry - gc.gammaFlip);
     if (flipDist < 0.50) {
       return { allowed: false, reason: "SPY $" + entry.toFixed(2) + " within $0.50 of gamma flip $" + gc.gammaFlip + " — regime indeterminate", tp1: entry, tp2: entry, target: null, dexBias: "NEUTRAL" };
+    }
+    if (vwap != null && Math.abs(vwap - gc.gammaFlip) < GEX_BUFFER) {
+      return { allowed: false, reason: "VWAP $" + vwap.toFixed(2) + " pinned to gamma flip $" + gc.gammaFlip + " ($" + Math.abs(vwap - gc.gammaFlip).toFixed(2) + " < $" + GEX_BUFFER + ") — session centered on flip, chop", tp1: entry, tp2: entry, target: null, dexBias: "NEUTRAL" };
     }
   }
 
@@ -1355,7 +1367,18 @@ async function executeTrade(direction, price, indicators, gexResult) {
   const now2  = getETDate();
   const isLateSession = now2.getHours() > 14 || (now2.getHours() === 14 && now2.getMinutes() >= 30);
   const date  = isLateSession ? getNextTradingDay() : now2;
-  if (isLateSession) log("SIGNAL","After 2:30 PM — using 1DTE expiry ("+date.toLocaleDateString("en-CA")+") for theta protection");
+  // Weekend/holiday gap guard: a late-session 1DTE whose expiry is >1 calendar day out
+  // (Friday, or before a holiday) would hold directional long premium through the weekend
+  // UNMONITORED, exposed to 3 days of theta + a gap open. This cost -$1,053 on 2026-07-13
+  // (a Friday $754C carried to Monday). Block the entry outright — no weekend holds.
+  if (isLateSession) {
+    const gapDays = Math.round((new Date(date.toDateString()) - new Date(now2.toDateString())) / 86400000);
+    if (gapDays > 1) {
+      log("SAFETY","Late-session entry BLOCKED — 1DTE expiry $"+date.toLocaleDateString("en-CA")+" is "+gapDays+" days out (weekend/holiday). No unmonitored multi-day holds.");
+      return;
+    }
+    log("SIGNAL","After 2:30 PM — using 1DTE expiry ("+date.toLocaleDateString("en-CA")+") for theta protection");
+  }
   const si    = selectStrike(price, direction, gexResult?.target, gexResult?.dexBias, gexResult?.pathResist);
 
   const sig = {
@@ -1560,11 +1583,14 @@ function detectMarketMode() {
     // Signal 1: GEX sign/magnitude (weight ×2) — most reliable signal
     if (gexCache?.netGex != null) {
       const g = gexCache.netGex;
-      if      (g < -1e9) { score += 2; reasons.push("GEX<-$1B (dealer short-gamma) +2"); }
+      // ANY positive net GEX is a pinning (chop) regime — dealers are long gamma and
+      // suppress moves. The old $0-2B "neutral" band scored 0 and let a genuine pin day
+      // (2026-07-13 AM lived in that band) drift to NEUTRAL/TREND. Removed: positive now
+      // always votes CHOP, scaled by magnitude.
+      if      (g < -1e9) { score += 2; reasons.push("GEX<-$1B (dealer short-gamma, trend) +2"); }
       else if (g < 0)    { score += 1; reasons.push("GEX neg (mild trend bias) +1"); }
-      else if (g > 5e9)  { score -= 2; reasons.push("GEX>$5B (strong pinning) -2"); }
-      else if (g > 2e9)  { score -= 1; reasons.push("GEX>$2B (mild pinning) -1"); }
-      else               { reasons.push("GEX neutral"); }
+      else if (g > 4e9)  { score -= 2; reasons.push("GEX>$4B (strong pinning) -2"); }
+      else               { score -= 1; reasons.push("GEX>$0 (dealer long-gamma, pinning) -1"); }
     } else { reasons.push("GEX unavailable"); }
 
     // Signal 2: VEX — use percentile rank when available (normalised vs last 5 days),
@@ -1614,7 +1640,18 @@ function detectMarketMode() {
     }
 
     marketScore = score;
-    const classified = score >= 2 ? "TREND" : score <= -2 ? "CHOP" : "NEUTRAL";
+    let classified = score >= 2 ? "TREND" : score <= -2 ? "CHOP" : "NEUTRAL";
+
+    // Pin floor: positive GEX (dealer long-gamma) with VWAP sitting on the gamma flip is
+    // the definition of a pin/chop day — it must never be classified TREND, no matter how
+    // many secondary signals (squeeze/VEX/gap) fire. This is the same VWAP-on-flip condition
+    // that blocks entries in applyGEX; here it caps the regime. Prevents the 2026-07-13
+    // trade-2 case (positive GEX pin classified TREND → tight 15% stop → 1-min stop-out).
+    if (classified === "TREND" && gexCache?.netGex > 0 && gexCache?.gammaFlip != null &&
+        lastVwap != null && Math.abs(lastVwap - gexCache.gammaFlip) < GEX_BUFFER) {
+      reasons.push("PIN FLOOR: +GEX & VWAP $"+lastVwap.toFixed(2)+" on flip $"+gexCache.gammaFlip+" — capped TREND→NEUTRAL");
+      classified = "NEUTRAL";
+    }
 
     const active = MARKET_MODE_OVERRIDE || (MARKET_MODE_AUTO === "ON" ? classified : "NEUTRAL");
     const changed = active !== MARKET_MODE;
@@ -1739,8 +1776,15 @@ async function runSignalEngine() {
       }
     }
 
-    // Apply GEX filter (walls, flip, magnet, DEX bias)
-    const gexResult=applyGEX(eval_result.direction,currentPrice);
+    // Ensure GEX is reasonably fresh before applying flip/wall/pin filters — the
+    // scheduled refresh is up to 30 min stale and the flip drifts. getGEX() respects
+    // its own 5-min cache, so this is a no-op when already fresh.
+    if(!gexCache || (Date.now()-gexCacheTime)>300000){
+      try{ await getGEX(false); }catch(e){ log("GEX ERR","pre-signal refresh: "+e.message); }
+    }
+
+    // Apply GEX filter (walls, flip, magnet, DEX bias, VWAP-on-flip pin)
+    const gexResult=applyGEX(eval_result.direction,currentPrice,ind.vwap);
     if(!gexResult.allowed){
       log("GEX","Signal BLOCKED — "+gexResult.reason);
       saveSignalToDB({direction:eval_result.direction,spyEntry:currentPrice,gexTarget:gexResult.target,strength:eval_result.strength},{...ind},false,"GEX: "+gexResult.reason);
@@ -1796,10 +1840,16 @@ async function recoverPositions(){
 
 // ── EOD force close ───────────────────────────────────────────────────────────
 async function forceCloseAll(){
-  // Skip 1DTE positions at EOD — they expire tomorrow, intentionally held overnight
-  const active=signalHistory.filter(s=>["FILLED","SENT"].includes(s.status)&&!s.is1DTE);
-  if(!active.length){log("EOD","No 0DTE positions to close");return;}
-  log("EOD","Force closing "+active.length+" 0DTE position(s) (1DTE positions held overnight)");
+  // Normally skip 1DTE positions at EOD — they expire tomorrow, intentionally held
+  // overnight. BUT when the next trading day is >1 calendar day away (Friday/holiday),
+  // a "1DTE" hold is a weekend hold — force-close those too. No unmonitored multi-day holds.
+  const now=getETDate();
+  const nextTd=getNextTradingDay();
+  const gapDays=Math.round((new Date(nextTd.toDateString()) - new Date(now.toDateString()))/86400000);
+  const weekendGap = gapDays>1;
+  const active=signalHistory.filter(s=>["FILLED","SENT"].includes(s.status) && (!s.is1DTE || weekendGap));
+  if(!active.length){log("EOD","No positions to close"+(weekendGap?" (weekend gap — 1DTE included)":""));return;}
+  log("EOD","Force closing "+active.length+" position(s)"+(weekendGap?" — WEEKEND/HOLIDAY GAP ("+gapDays+"d), closing 1DTE too":" (1DTE positions held overnight)"));
   for(const sig of active){
     if(sig._monitorInterval) clearInterval(sig._monitorInterval);
     try{
@@ -1863,7 +1913,7 @@ app.options("*",cors());
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"11.16-squeeze-flags-gex-profile",status:"running",
+  service:"SPX COMMAND",version:"11.17-pin-guard-weekend-block-classifier",status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,marketMode:MARKET_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -2174,7 +2224,7 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"11.16-squeeze-flags-gex-profile", mode:IS_PAPER?"PAPER":"LIVE",
+    version:"11.17-pin-guard-weekend-block-classifier", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, marketMode:MARKET_MODE, marketScore, marketModeAuto:MARKET_MODE_AUTO,
     noTradingView:true,
     exitStrategy:"price-monitor + DELETE /v2/positions",
