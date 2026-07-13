@@ -747,7 +747,7 @@ async function faGet(endpoint, attempt=1) {
   try {
     const r = await fetch(url, {
       headers: { "X-Api-Key": FLASHALPHA_KEY, "Accept": "application/json" },
-      signal: AbortSignal.timeout(8000),  // don't hang a whole scan on a slow FA call
+      signal: AbortSignal.timeout(20000),  // generous — FA slows near the close; only guard against a true hang
     });
     if (!r.ok) {
       const txt = await r.text();
@@ -1978,7 +1978,7 @@ app.options("*",cors());
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"11.18.1-flashalpha-retry-timeout",status:"running",
+  service:"SPX COMMAND",version:"11.18.2-fa-timeout-20s",status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,marketMode:MARKET_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -2289,7 +2289,7 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"11.18.1-flashalpha-retry-timeout", mode:IS_PAPER?"PAPER":"LIVE",
+    version:"11.18.2-fa-timeout-20s", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, marketMode:MARKET_MODE, marketScore, marketModeAuto:MARKET_MODE_AUTO,
     noTradingView:true,
     exitStrategy:"price-monitor + DELETE /v2/positions",
