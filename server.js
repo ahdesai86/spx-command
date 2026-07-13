@@ -861,7 +861,13 @@ async function getGEX(force) {
   if (today !== gexLastDate) { gexFired = new Set(); gexLastDate = today; gexCache = null; gexCacheTime = 0; }
   if (!force && gexCache && (now - gexCacheTime) < 300000) return gexCache; // 5 min cache (FlashAlpha data is fresher)
   const r = await calcGEX();
-  if (r) { gexCache = r; gexCacheTime = now; }
+  if (r) {
+    gexCache = r; gexCacheTime = now;
+    // Re-classify on every fresh GEX — a midday net-GEX sign flip (positive pin → negative
+    // trend) is a major regime change the old twice-a-day (ORB + 11:00) schedule missed
+    // entirely. Only once the session is underway (ORB built) to avoid pre-open noise.
+    if (orbState?.built) detectMarketMode();
+  }
   return gexCache;
 }
 
@@ -1663,7 +1669,27 @@ function detectMarketMode() {
 
     broadcast({ type:"market_mode", mode:active, classified, score, auto:MARKET_MODE_AUTO==="ON", reasons });
     if (changed) log("MARKET","Mode changed → "+active+(MARKET_MODE_AUTO==="ON"?" (params applied)":" (dry-run, no effect)"));
+    saveModeState();
   } catch(e) { log("MARKET ERR","detectMarketMode: "+e.message); }
+}
+
+// Persist mode state so a mid-day restart resumes the last classification instead of
+// snapping to NEUTRAL until the next scan. Small single-object file on the DB volume.
+const MODE_STATE_FILE = path.join(DB_DIR, "mode_state.json");
+function saveModeState(){
+  try{ fs.writeFileSync(MODE_STATE_FILE, JSON.stringify({ mode:MARKET_MODE, score:marketScore, date:marketModeDate })); }
+  catch(e){ console.error("[MODE ERR] saveModeState:", e.message); }
+}
+function restoreModeState(){
+  try{
+    if(!fs.existsSync(MODE_STATE_FILE)) return;
+    const s=JSON.parse(fs.readFileSync(MODE_STATE_FILE,"utf8"));
+    const today=new Date().toLocaleDateString("en-CA",{timeZone:"America/New_York"});
+    if(s.date===today){
+      MARKET_MODE=s.mode; marketScore=s.score; marketModeDate=s.date;
+      log("RECOVER","Mode restored from disk → "+MARKET_MODE+" (score "+marketScore+") — survives mid-day restart");
+    }
+  }catch(e){ log("RECOVER ERR","restoreModeState: "+e.message); }
 }
 
 async function runSignalEngine() {
@@ -1931,7 +1957,7 @@ app.options("*",cors());
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"11.17.1-persist-day-state",status:"running",
+  service:"SPX COMMAND",version:"11.18-intraday-mode-reclassify",status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,marketMode:MARKET_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -2242,7 +2268,7 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"11.17.1-persist-day-state", mode:IS_PAPER?"PAPER":"LIVE",
+    version:"11.18-intraday-mode-reclassify", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, marketMode:MARKET_MODE, marketScore, marketModeAuto:MARKET_MODE_AUTO,
     noTradingView:true,
     exitStrategy:"price-monitor + DELETE /v2/positions",
@@ -2353,6 +2379,7 @@ app.listen(PORT,async()=>{
   await fetchDailyEMAs(); // seed EMA9/21 from prior closes — always available from first bar
   await fetchPrevDayData(); // prev session close + 5-day ADR for market mode classifier
   reconstructDayState();    // rebuild sessionPnL/dailyLoss/tradesDay from today's trades (survives mid-day restarts)
+  restoreModeState();       // resume last MARKET_MODE instead of snapping to NEUTRAL after a mid-day restart
   await recoverPositions(); // re-attach monitors to any open 1DTE positions from prior session
   const now=new Date(new Date().toLocaleString("en-US",{timeZone:"America/New_York"}));
   const h=now.getHours(),m=now.getMinutes();
