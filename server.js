@@ -157,7 +157,10 @@ let lastVwap        = null;   // most recent session VWAP (for classifier pin-fl
 let scanActive      = false;
 let tradesDay       = 0;
 const MAX_LOGS      = 500;
-const GEX_SCHEDULE  = [{h:9,m:25},{h:10,m:0},{h:10,m:30},{h:11,m:0},{h:11,m:30},{h:12,m:0},{h:13,m:0},{h:14,m:0},{h:15,m:0}];
+// Scheduled GEX refreshes — every 15 min during RTH. 26 slots x 5 endpoints = ~130 FA
+// calls/day, comfortably inside the 2500/day quota (was blown 2026-07-13 by a per-scan
+// refresh + retry-doubling, not by the schedule). 15-min freshness is ample for flip/wall.
+const GEX_SCHEDULE  = (()=>{ const s=[]; for(let t=9*60+25; t<=15*60+45; t+=15) s.push({h:Math.floor(t/60), m:t%60}); return s; })();
 let faLevelsCache   = null;
 let faZeroDteCache  = null;
 // Market mode classifier state
@@ -740,19 +743,47 @@ function evaluateSignal(ind) {
 const OPTIONS_FEED = process.env.OPTIONS_FEED || "opra";
 let fullChainCache = null;
 
+// FlashAlpha usage tracking + quota circuit breaker. The Growth plan is 2500 requests/day.
+// Once "Quota exceeded" is seen, STOP calling FA until the reset time — retrying a quota
+// error just burns more of the (already-exhausted) budget. Counter resets each ET day.
+let faCallsToday   = 0;
+let faCallsDate    = "";
+let faQuotaBlocked = false;
+let faQuotaResetAt = 0;   // epoch ms; 0 = unknown → default next UTC midnight
+function faDayRollover(){
+  const today=new Date().toLocaleDateString("en-CA",{timeZone:"America/New_York"});
+  if(faCallsDate!==today){ faCallsDate=today; faCallsToday=0; faQuotaBlocked=false; faQuotaResetAt=0; }
+}
+
 async function faGet(endpoint, attempt=1) {
   if (!FLASHALPHA_KEY) return null;
+  faDayRollover();
+  // Quota circuit breaker — skip the call entirely while blocked
+  if (faQuotaBlocked) {
+    if (Date.now() >= faQuotaResetAt && faQuotaResetAt>0) { faQuotaBlocked=false; log("FA","Quota window elapsed — resuming FlashAlpha calls"); }
+    else return null;
+  }
   const url = FLASHALPHA_BASE + endpoint;
   const MAX_ATTEMPTS = 2;
   try {
+    faCallsToday++;
     const r = await fetch(url, {
       headers: { "X-Api-Key": FLASHALPHA_KEY, "Accept": "application/json" },
       signal: AbortSignal.timeout(20000),  // generous — FA slows near the close; only guard against a true hang
     });
     if (!r.ok) {
       const txt = await r.text();
-      // Retry transient server/rate-limit errors once; 4xx (except 429) won't fix on retry
-      if ((r.status >= 500 || r.status === 429) && attempt < MAX_ATTEMPTS) {
+      // 429 QUOTA EXCEEDED — do NOT retry (wastes more budget). Trip the circuit breaker.
+      if (r.status === 429) {
+        faQuotaBlocked = true;
+        const m = txt.match(/resets at\s+([0-9T:\-\.Z+]+)/i);
+        const parsed = m ? Date.parse(m[1]) : NaN;
+        faQuotaResetAt = !isNaN(parsed) ? parsed : new Date(new Date().setUTCHours(24,0,0,0)).getTime();
+        log("FA ERR", "QUOTA EXCEEDED ("+faCallsToday+" calls today) — FlashAlpha calls SUSPENDED until "+new Date(faQuotaResetAt).toISOString());
+        return null;
+      }
+      // Retry only genuine transient server errors (5xx); other 4xx won't fix on retry
+      if (r.status >= 500 && attempt < MAX_ATTEMPTS) {
         log("FA ERR", "GET " + endpoint + " " + r.status + " — retrying");
         await new Promise(res => setTimeout(res, 600));
         return faGet(endpoint, attempt+1);
@@ -1823,10 +1854,12 @@ async function runSignalEngine() {
       }
     }
 
-    // Ensure GEX is reasonably fresh before applying flip/wall/pin filters — the
-    // scheduled refresh is up to 30 min stale and the flip drifts. getGEX() respects
-    // its own 5-min cache, so this is a no-op when already fresh.
-    if(!gexCache || (Date.now()-gexCacheTime)>300000){
+    // GEX freshness is handled by the 15-min scheduled refresh (GEX_SCHEDULE), NOT a
+    // per-scan refresh — the old per-scan getGEX fired a 5-call FA fetch on nearly every
+    // 5-min scan (~375 calls/day), a major contributor to blowing the 2500/day quota on
+    // 2026-07-13. Only refresh here as a last resort if the cache is truly stale (>20 min),
+    // and never when the quota breaker is tripped.
+    if(!faQuotaBlocked && (!gexCache || (Date.now()-gexCacheTime)>1200000)){
       try{ await getGEX(false); }catch(e){ log("GEX ERR","pre-signal refresh: "+e.message); }
     }
 
@@ -1978,7 +2011,7 @@ app.options("*",cors());
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"11.18.2-fa-timeout-20s",status:"running",
+  service:"SPX COMMAND",version:"11.19-fa-quota-guard",status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,marketMode:MARKET_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -2289,7 +2322,7 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"11.18.2-fa-timeout-20s", mode:IS_PAPER?"PAPER":"LIVE",
+    version:"11.19-fa-quota-guard", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, marketMode:MARKET_MODE, marketScore, marketModeAuto:MARKET_MODE_AUTO,
     noTradingView:true,
     exitStrategy:"price-monitor + DELETE /v2/positions",
@@ -2299,6 +2332,7 @@ app.get("/status",(req,res)=>{
     tp1Config:{mode:TP1_FIXED_MOVE>0?"fixed":"gex-adaptive",value:TP1_FIXED_MOVE>0?"$"+TP1_FIXED_MOVE:"GEX wall ("+TP1_MIN_MULT+"x-"+TP1_MAX_MULT+"x bounds, "+TP1_MULTIPLIER+"x fallback)"},
     trailingStop:{triggerPct:(TRAIL_TRIGGER_PCT*100)+"%",trailDistance:(TRAIL_DISTANCE_PCT*100)+"%"},
     sessionPnL:sessionPnL.toFixed(2), dailyLoss:dailyLoss.toFixed(2),
+    faCallsToday, faQuotaLimit:2500, faQuotaBlocked, faQuotaResetAt:faQuotaResetAt?new Date(faQuotaResetAt).toISOString():null,
     dailyLossLimit:(ACCOUNT_SIZE*MAX_DAILY_LOSS).toFixed(2),
     tradesDay:tradesDay+"/"+MAX_TRADES_DAY,
     orb:orbState,
