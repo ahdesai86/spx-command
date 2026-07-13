@@ -233,6 +233,12 @@ function saveSignalToDB(sig, indicators, fired, blockedReason) {
       rsi:            indicators.rsi||null,
       ema9:           indicators.ema9||null,
       ema21:          indicators.ema21||null,
+      squeeze_on:     indicators.squeeze?.on??null,
+      squeeze_bars:   indicators.squeeze?.barsOn??null,
+      squeeze_fired:  indicators.squeeze?.fired??null,
+      squeeze_dir:    indicators.squeeze?.direction||null,
+      flag_pattern:   indicators.flag||null,
+      gex_path_resist: gexCache?.profile ? pathResistance(sig.direction, sig.spyEntry) : null,
       gex_regime:     gexCache?.regime||null,
       gex_flip:       gexCache?.gammaFlip||null,
       nearest_wall:   sig.gexTarget||null,
@@ -282,6 +288,9 @@ function saveTradeToDB(trade, signalDbId, indicators) {
       orb_low:        indicators?.orbLow||null,
       vwap_at_entry:  indicators?.vwap||null,
       rsi_at_entry:   indicators?.rsi||null,
+      squeeze_at_entry: indicators?.squeeze ? {on:indicators.squeeze.on, fired:indicators.squeeze.fired, dir:indicators.squeeze.direction} : null,
+      flag_at_entry:  indicators?.flag||null,
+      gex_path_resist: trade.gexPathResist??null,
       ema9_at_entry:  indicators?.ema9||null,
       ema21_at_entry: indicators?.ema21||null,
       tp1_mode:       TRAIL_TRIGGER_DOLLARS>0?"trail-trigger-$"+TRAIL_TRIGGER_DOLLARS:"trail-trigger-"+(TRAIL_TRIGGER_PCT*100)+"%",
@@ -524,6 +533,86 @@ function calcVWAP(bars) {
 }
 
 /**
+ * TTM Squeeze — Bollinger Bands (20, 2σ) inside Keltner Channels (20, 1.5×ATR).
+ * Pure arithmetic, zero subjective parameters. squeezeState is module-global so
+ * fired-transitions are detected across scan ticks and the classifier can read it.
+ * Returns { on, barsOn, fired, direction, momentum } or null if <21 bars.
+ */
+let squeezeState = { on:false, barsOn:0, fired:false, firedAt:0, direction:null, momentum:null, date:"" };
+function calcSqueeze(bars) {
+  const P = 20;
+  if (bars.length < P+1) return null;
+  const today = new Date().toLocaleDateString("en-CA",{timeZone:"America/New_York"});
+  if (squeezeState.date !== today) squeezeState = { on:false, barsOn:0, fired:false, firedAt:0, direction:null, momentum:null, date:today };
+
+  const w      = bars.slice(-P);
+  const closes = w.map(b=>b.c);
+  const sma    = closes.reduce((a,b)=>a+b,0)/P;
+  const sd     = Math.sqrt(closes.reduce((a,c)=>a+(c-sma)**2,0)/P);
+  // ATR over the window (true range vs prior close)
+  let atr=0;
+  for (let i=0;i<w.length;i++){
+    const pc = i>0 ? w[i-1].c : w[0].o ?? w[0].c;
+    atr += Math.max(w[i].h-w[i].l, Math.abs(w[i].h-pc), Math.abs(w[i].l-pc));
+  }
+  atr/=P;
+
+  const bbU=sma+2*sd, bbL=sma-2*sd, kcU=sma+1.5*atr, kcL=sma-1.5*atr;
+  const on = bbU < kcU && bbL > kcL;
+
+  // TTM momentum: close vs midpoint of (Donchian mid + SMA)
+  const hh=Math.max(...w.map(b=>b.h)), ll=Math.min(...w.map(b=>b.l));
+  const momentum = parseFloat((closes[P-1] - ((hh+ll)/2 + sma)/2).toFixed(4));
+
+  const wasOn = squeezeState.on;
+  const fired = wasOn && !on; // squeeze released this bar
+  squeezeState.on     = on;
+  squeezeState.barsOn = on ? squeezeState.barsOn+1 : 0;
+  if (fired) { squeezeState.fired=true; squeezeState.firedAt=Date.now(); }
+  // fired flag stays true for 3 bars (~15 min) then decays
+  if (squeezeState.fired && Date.now()-squeezeState.firedAt > 15*60000) squeezeState.fired=false;
+  squeezeState.direction = momentum>0 ? "LONG" : momentum<0 ? "SHORT" : null;
+  squeezeState.momentum  = momentum;
+  if (fired) log("SQUEEZE","Fired "+squeezeState.direction+" — momentum "+momentum+" after "+(squeezeState.barsOn||"?")+" bars of compression");
+  return { on, barsOn:squeezeState.barsOn, fired:squeezeState.fired, direction:squeezeState.direction, momentum };
+}
+
+/**
+ * Bull/bear flag detector — LOG-ONLY pilot (never gates a trade).
+ * Impulse: any 4-bar window in the last 12 bars moving >= 0.25%.
+ * Consolidation: 3-8 bars after impulse, avg range < 50% of impulse bar range,
+ * retracing <= 40% of the impulse. Breakout: latest close beyond consolidation
+ * extreme in the impulse direction.
+ * Returns "BULL_FLAG" | "BEAR_FLAG" | null. Journal accumulates outcomes for
+ * 2-3 weeks before this is allowed to become a real (CHOP-mode) filter.
+ */
+function detectFlag(bars) {
+  if (bars.length < 10) return null;
+  const recent = bars.slice(-16);
+  for (let s=0; s<=recent.length-8; s++) {
+    const imp = recent.slice(s, s+4);
+    const impMove = imp[3].c - imp[0].o;
+    const impPct  = Math.abs(impMove)/imp[0].o;
+    if (impPct < 0.0025) continue;
+    const dir = impMove>0 ? 1 : -1;
+    const impRange = imp.reduce((a,b)=>a+(b.h-b.l),0)/4;
+    const cons = recent.slice(s+4);
+    if (cons.length < 3 || cons.length > 8) continue;
+    const consRange = cons.reduce((a,b)=>a+(b.h-b.l),0)/cons.length;
+    if (consRange >= impRange*0.5) continue;                       // not tightening
+    const retrace = dir>0 ? imp[3].c - Math.min(...cons.map(b=>b.l))
+                          : Math.max(...cons.map(b=>b.h)) - imp[3].c;
+    if (retrace > Math.abs(impMove)*0.4) continue;                 // gave back too much
+    const last = recent[recent.length-1];
+    const consHigh = Math.max(...cons.slice(0,-1).map(b=>b.h));
+    const consLow  = Math.min(...cons.slice(0,-1).map(b=>b.l));
+    if (dir>0 && last.c > consHigh) return "BULL_FLAG";
+    if (dir<0 && last.c < consLow)  return "BEAR_FLAG";
+  }
+  return null;
+}
+
+/**
  * Build ORB from first ORB_MINUTES of bars
  * Returns { high, low, built } or null
  */
@@ -585,8 +674,10 @@ function calcIndicators(bars, currentPrice) {
   // confirmation available from the first 5-min bar instead of waiting 105 min.
   const ema9Final  = ema9  ?? dailyEMA9;
   const ema21Final = ema21 ?? dailyEMA21;
+  const squeeze = calcSqueeze(bars);   // logged context + classifier input
+  const flag    = detectFlag(bars);    // LOG-ONLY pilot — never gates entries
   return { price, orbHigh:orb?.high||null, orbLow:orb?.low||null,
-    vwap, rsi, ema9:ema9Final, ema21:ema21Final, orbBreak };
+    vwap, rsi, ema9:ema9Final, ema21:ema21Final, orbBreak, squeeze, flag };
 }
 
 /**
@@ -705,13 +796,21 @@ async function calcGEX() {
     const gammaFlip = gexData.gamma_flip || (levelsData?.levels?.gamma_flip) || spot;
     const regime = (gexData.net_gex_label || (gexData.net_gex >= 0 ? "positive" : "negative"));
 
+    // Per-strike GEX profile (spot ±$10) — the SHAPE of the curve, not just wall peaks.
+    // Used for path resistance (opposing GEX between entry and target) and wall
+    // hardness (concentrated spike vs distributed ledge).
+    const profile = strikes
+      .filter(s => Math.abs(s.strike - spot) <= 10)
+      .map(s => ({ strike: s.strike, netGex: (s.call_gex||0)+(s.put_gex||0), callGex: s.call_gex||0, putGex: s.put_gex||0 }))
+      .sort((a,b) => a.strike - b.strike);
+
     // Extract key levels
     const levels = levelsData?.levels || {};
     const zeroDte = zeroDteData || {};
     const maxPain = maxPainData?.max_pain || null;
 
     const result = {
-      callWalls, putWalls,
+      callWalls, putWalls, profile,
       gammaFlip: parseFloat(gammaFlip.toFixed ? gammaFlip.toFixed(2) : gammaFlip),
       netGex: Math.round(gexData.net_gex || 0),
       regime,
@@ -762,6 +861,38 @@ async function getGEX(force) {
   const r = await calcGEX();
   if (r) { gexCache = r; gexCacheTime = now; }
   return gexCache;
+}
+
+/**
+ * Path resistance — fraction [0..1] of nearby absolute GEX that opposes a move
+ * from entry toward the target side. Positive net GEX at a strike = dealers fade
+ * moves through it (resistance); negative = dealers amplify (fuel).
+ * High value (>0.6) = price must chew through a wall of pinning gamma; low = clear air.
+ */
+function pathResistance(direction, entry) {
+  const prof = gexCache?.profile;
+  if (!prof || !prof.length) return null;
+  const ahead = prof.filter(p => direction==="LONG" ? p.strike > entry : p.strike < entry);
+  if (!ahead.length) return null;
+  const totalAbs = ahead.reduce((a,p)=>a+Math.abs(p.netGex),0);
+  if (!totalAbs) return null;
+  const opposing = ahead.reduce((a,p)=>a+(p.netGex>0?p.netGex:0),0); // positive GEX = pinning = resistance
+  return parseFloat((opposing/totalAbs).toFixed(2));
+}
+
+/**
+ * Wall hardness — is the target wall a concentrated spike (hard: expect sharp
+ * rejection, tighten at it) or a distributed ledge (soft: price may grind through)?
+ * Returns ratio of wall strike |GEX| to mean |GEX| of the rest of the profile.
+ */
+function wallHardness(wallPrice) {
+  const prof = gexCache?.profile;
+  if (!prof || prof.length < 3 || wallPrice==null) return null;
+  const wall = prof.find(p => Math.abs(p.strike-wallPrice) < 0.51);
+  if (!wall) return null;
+  const rest = prof.filter(p => p !== wall);
+  const meanAbs = rest.reduce((a,p)=>a+Math.abs(p.netGex),0)/rest.length;
+  return meanAbs ? parseFloat((Math.abs(wall.netGex)/meanAbs).toFixed(1)) : null;
 }
 
 function applyGEX(direction, entry) {
@@ -823,7 +954,10 @@ function applyGEX(direction, entry) {
     const tp1    = magnet && magnet > entry && magnet < callWall ? magnet : callWall;
     const tp2    = callWall > tp1 ? callWall : (walls[1]?.price || callWall);
     const target = magnet && magnet > entry && magnet < callWall ? magnet : callWall;
-    return { allowed: true, reason: "LONG → wall $" + callWall + (magnet ? " | magnet $" + magnet : "") + dexNote, tp1, tp2, target, dexBias };
+    const pathResist = pathResistance("LONG", entry);
+    const hardness   = wallHardness(callWall);
+    const profNote   = (pathResist!=null ? " | path resist "+pathResist : "") + (hardness!=null ? " | wall "+hardness+"x"+(hardness>=2?" HARD":" soft") : "");
+    return { allowed: true, reason: "LONG → wall $" + callWall + (magnet ? " | magnet $" + magnet : "") + dexNote + profNote, tp1, tp2, target, dexBias, pathResist, wallHardness: hardness };
   }
 
   if (direction === "SHORT") {
@@ -834,7 +968,10 @@ function applyGEX(direction, entry) {
     const tp1    = magnet && magnet < entry && magnet > putWall ? magnet : putWall;
     const tp2    = putWall < tp1 ? putWall : (walls[1]?.price || putWall);
     const target = magnet && magnet < entry && magnet > putWall ? magnet : putWall;
-    return { allowed: true, reason: "SHORT → wall $" + putWall + (magnet ? " | magnet $" + magnet : "") + dexNote, tp1, tp2, target, dexBias };
+    const pathResist = pathResistance("SHORT", entry);
+    const hardness   = wallHardness(putWall);
+    const profNote   = (pathResist!=null ? " | path resist "+pathResist : "") + (hardness!=null ? " | wall "+hardness+"x"+(hardness>=2?" HARD":" soft") : "");
+    return { allowed: true, reason: "SHORT → wall $" + putWall + (magnet ? " | magnet $" + magnet : "") + dexNote + profNote, tp1, tp2, target, dexBias, pathResist, wallHardness: hardness };
   }
 
   return { allowed: true, reason: "No GEX filter" + dexNote, tp1: entry, tp2: entry, target: null, dexBias };
@@ -860,7 +997,7 @@ function applyGEX(direction, entry) {
  *   DEX OPPOSED — MM hedging flows work against the trade; penalize low-delta
  *     strikes (need the move to overcome the hedging headwind before OTM pays).
  */
-function selectStrike(price, direction, target, dexBias) {
+function selectStrike(price, direction, target, dexBias, pathResist) {
   const atm = Math.round(price);
 
   // No GEX cache at all → pure ATM fallback
@@ -904,7 +1041,9 @@ function selectStrike(price, direction, target, dexBias) {
       const vexHigh    = gexCache.vexPctRank != null && gexCache.vexPctRank >= 80;
       const vexLow     = gexCache.vexPctRank != null && gexCache.vexPctRank <= 20;
       const dexOpposed = dexBias === "OPPOSED";
+      const highResist = pathResist != null && pathResist >= 0.6;
       const expNotes   = [];
+      if (highResist) expNotes.push("GEX path resist "+pathResist+" — pinning gamma ahead, favoring high delta");
       if (chexHigh)   expNotes.push("CHEX p"+gexCache.chexPctRank+" charm decay — favoring ATM/ITM");
       if (vexHigh)    expNotes.push("VEX p"+gexCache.vexPctRank+" big move expected — OTM boost");
       if (vexLow)     expNotes.push("VEX p"+gexCache.vexPctRank+" pinning — favoring high delta");
@@ -919,6 +1058,7 @@ function selectStrike(price, direction, target, dexBias) {
         if (chexHigh   && c.delta < 0.35) expAdj *= 0.65; // charm bleed hits far OTM hardest
         if (vexLow     && c.delta < 0.40) expAdj *= 0.80;
         if (dexOpposed && c.delta < 0.40) expAdj *= 0.80;
+        if (highResist && c.delta < 0.40) expAdj *= 0.75; // must chew through pinning gamma — OTM unlikely to be reached
         if (vexHigh    && c.delta < 0.40 && c.delta >= 0.20) expAdj *= 1.15;
         return {...c, score: payoffScore*ivPenalty*expAdj};
       }).sort((a,b)=>b.score-a.score);
@@ -945,7 +1085,9 @@ function selectStrike(price, direction, target, dexBias) {
   // ── Heuristic fallback (no real greeks, or no candidates found) ─────────
   // Charm clamp: high CHEX after 12:00 ET bleeds OTM premium into close — cap OTM at 1
   const charmClamp = getETDate().getHours() >= 12 && gexCache.chexPctRank != null && gexCache.chexPctRank >= 70;
-  const otmCap = charmClamp ? 1 : 5;
+  // Resistance clamp: >=60% of nearby GEX opposes the move — far OTM won't get reached
+  const resistClamp = pathResist != null && pathResist >= 0.6;
+  const otmCap = charmClamp ? 1 : resistClamp ? 2 : 5;
   if(direction==="LONG"){
     const walls=(gexCache.callWalls||[]).filter(w=>w.price>price).sort((a,b)=>a.price-b.price);
     if(!walls.length) return {strike:atm+1,reason:"OTM+1",delta:0.45,otm:1,method:"heuristic"};
@@ -1214,7 +1356,7 @@ async function executeTrade(direction, price, indicators, gexResult) {
   const isLateSession = now2.getHours() > 14 || (now2.getHours() === 14 && now2.getMinutes() >= 30);
   const date  = isLateSession ? getNextTradingDay() : now2;
   if (isLateSession) log("SIGNAL","After 2:30 PM — using 1DTE expiry ("+date.toLocaleDateString("en-CA")+") for theta protection");
-  const si    = selectStrike(price, direction, gexResult?.target, gexResult?.dexBias);
+  const si    = selectStrike(price, direction, gexResult?.target, gexResult?.dexBias, gexResult?.pathResist);
 
   const sig = {
     id:          Date.now(),
@@ -1227,6 +1369,9 @@ async function executeTrade(direction, price, indicators, gexResult) {
     stop:        indicators.orbLow,
     tp1:         gexResult.tp1, tp2:gexResult.tp2,
     gexTarget:   gexResult.target, gexReason:gexResult.reason, dexBias:gexResult.dexBias||"NEUTRAL",
+    gexPathResist: gexResult.pathResist??null, gexWallHardness: gexResult.wallHardness??null,
+    squeezeAtEntry: indicators.squeeze ? {on:indicators.squeeze.on, fired:indicators.squeeze.fired, dir:indicators.squeeze.direction} : null,
+    flagAtEntry: indicators.flag||null,
     expiry:      date.getFullYear()+String(date.getMonth()+1).padStart(2,"0")+String(date.getDate()).padStart(2,"0"),
     is1DTE:      isLateSession,
     riskBudget:getRiskBudget(),
@@ -1458,6 +1603,14 @@ function detectMarketMode() {
       if      (orbPctADR > 0.45) { score += 1; reasons.push("ORB "+(orbPctADR*100).toFixed(0)+"% ADR wide +1"); }
       else if (orbPctADR < 0.20) { score -= 1; reasons.push("ORB "+(orbPctADR*100).toFixed(0)+"% ADR tight -1"); }
       else                       { reasons.push("ORB "+(orbPctADR*100).toFixed(0)+"% ADR normal"); }
+    }
+
+    // Signal 5: TTM Squeeze — price-action confirmation of the compression/expansion
+    // cycle the exposure metrics see from the positioning side
+    if (squeezeState.date) {
+      if      (squeezeState.fired)      { score += 1; reasons.push("Squeeze fired "+(squeezeState.direction||"")+" (expansion beginning) +1"); }
+      else if (squeezeState.barsOn >= 6){ score -= 1; reasons.push("Squeeze on "+squeezeState.barsOn+" bars (compression) -1"); }
+      else                              { reasons.push("Squeeze neutral"); }
     }
 
     marketScore = score;
@@ -1710,7 +1863,7 @@ app.options("*",cors());
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"11.15.1-auto-mode-default-on",status:"running",
+  service:"SPX COMMAND",version:"11.16-squeeze-flags-gex-profile",status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,marketMode:MARKET_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -2021,7 +2174,7 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"11.15.1-auto-mode-default-on", mode:IS_PAPER?"PAPER":"LIVE",
+    version:"11.16-squeeze-flags-gex-profile", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, marketMode:MARKET_MODE, marketScore, marketModeAuto:MARKET_MODE_AUTO,
     noTradingView:true,
     exitStrategy:"price-monitor + DELETE /v2/positions",
