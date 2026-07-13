@@ -1838,6 +1838,24 @@ async function recoverPositions(){
   }catch(e){ log("RECOVER ERR","recoverPositions: "+e.message); }
 }
 
+// ── Reconstruct day P&L / risk state after a mid-day restart ──────────────────
+// sessionPnL, dailyLoss and tradesDay live only in memory and start at 0 on every
+// process launch. A mid-day redeploy therefore zeroes the day's realized P&L display
+// AND, critically, the daily-loss circuit breaker and max-trades-per-day cap — the bot
+// would forget it was already down for the day. Rebuild all three from today's persisted
+// trades so the accounting and safety limits survive restarts.
+function reconstructDayState(){
+  try{
+    const today=new Date().toLocaleDateString("en-CA",{timeZone:"America/New_York"});
+    const todays=loadDB("trades").filter(t=>t.date===today);
+    if(!todays.length){log("RECOVER","No prior trades today — day state starts clean");return;}
+    sessionPnL = todays.reduce((a,t)=>a+(t.pnl||0),0);
+    dailyLoss  = todays.reduce((a,t)=>a+(t.pnl<0?Math.abs(t.pnl):0),0);
+    tradesDay  = todays.length;
+    log("RECOVER","Day state rebuilt from "+todays.length+" trade(s) today — sessionPnL $"+sessionPnL.toFixed(2)+" | dailyLoss $"+dailyLoss.toFixed(2)+" | tradesDay "+tradesDay);
+  }catch(e){ log("RECOVER ERR","reconstructDayState: "+e.message); }
+}
+
 // ── EOD force close ───────────────────────────────────────────────────────────
 async function forceCloseAll(){
   // Normally skip 1DTE positions at EOD — they expire tomorrow, intentionally held
@@ -1913,7 +1931,7 @@ app.options("*",cors());
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"11.17-pin-guard-weekend-block-classifier",status:"running",
+  service:"SPX COMMAND",version:"11.17.1-persist-day-state",status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,marketMode:MARKET_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -2224,7 +2242,7 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"11.17-pin-guard-weekend-block-classifier", mode:IS_PAPER?"PAPER":"LIVE",
+    version:"11.17.1-persist-day-state", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, marketMode:MARKET_MODE, marketScore, marketModeAuto:MARKET_MODE_AUTO,
     noTradingView:true,
     exitStrategy:"price-monitor + DELETE /v2/positions",
@@ -2334,6 +2352,7 @@ app.listen(PORT,async()=>{
   await checkAccount();
   await fetchDailyEMAs(); // seed EMA9/21 from prior closes — always available from first bar
   await fetchPrevDayData(); // prev session close + 5-day ADR for market mode classifier
+  reconstructDayState();    // rebuild sessionPnL/dailyLoss/tradesDay from today's trades (survives mid-day restarts)
   await recoverPositions(); // re-attach monitors to any open 1DTE positions from prior session
   const now=new Date(new Date().toLocaleString("en-US",{timeZone:"America/New_York"}));
   const h=now.getHours(),m=now.getMinutes();
