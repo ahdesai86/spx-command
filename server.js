@@ -829,7 +829,7 @@ async function calcGEX() {
       faGet("/v1/maxpain/SPY?expiration=" + today),
     ]);
 
-    if (!gexData) { log("GEX ERR", "FlashAlpha GEX endpoint returned no data"); return null; }
+    if (!gexData) { log("GEX ERR", "FlashAlpha GEX endpoint returned no data"); broadcastHealth(); return null; }
 
     const spot = gexData.underlying_price || (await getSPYQuote()) || 0;
     if (!spot) { log("GEX ERR", "No SPY spot"); return null; }
@@ -1729,6 +1729,7 @@ function detectMarketMode() {
     broadcast({ type:"market_mode", mode:active, classified, score, auto:MARKET_MODE_AUTO==="ON", reasons });
     if (changed) log("MARKET","Mode changed → "+active+(MARKET_MODE_AUTO==="ON"?" (params applied)":" (dry-run, no effect)"));
     saveModeState();
+    broadcastHealth();
   } catch(e) { log("MARKET ERR","detectMarketMode: "+e.message); }
 }
 
@@ -1931,6 +1932,24 @@ async function recoverPositions(){
 // AND, critically, the daily-loss circuit breaker and max-trades-per-day cap — the bot
 // would forget it was already down for the day. Rebuild all three from today's persisted
 // trades so the accounting and safety limits survive restarts.
+// Classifier health — the market-mode classifier's primary, highest-weighted input is
+// net GEX. When GEX is missing/stale/quota-blocked the classifier still runs but is flying
+// on secondary signals only (degraded). Surface this so the dashboard can warn loudly.
+function classifierHealth(){
+  const now=Date.now();
+  const ageMin = gexCacheTime ? Math.round((now-gexCacheTime)/60000) : null;
+  const staleAfter = Math.max(GEX_REFRESH_MINS*3, 20); // >3 refresh cycles (min 20m) = stale
+  const available = !!(gexCache && gexCache.netGex != null);
+  const stale = available && ageMin != null && ageMin > staleAfter;
+  let status="OK", reason="GEX live";
+  if (faQuotaBlocked)      { status="FAILED";   reason="FlashAlpha quota exhausted — classifier blind (GEX unavailable)"; }
+  else if (!available)     { status="FAILED";   reason="No GEX data — classifier running without its primary signal"; }
+  else if (stale)          { status="DEGRADED"; reason="GEX stale ("+ageMin+"m old) — classifier may be acting on outdated regime"; }
+  return { status, reason, gexAvailable:available, gexAgeMin:ageMin, gexStale:stale,
+           quotaBlocked:faQuotaBlocked, marketMode:MARKET_MODE, marketScore, auto:MARKET_MODE_AUTO==="ON" };
+}
+function broadcastHealth(){ try{ broadcast({ type:"health", ...classifierHealth() }); }catch(_){} }
+
 function reconstructDayState(){
   try{
     const today=new Date().toLocaleDateString("en-CA",{timeZone:"America/New_York"});
@@ -2018,7 +2037,7 @@ app.options("*",cors());
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"11.20-configurable-cadences",status:"running",
+  service:"SPX COMMAND",version:"11.21-sse-resilience-classifier-health",status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,marketMode:MARKET_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -2058,8 +2077,13 @@ app.get("/events",(req,res)=>{
       })+"\n\n");
     } catch(_) {}
   }
-  const ping=setInterval(()=>{try{res.write(": ping\n\n");}catch(_){clearInterval(ping);}},30000);
-  req.on("close",()=>{clearInterval(ping);sseClients=sseClients.filter(c=>c!==res);});
+  // Heartbeat every 15s — keeps the connection alive under Railway's edge idle timeout so
+  // the dashboard doesn't drop into "reconnecting" during quiet periods. Also tell the
+  // browser to wait 3s before its own reconnect (belt-and-suspenders with client backoff).
+  res.write("retry: 3000\n\n");
+  const ping=setInterval(()=>{try{res.write(": ping\n\n");}catch(_){clearInterval(ping);}},15000);
+  const cleanup=()=>{clearInterval(ping);sseClients=sseClients.filter(c=>c!==res);};
+  req.on("close",cleanup); res.on("close",cleanup); res.on("error",cleanup);
 });
 
 app.get("/gex",async(req,res)=>{
@@ -2329,7 +2353,7 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"11.20-configurable-cadences", mode:IS_PAPER?"PAPER":"LIVE",
+    version:"11.21-sse-resilience-classifier-health", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, marketMode:MARKET_MODE, marketScore, marketModeAuto:MARKET_MODE_AUTO,
     SIGNAL_SCAN_MINS, GEX_REFRESH_MINS,
     noTradingView:true,
@@ -2341,6 +2365,7 @@ app.get("/status",(req,res)=>{
     trailingStop:{triggerPct:(TRAIL_TRIGGER_PCT*100)+"%",trailDistance:(TRAIL_DISTANCE_PCT*100)+"%"},
     sessionPnL:sessionPnL.toFixed(2), dailyLoss:dailyLoss.toFixed(2),
     faCallsToday, faQuotaLimit:2500, faQuotaBlocked, faQuotaResetAt:faQuotaResetAt?new Date(faQuotaResetAt).toISOString():null,
+    classifierHealth: classifierHealth(),
     dailyLossLimit:(ACCOUNT_SIZE*MAX_DAILY_LOSS).toFixed(2),
     tradesDay:tradesDay+"/"+MAX_TRADES_DAY,
     orb:orbState,

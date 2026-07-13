@@ -95,6 +95,11 @@
 </head>
 <body>
 
+<!-- Classifier health banner — hidden when healthy, big + loud when GEX/classifier fails -->
+<div id="health-banner" style="display:none;position:sticky;top:0;z-index:9999;
+  padding:12px 18px;font-size:14px;font-weight:700;letter-spacing:.4px;text-align:center;
+  color:#fff;box-shadow:0 2px 12px rgba(0,0,0,.5)"></div>
+
 <!-- Top bar -->
 <div id="topbar">
   <div style="display:flex;align-items:center;gap:14px">
@@ -973,8 +978,44 @@ async function saveSettings() {
 }
 
 // ── SSE ───────────────────────────────────────────────────────────────────────
+let _es = null;          // the single active EventSource
+let _reconnectTimer = null;
+let _backoff = 1500;     // grows on repeated failures, resets on success
+let _connected = false;
+
+function setConnState(state){ // "connecting" | "connected" | "reconnecting"
+  const pip=document.getElementById("conn-pip"), txt=document.getElementById("conn-text"), box=document.getElementById("conn-status");
+  if(!pip||!txt) return;
+  if(state==="connected"){
+    pip.style.background=C.bull; pip.style.boxShadow="0 0 6px "+C.bull;
+    txt.style.color=C.bull; txt.textContent="CONNECTED";
+    if(box){ box.style.background=C.bull+"0f"; box.style.border="1px solid "+C.bull+"25"; }
+  } else if(state==="reconnecting"){
+    pip.style.background=C.yellow; pip.style.boxShadow="none";
+    txt.style.color=C.yellow; txt.textContent="RECONNECTING...";
+  } else {
+    pip.style.background=C.yellow; txt.style.color=C.yellow; txt.textContent="CONNECTING...";
+  }
+}
+
+function scheduleReconnect(){
+  if(_reconnectTimer) return;             // never stack reconnect timers
+  setConnState("reconnecting");
+  _reconnectTimer = setTimeout(()=>{ _reconnectTimer=null; connect(); }, _backoff);
+  _backoff = Math.min(_backoff*1.5, 15000); // capped exponential backoff
+}
+
 function connect() {
+  // Tear down any existing connection first — prevents stacked EventSources (the root
+  // cause of the flapping "connecting..." — native reconnect + manual reconnect dueling).
+  if(_es){ try{ _es.onopen=_es.onerror=_es.onmessage=null; _es.close(); }catch(_){} _es=null; }
+  if(_reconnectTimer){ clearTimeout(_reconnectTimer); _reconnectTimer=null; }
+
+  setConnState(_connected?"reconnecting":"connecting");
   const es = new EventSource(SERVER+"/events");
+  _es = es;
+
+  es.onopen = () => { _connected=true; _backoff=1500; setConnState("connected"); };
 
   es.onmessage = e => {
     try {
@@ -990,14 +1031,7 @@ function connect() {
         sessionPnL = parseFloat(ev.sessionPnL)||0;
         dailyLoss  = parseFloat(ev.dailyLoss)||0;
 
-        // Connection established
-        document.getElementById("conn-pip").style.background   = C.bull;
-        document.getElementById("conn-pip").style.boxShadow    = "0 0 6px "+C.bull;
-        document.getElementById("conn-text").style.color       = C.bull;
-        document.getElementById("conn-text").textContent       = "CONNECTED";
-        document.getElementById("conn-status").style.background= C.bull+"0f";
-        document.getElementById("conn-status").style.border    = "1px solid "+C.bull+"25";
-
+        _connected=true; _backoff=1500; setConnState("connected");
         renderSignals();
         renderLogs();
         updateStats();
@@ -1063,16 +1097,48 @@ function connect() {
         if (currentTab==="settings") renderSettingsForm(ev.settings||{});
       }
 
+      else if (ev.type==="health") {
+        renderHealthBanner(ev);
+      }
+
     } catch(_) {}
   };
 
   es.onerror = () => {
-    document.getElementById("conn-pip").style.background   = C.yellow;
-    document.getElementById("conn-text").style.color       = C.yellow;
-    document.getElementById("conn-text").textContent       = "RECONNECTING...";
-    es.close();
-    setTimeout(connect, 3000);
+    // Close this (dead/erroring) connection and schedule exactly one backed-off reconnect.
+    // Do NOT let the browser's native EventSource reconnect run alongside ours.
+    try{ es.onopen=es.onerror=es.onmessage=null; es.close(); }catch(_){}
+    if(_es===es) _es=null;
+    scheduleReconnect();
   };
+}
+
+// Reconnect immediately when the tab regains focus — mobile/laptop sleep suspends SSE and
+// leaves it stuck on "reconnecting" until a slow retry; this snaps it back instantly.
+document.addEventListener("visibilitychange", ()=>{
+  if(document.visibilityState==="visible" && (!_es || _es.readyState===2)){
+    _backoff=1500; if(_reconnectTimer){clearTimeout(_reconnectTimer);_reconnectTimer=null;} connect();
+  }
+});
+
+// ── Classifier health banner ───────────────────────────────────────────────────
+function renderHealthBanner(h){
+  const el=document.getElementById("health-banner");
+  if(!el||!h) return;
+  const st=h.status||(h.classifierHealth&&h.classifierHealth.status);
+  const hh=h.classifierHealth||h;
+  if(!st || st==="OK"){ el.style.display="none"; return; }
+  el.style.display="block";
+  if(st==="FAILED"){
+    el.style.background="#c0263a";
+    el.innerHTML="⚠ GEX CLASSIFIER FAILED — "+(hh.reason||"GEX unavailable")+
+      ". Market-mode detection is BLIND; entries fall back to fail-closed. Check FlashAlpha quota."+
+      (hh.quotaBlocked?" [QUOTA EXHAUSTED]":"");
+  } else { // DEGRADED
+    el.style.background="#b8860b";
+    el.innerHTML="⚠ GEX CLASSIFIER DEGRADED — "+(hh.reason||"GEX stale")+
+      ". Regime may be outdated.";
+  }
 }
 
 // ── Load status for config ─────────────────────────────────────────────────────
@@ -1094,6 +1160,7 @@ async function loadStatus() {
       if (el) el.textContent = tp1Config;
     }
     if (s.signalMode) signalMode = s.signalMode;
+    if (s.classifierHealth) renderHealthBanner(s.classifierHealth);
     if (s.tradesDay) document.getElementById("cfg-trades").textContent = s.tradesDay;
     if (s.SIGNAL_SCAN_MINS) { const el=document.getElementById("cfg-scan"); if(el) el.textContent="Every "+s.SIGNAL_SCAN_MINS+" min"; }
     if (s.GEX_REFRESH_MINS) { const el=document.getElementById("cfg-gexrefresh"); if(el) el.textContent="Every "+s.GEX_REFRESH_MINS+" min"; }
@@ -1114,6 +1181,7 @@ document.addEventListener("DOMContentLoaded", () => {
   loadStatus();
   loadJournal();
   connect();
+  setInterval(loadStatus, 20000);   // keep FA meter + classifier health banner current
   setInterval(loadJournal, 60000);
   setInterval(()=>{
     document.getElementById("clock").textContent =
