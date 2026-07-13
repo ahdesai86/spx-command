@@ -740,16 +740,37 @@ function evaluateSignal(ind) {
 const OPTIONS_FEED = process.env.OPTIONS_FEED || "opra";
 let fullChainCache = null;
 
-async function faGet(endpoint) {
+async function faGet(endpoint, attempt=1) {
   if (!FLASHALPHA_KEY) return null;
   const url = FLASHALPHA_BASE + endpoint;
-  const r = await fetch(url, { headers: { "X-Api-Key": FLASHALPHA_KEY, "Accept": "application/json" } });
-  if (!r.ok) {
-    const txt = await r.text();
-    log("FA ERR", "GET " + endpoint + " " + r.status + ": " + txt.slice(0, 200));
+  const MAX_ATTEMPTS = 2;
+  try {
+    const r = await fetch(url, {
+      headers: { "X-Api-Key": FLASHALPHA_KEY, "Accept": "application/json" },
+      signal: AbortSignal.timeout(8000),  // don't hang a whole scan on a slow FA call
+    });
+    if (!r.ok) {
+      const txt = await r.text();
+      // Retry transient server/rate-limit errors once; 4xx (except 429) won't fix on retry
+      if ((r.status >= 500 || r.status === 429) && attempt < MAX_ATTEMPTS) {
+        log("FA ERR", "GET " + endpoint + " " + r.status + " — retrying");
+        await new Promise(res => setTimeout(res, 600));
+        return faGet(endpoint, attempt+1);
+      }
+      log("FA ERR", "GET " + endpoint + " " + r.status + ": " + txt.slice(0, 200));
+      return null;
+    }
+    return r.json();
+  } catch (e) {
+    // Network/timeout — retry once before giving up
+    if (attempt < MAX_ATTEMPTS) {
+      log("FA ERR", "GET " + endpoint + " " + e.message + " — retrying");
+      await new Promise(res => setTimeout(res, 600));
+      return faGet(endpoint, attempt+1);
+    }
+    log("FA ERR", "GET " + endpoint + " failed after "+attempt+" attempts: " + e.message);
     return null;
   }
-  return r.json();
 }
 
 // ── FlashAlpha-powered GEX + exposure analytics ──────────────────────────────
@@ -1957,7 +1978,7 @@ app.options("*",cors());
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"11.18-intraday-mode-reclassify",status:"running",
+  service:"SPX COMMAND",version:"11.18.1-flashalpha-retry-timeout",status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,marketMode:MARKET_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -2268,7 +2289,7 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"11.18-intraday-mode-reclassify", mode:IS_PAPER?"PAPER":"LIVE",
+    version:"11.18.1-flashalpha-retry-timeout", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, marketMode:MARKET_MODE, marketScore, marketModeAuto:MARKET_MODE_AUTO,
     noTradingView:true,
     exitStrategy:"price-monitor + DELETE /v2/positions",
