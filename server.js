@@ -109,6 +109,8 @@ const SETTINGS_SCHEMA = {
   DIRECTION_COOLDOWN_MINS:{ type:"number",min:5,   max:240, integer:true, set:v=>DIRECTION_COOLDOWN_MINS=v },
   MARKET_MODE_AUTO:      { type:"enum",   values:["ON","OFF"], set:v=>MARKET_MODE_AUTO=v },
   MARKET_MODE_OVERRIDE:  { type:"enum",   values:["","TREND","NEUTRAL","CHOP"], set:v=>MARKET_MODE_OVERRIDE=v },
+  SIGNAL_SCAN_MINS:      { type:"number", min:5, max:30, integer:true, set:v=>SIGNAL_SCAN_MINS=snapTo5(v) },
+  GEX_REFRESH_MINS:      { type:"number", min:5, max:30, integer:true, set:v=>GEX_REFRESH_MINS=snapTo5(v) },
 };
 
 function getSettingsSnapshot(){
@@ -121,6 +123,7 @@ function getSettingsSnapshot(){
     RSI_LONG_MAX, RSI_SHORT_MIN,
     DIRECTION_COOLDOWN, DIRECTION_COOLDOWN_MINS,
     MARKET_MODE_AUTO, MARKET_MODE_OVERRIDE,
+    SIGNAL_SCAN_MINS, GEX_REFRESH_MINS,
   };
 }
 
@@ -157,10 +160,14 @@ let lastVwap        = null;   // most recent session VWAP (for classifier pin-fl
 let scanActive      = false;
 let tradesDay       = 0;
 const MAX_LOGS      = 500;
-// Scheduled GEX refreshes — every 15 min during RTH. 26 slots x 5 endpoints = ~130 FA
-// calls/day, comfortably inside the 2500/day quota (was blown 2026-07-13 by a per-scan
-// refresh + retry-doubling, not by the schedule). 15-min freshness is ample for flip/wall.
-const GEX_SCHEDULE  = (()=>{ const s=[]; for(let t=9*60+25; t<=15*60+45; t+=15) s.push({h:Math.floor(t/60), m:t%60}); return s; })();
+// Two independent, live-tunable cadences (minutes), both default 5. Signal scan drives
+// entry evaluation (aligned to 5-min bars); GEX refresh drives FlashAlpha calls. Kept
+// separate so quota headroom and entry precision don't trade off against each other.
+// At 5-min GEX during RTH that's ~77 slots x 5 endpoints = ~385 FA calls/day (15% of the
+// 2500/day quota) — slow GEX to 10/15 from Settings if you want more headroom.
+let SIGNAL_SCAN_MINS = parseInt(process.env.SIGNAL_SCAN_MINS || "5");
+let GEX_REFRESH_MINS = parseInt(process.env.GEX_REFRESH_MINS || "5");
+const snapTo5 = v => Math.max(5, Math.min(30, Math.round(v/5)*5)); // keep aligned to 5-min bars
 let faLevelsCache   = null;
 let faZeroDteCache  = null;
 // Market mode classifier state
@@ -2011,7 +2018,7 @@ app.options("*",cors());
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"11.19-fa-quota-guard",status:"running",
+  service:"SPX COMMAND",version:"11.20-configurable-cadences",status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,marketMode:MARKET_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -2322,8 +2329,9 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"11.19-fa-quota-guard", mode:IS_PAPER?"PAPER":"LIVE",
+    version:"11.20-configurable-cadences", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, marketMode:MARKET_MODE, marketScore, marketModeAuto:MARKET_MODE_AUTO,
+    SIGNAL_SCAN_MINS, GEX_REFRESH_MINS,
     noTradingView:true,
     exitStrategy:"price-monitor + DELETE /v2/positions",
     riskBudget:"$"+getRiskBudget(),
@@ -2357,7 +2365,7 @@ setInterval(async()=>{
     if(!isWeekday(now)) return;
     const h=now.getHours(),m=now.getMinutes();
     // 5-min bars close at :00, :05, :10, :15, :20, :25, :30, :35, :40, :45, :50, :55
-    if(m%5===0){
+    if(m % SIGNAL_SCAN_MINS === 0){
       await runSignalEngine();
     }
     // Reset daily counters at market open and refresh daily EMA seed with yesterday's close
@@ -2383,9 +2391,9 @@ setInterval(async()=>{
     const today=now.toLocaleDateString("en-CA");
     if(!((h>9||(h===9&&m>=25))&&h<16)) return;
     const key=today+"_"+h+"_"+m;
-    if(GEX_SCHEDULE.some(s=>s.h===h&&s.m===m)&&!gexFired.has(key)){
+    if(m % GEX_REFRESH_MINS === 0 && !gexFired.has(key)){
       gexFired.add(key);
-      log("GEX","Scheduled refresh "+String(h).padStart(2,"0")+":"+String(m).padStart(2,"0"));
+      log("GEX","Scheduled refresh "+String(h).padStart(2,"0")+":"+String(m).padStart(2,"0")+" (every "+GEX_REFRESH_MINS+"m)");
       await getGEX(true);
     }
   } catch(e) { console.error("[SCHEDULER ERR] GEX tick:", e.message); }

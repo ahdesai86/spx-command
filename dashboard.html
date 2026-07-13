@@ -255,7 +255,9 @@
         <div style="color:#7a9db8;font-size:13px;letter-spacing:2px;margin-bottom:8px">SIGNAL ENGINE</div>
         <div class="cfg-row"><span class="cfg-k">Mode</span><span id="cfg-mode" class="cfg-v" style="color:#f5c842">—</span></div>
         <div class="cfg-row"><span class="cfg-k">ORB</span><span class="cfg-v">15 min (9:30–9:45)</span></div>
-        <div class="cfg-row"><span class="cfg-k">Scan</span><span class="cfg-v">Every 5-min bar close</span></div>
+        <div class="cfg-row"><span class="cfg-k">Scan</span><span id="cfg-scan" class="cfg-v">—</span></div>
+        <div class="cfg-row"><span class="cfg-k">GEX Refresh</span><span id="cfg-gexrefresh" class="cfg-v">—</span></div>
+        <div class="cfg-row"><span class="cfg-k">FlashAlpha</span><span id="cfg-faquota" class="cfg-v">—</span></div>
         <div class="cfg-row"><span class="cfg-k">Indicators</span><span class="cfg-v">ORB + VWAP + RSI + EMA</span></div>
         <div class="cfg-row"><span class="cfg-k">Trades/day</span><span id="cfg-trades" class="cfg-v">—</span></div>
         <div class="cfg-row"><span class="cfg-k">TradingView</span><span class="cfg-v" style="color:#2dd4a0">Not required ✓</span></div>
@@ -899,6 +901,8 @@ const SETTINGS_META = {
   DIRECTION_COOLDOWN_MINS:{label:"Direction Cooldown (min)", unit:"min",      step:5,    hint:"How long to block the losing direction after 2 consecutive stops (default 60 min)."},
   MARKET_MODE_AUTO:      {label:"Market Mode Auto",          enum:true,                  hint:"ON: dynamically adjusts RSI thresholds and cooldown based on GEX+gap+ORB signals. OFF: logs classification only (dry-run)."},
   MARKET_MODE_OVERRIDE:  {label:"Market Mode Override",      enum:true,                  hint:"Force a specific mode regardless of classifier. Leave blank for auto-detection. Use TREND/CHOP on known event days."},
+  SIGNAL_SCAN_MINS:      {label:"Signal Scan (min)",         unit:"min",      step:5,    hint:"How often the signal engine evaluates entries. Default 5 (aligned to 5-min bars). Higher = later entries but fewer whipsaws. Snaps to multiples of 5."},
+  GEX_REFRESH_MINS:      {label:"GEX Refresh (min)",         unit:"min",      step:5,    hint:"How often FlashAlpha GEX is refreshed. Default 5 (~385 FA calls/day). Raise to 10/15 for more quota headroom against the 2500/day limit. Snaps to multiples of 5."},
 };
 
 let settingsSchema = {};
@@ -1091,6 +1095,16 @@ async function loadStatus() {
     }
     if (s.signalMode) signalMode = s.signalMode;
     if (s.tradesDay) document.getElementById("cfg-trades").textContent = s.tradesDay;
+    if (s.SIGNAL_SCAN_MINS) { const el=document.getElementById("cfg-scan"); if(el) el.textContent="Every "+s.SIGNAL_SCAN_MINS+" min"; }
+    if (s.GEX_REFRESH_MINS) { const el=document.getElementById("cfg-gexrefresh"); if(el) el.textContent="Every "+s.GEX_REFRESH_MINS+" min"; }
+    if (s.faCallsToday != null) {
+      const el=document.getElementById("cfg-faquota");
+      if(el){
+        const pct = Math.round((s.faCallsToday/(s.faQuotaLimit||2500))*100);
+        el.textContent = s.faCallsToday+" / "+(s.faQuotaLimit||2500)+" ("+pct+"%)"+(s.faQuotaBlocked?" — QUOTA HIT":"");
+        el.style.color = s.faQuotaBlocked ? "#f05b6d" : pct>80 ? "#f5c842" : "#2dd4a0";
+      }
+    }
     updateStats();
   } catch(_){}
 }
