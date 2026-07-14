@@ -2037,7 +2037,7 @@ app.options("*",cors());
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"11.21-sse-resilience-classifier-health",status:"running",
+  service:"SPX COMMAND",version:"11.22-blocked-analysis-endpoint",status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,marketMode:MARKET_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -2138,6 +2138,79 @@ app.get("/db/signals",(req,res)=>{
   const limit=parseInt(req.query.limit||"100");
   const rows=loadDB("signals").reverse().slice(0,limit);
   res.json({count:rows.length,signals:rows});
+});
+
+// Blocked-signal outcome analysis — are our entry guards blocking would-be winners?
+// For each blocked directional signal, replay the same-day SPY path forward and check
+// whether price moved far enough in the signal's direction (a "would-win") before moving
+// against it by a stop-equivalent, grouped by which guard blocked it. PROXY: SPY-move
+// stand-in for option P&L (no historical premiums), sampled at scan cadence — relative
+// screen, not a backtest. Mirrors scripts/blocked-analysis.js.
+function analyzeBlockedSignals(signals, {win=1.2, stop=0.5, windowMin=45, days=14}={}){
+  const categorize = (reason="")=>{
+    const r=reason.toLowerCase();
+    if(/no orb breakout|no rsi|no vwap/.test(r)) return null;
+    if(/pinned to gamma flip/.test(r)) return "VWAP-on-flip pin";
+    if(/within \$0\.50 of gamma flip|regime indetermin/.test(r)) return "Gamma-flip proximity";
+    if(/pin risk/.test(r)) return "Pin-risk score";
+    if(/magnet/.test(r)) return "0DTE magnet proximity";
+    if(/dex bullish|dex bearish|conflicts with/.test(r)) return "DEX direction (RETIRED)";
+    if(/wall|upside target|downside target/.test(r)) return "Wall target / no room";
+    if(/no gex cache|fail-closed/.test(r)) return "Fail-closed (no GEX)";
+    if(/weekend|holiday/.test(r)) return "Weekend/holiday block";
+    if(/chex/.test(r)) return "CHEX EOD filter";
+    if(/cooldown/.test(r)) return "Direction cooldown";
+    if(/max .*trades|trades\/day/.test(r)) return "Max trades/day";
+    if(/daily loss/.test(r)) return "Daily loss limit";
+    if(/rsi .*\[mode:/.test(r)){ const m=r.match(/\[mode:(\w+)/); return "RSI reject ("+(m?m[1].toUpperCase():"?")+")"; }
+    if(/rsi/.test(r)) return "RSI reject";
+    return "Other";
+  };
+  const outcome=(dir,entryPx,path,idx)=>{
+    const endT=new Date(path[idx].ts).getTime()+windowMin*60000;
+    let mfe=0,mae=0;
+    for(let j=idx+1;j<path.length;j++){
+      if(new Date(path[j].ts).getTime()>endT) break;
+      const move=path[j].px-entryPx, fav=dir==="LONG"?move:-move, adv=-fav;
+      if(fav>mfe)mfe=fav; if(adv>mae)mae=adv;
+      if(fav>=win) return {verdict:"win",mfe,mae};
+      if(adv>=stop) return {verdict:"loss",mfe,mae};
+    }
+    return {verdict:"neutral",mfe,mae};
+  };
+  const byDay={}; for(const s of signals){ (byDay[s.date] ||= []).push(s); }
+  const dayKeys=Object.keys(byDay).sort().slice(-days);
+  const cats={}; let analyzed=0;
+  for(const day of dayKeys){
+    const rows=byDay[day].filter(r=>r.spy_price!=null).sort((a,b)=>new Date(a.timestamp)-new Date(b.timestamp));
+    const path=rows.map(r=>({ts:r.timestamp,px:r.spy_price}));
+    rows.forEach((r,i)=>{
+      if(r.fired) return;
+      if(r.direction!=="LONG"&&r.direction!=="SHORT") return;
+      const cat=categorize(r.blocked_reason); if(!cat) return;
+      const o=outcome(r.direction,r.spy_price,path,i);
+      const c=(cats[cat] ||= {n:0,win:0,loss:0,neutral:0,mfeSum:0,maeSum:0});
+      c.n++; c[o.verdict]++; c.mfeSum+=o.mfe; c.maeSum+=o.mae; analyzed++;
+    });
+  }
+  const table=Object.entries(cats).sort((a,b)=>b[1].n-a[1].n).map(([cat,c])=>({
+    guard:cat, n:c.n,
+    wouldWinPct:Math.round(c.win/c.n*100), wouldLossPct:Math.round(c.loss/c.n*100),
+    neutralPct:Math.round(c.neutral/c.n*100),
+    avgMFE:+(c.mfeSum/c.n).toFixed(2), avgMAE:+(c.maeSum/c.n).toFixed(2),
+  }));
+  return { params:{win,stop,windowMin,days}, daysCovered:dayKeys, analyzed, table,
+    note:"high wouldWinPct = guard blocked winners (too conservative); high wouldLossPct = correctly filtered losers. SPY-move proxy, scan-cadence sampled." };
+}
+
+app.get("/db/blocked-analysis",(req,res)=>{
+  const opts={
+    win:      parseFloat(req.query.win    ?? "1.2"),
+    stop:     parseFloat(req.query.stop   ?? "0.5"),
+    windowMin:parseInt  (req.query.window ?? "45"),
+    days:     parseInt  (req.query.days   ?? "14"),
+  };
+  res.json(analyzeBlockedSignals(loadDB("signals"), opts));
 });
 
 app.get("/db/gex",(req,res)=>{
@@ -2353,7 +2426,7 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"11.21-sse-resilience-classifier-health", mode:IS_PAPER?"PAPER":"LIVE",
+    version:"11.22-blocked-analysis-endpoint", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, marketMode:MARKET_MODE, marketScore, marketModeAuto:MARKET_MODE_AUTO,
     SIGNAL_SCAN_MINS, GEX_REFRESH_MINS,
     noTradingView:true,
