@@ -110,9 +110,43 @@ async function getAccessToken() {
     } catch (e) { console.log("Refresh failed (" + e.message + ") — doing full login.\n"); }
   }
   // Full 3-legged OAuth via loopback callback
-  const authUrl = BASE + "/v1/oauth/authorize?client_id=" + encodeURIComponent(APP_KEY) +
+  const authUrl = BASE + "/v1/oauth/authorize?response_type=code&client_id=" + encodeURIComponent(APP_KEY) +
                   "&redirect_uri=" + encodeURIComponent(REDIRECT);
-  console.log("\n1. Open this URL in your browser and log in to Schwab:\n\n   " + authUrl + "\n");
+
+  // Pre-flight: ask Schwab what it thinks of this app key BEFORE sending you to a browser.
+  // A 4xx here means the problem is the app/key/callback — not anything you did in the browser.
+  console.log("\nPre-flight: checking your app key against Schwab...");
+  try {
+    const pf = await fetch(authUrl, { redirect: "manual" });
+    const loc = pf.headers.get("location") || "";
+    console.log("  HTTP " + pf.status + (loc ? "  ->  " + loc.slice(0, 110) : ""));
+    if (pf.status >= 400) {
+      const body = await pf.text();
+      console.log("\n  Schwab REJECTED the authorize request. Response:\n  " + body.slice(0, 500).replace(/\n/g, "\n  "));
+      console.log("\n  This is an app/credential problem, not a browser problem. Check:");
+      console.log("   * App status is 'Ready For Use' in developer.schwab.com (most common cause)");
+      console.log("   * SCHWAB_APP_KEY is the App Key / Client ID (not the Secret)");
+      console.log("   * Portal Callback URL matches EXACTLY: " + REDIRECT);
+      throw new Error("Authorize endpoint returned " + pf.status + " — fix the app config above, then re-run.");
+    }
+    if (loc && /error/i.test(loc)) {
+      console.log("\n  Schwab redirected to an error: " + loc);
+      throw new Error("Authorize returned an error redirect — see above.");
+    }
+    console.log("  Looks OK — Schwab accepted the app key.\n");
+  } catch (e) {
+    if (/Authorize endpoint returned|error redirect/.test(e.message)) throw e;
+    console.log("  (pre-flight inconclusive: " + e.message + " — continuing anyway)\n");
+  }
+
+  // Auto-open the browser so a mangled terminal copy-paste can't be the problem
+  try {
+    require("child_process").execSync("open " + JSON.stringify(authUrl), { stdio: "ignore" });
+    console.log("1. Opened the Schwab login page in your browser.");
+    console.log("   (If nothing opened, paste this URL manually — it is ONE line:)\n\n" + authUrl + "\n");
+  } catch {
+    console.log("\n1. Open this URL in your browser and log in to Schwab (it is ONE line):\n\n" + authUrl + "\n");
+  }
   console.log("2. Approve the account link. Your browser will then try to load\n   " + REDIRECT +
               "/?code=...  and show a CONNECTION ERROR. That is expected and fine —\n   nothing is listening on that port.\n");
   console.log("3. Copy the ENTIRE URL from the browser address bar and paste it below.\n   Do this promptly — the code expires in ~30 seconds.\n");
