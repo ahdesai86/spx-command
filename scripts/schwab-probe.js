@@ -22,9 +22,11 @@ const fs = require("fs");
 const path = require("path");
 const readline = require("readline");
 
-const APP_KEY    = process.env.SCHWAB_APP_KEY || "";
-const APP_SECRET = process.env.SCHWAB_APP_SECRET || "";
-const REDIRECT   = process.env.SCHWAB_REDIRECT_URI || "https://127.0.0.1:8182";
+// .trim() matters: copying from the Schwab portal often drags in a trailing newline or
+// space, which produces an indistinguishable invalid_client 401.
+const APP_KEY    = (process.env.SCHWAB_APP_KEY || "").trim();
+const APP_SECRET = (process.env.SCHWAB_APP_SECRET || "").trim();
+const REDIRECT   = (process.env.SCHWAB_REDIRECT_URI || "https://127.0.0.1:8182").trim();
 const BASE       = "https://api.schwabapi.com";
 const TOKENS     = path.join(__dirname, ".schwab_tokens.json");
 
