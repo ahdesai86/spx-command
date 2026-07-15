@@ -36,6 +36,53 @@ const ask = q => new Promise(r => {
 const loadTokens = () => { try { return JSON.parse(fs.readFileSync(TOKENS, "utf8")); } catch { return null; } };
 const saveTokens = t => fs.writeFileSync(TOKENS, JSON.stringify({ ...t, saved_at: Date.now() }, null, 2));
 
+/**
+ * Pull the auth code out of whatever the user pasted. Accepts a full redirect URL, a
+ * URL with params in the fragment, or a bare code string. On failure it prints exactly
+ * what WAS found, so we can diagnose instead of guess.
+ */
+function extractCode(pasted) {
+  let s = (pasted || "").trim().replace(/^['"]|['"]$/g, "");
+  if (!s) throw new Error("Nothing pasted.");
+
+  // Bare code (no scheme) — Schwab codes are long and contain no spaces
+  if (!/^https?:\/\//i.test(s)) {
+    if (s.length > 20 && !/\s/.test(s)) { console.log("(accepted as a bare code)"); return s; }
+    throw new Error(
+      "That is neither a URL nor a code.\n" +
+      "  You pasted: " + s.slice(0, 120) + "\n" +
+      "  Expected something like: https://127.0.0.1:8182/?code=XXXX&session=YYYY");
+  }
+
+  let u;
+  try { u = new URL(s); }
+  catch (e) { throw new Error("URL parse failed: " + e.message + "\n  You pasted: " + s.slice(0, 160)); }
+
+  const q = Object.fromEntries(u.searchParams.entries());
+  const frag = u.hash.startsWith("#")
+    ? Object.fromEntries(new URLSearchParams(u.hash.slice(1)).entries()) : {};
+  const code = q.code || frag.code;
+  if (code) return code;
+
+  // No code — report precisely what came back
+  const lines = ["No ?code= in that URL.", "  host : " + u.host, "  path : " + u.pathname];
+  lines.push("  query params : " + (Object.keys(q).length ? JSON.stringify(q) : "(none)"));
+  if (Object.keys(frag).length) lines.push("  fragment params : " + JSON.stringify(frag));
+  if (q.error || frag.error) {
+    lines.push("", "  >>> Schwab returned an ERROR: " + (q.error || frag.error));
+    if (q.error_description || frag.error_description)
+      lines.push("      " + (q.error_description || frag.error_description));
+  }
+  lines.push("", "Most likely causes:");
+  if (u.host.includes("schwab") || u.pathname.includes("authorize"))
+    lines.push("  * You pasted the LOGIN url, not the redirect. Complete the login first,");
+    lines.push("    then copy the URL the browser lands on (it starts with " + REDIRECT + ").");
+  lines.push("  * The login/consent didn't finish — you must click through to the account approval.");
+  lines.push("  * App is not in 'Ready For Use' status in the Schwab developer portal.");
+  lines.push("  * Callback URL in the portal doesn't exactly match: " + REDIRECT);
+  throw new Error(lines.join("\n"));
+}
+
 async function postToken(params) {
   const r = await fetch(BASE + "/v1/oauth/token", {
     method: "POST",
@@ -69,11 +116,8 @@ async function getAccessToken() {
   console.log("2. Approve the account link. Your browser will then try to load\n   " + REDIRECT +
               "/?code=...  and show a CONNECTION ERROR. That is expected and fine —\n   nothing is listening on that port.\n");
   console.log("3. Copy the ENTIRE URL from the browser address bar and paste it below.\n   Do this promptly — the code expires in ~30 seconds.\n");
-  const pasted = await ask("Paste the full redirect URL here: ");
-  let code;
-  try { code = new URL(pasted).searchParams.get("code"); }   // handles URL-decoding for us
-  catch { throw new Error("That doesn't look like a URL. Paste the whole https://127.0.0.1:8182/?code=... string."); }
-  if (!code) throw new Error("No ?code= found in that URL.");
+  const pasted = await ask("Paste the full redirect URL (or just the code) here: ");
+  const code = extractCode(pasted);
   const t2 = await postToken({ grant_type: "authorization_code", code, redirect_uri: REDIRECT });
   saveTokens(t2);
   console.log("\nTokens saved to scripts/.schwab_tokens.json (refresh token valid ~7 days).\n");
