@@ -2037,7 +2037,7 @@ app.options("*",cors());
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"11.22-blocked-analysis-endpoint",status:"running",
+  service:"SPX COMMAND",version:"11.23-schwab-readonly-probe",status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,marketMode:MARKET_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -2212,6 +2212,137 @@ app.get("/db/blocked-analysis",(req,res)=>{
   };
   res.json(analyzeBlockedSignals(loadDB("signals"), opts));
 });
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TEMPORARY — Schwab READ-ONLY capability probe. DELETE once the question is answered.
+//
+// Purpose: verify with a REAL API response that Schwab actually returns populated
+// greeks + openInterest FOR 0DTE contracts, BEFORE building any integration. A prior
+// unverified "this will give us greeks" recommendation cost the user $99 on Alpaca.
+//
+// HARD RULE: /marketdata/* endpoints ONLY. Never /trader/*, never order placement.
+// This probe cannot place a trade — it has no code path to one.
+// ══════════════════════════════════════════════════════════════════════════════
+const SCHWAB_APP_KEY    = process.env.SCHWAB_APP_KEY || "";
+const SCHWAB_APP_SECRET = process.env.SCHWAB_APP_SECRET || "";
+const SCHWAB_REDIRECT   = process.env.SCHWAB_REDIRECT_URI || "";
+const SCHWAB_BASE       = "https://api.schwabapi.com";
+const SCHWAB_TOKEN_FILE = path.join(DB_DIR, "schwab_tokens.json");
+
+function schwabBasic(){ return Buffer.from(SCHWAB_APP_KEY+":"+SCHWAB_APP_SECRET).toString("base64"); }
+function schwabLoadTokens(){ try{ return JSON.parse(fs.readFileSync(SCHWAB_TOKEN_FILE,"utf8")); }catch(_){ return null; } }
+function schwabSaveTokens(t){
+  try{ fs.writeFileSync(SCHWAB_TOKEN_FILE, JSON.stringify({...t, saved_at:Date.now()})); }
+  catch(e){ log("SCHWAB ERR","saveTokens: "+e.message); }
+}
+
+// Returns a valid access token, refreshing if the 30-min one has expired.
+async function schwabAccessToken(){
+  const t = schwabLoadTokens();
+  if(!t || !t.refresh_token) return null;
+  const ageSec = (Date.now() - (t.saved_at||0))/1000;
+  if(t.access_token && ageSec < (t.expires_in||1800) - 120) return t.access_token;
+  try{
+    const r = await fetch(SCHWAB_BASE+"/v1/oauth/token",{
+      method:"POST",
+      headers:{ "Authorization":"Basic "+schwabBasic(), "Content-Type":"application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ grant_type:"refresh_token", refresh_token:t.refresh_token }),
+    });
+    const txt = await r.text();
+    if(!r.ok){ log("SCHWAB ERR","refresh "+r.status+": "+txt.slice(0,200)); return null; }
+    const nt = JSON.parse(txt);
+    schwabSaveTokens({ ...t, ...nt });
+    log("SCHWAB","Access token refreshed");
+    return nt.access_token;
+  }catch(e){ log("SCHWAB ERR","refresh: "+e.message); return null; }
+}
+
+// Step 1 — start OAuth: sends you to Schwab's login/consent page.
+app.get("/schwab/auth",(req,res)=>{
+  if(!SCHWAB_APP_KEY || !SCHWAB_REDIRECT)
+    return res.status(400).type("text/plain").send(
+      "Missing env vars. Set in Railway:\n  SCHWAB_APP_KEY\n  SCHWAB_APP_SECRET\n  SCHWAB_REDIRECT_URI"+
+      "\n\nSCHWAB_REDIRECT_URI must EXACTLY match the Callback URL registered in your Schwab dev portal app.");
+  const url = SCHWAB_BASE+"/v1/oauth/authorize"
+    + "?client_id="+encodeURIComponent(SCHWAB_APP_KEY)
+    + "&redirect_uri="+encodeURIComponent(SCHWAB_REDIRECT);
+  log("SCHWAB","Auth flow started");
+  res.redirect(url);
+});
+
+// Step 2 — Schwab redirects back here with ?code=. Exchange it immediately (codes
+// expire in ~30s), then persist tokens to the Railway volume.
+app.get("/schwab/callback", async (req,res)=>{
+  const code = req.query.code;
+  if(!code) return res.status(400).type("text/plain").send("No ?code in callback.\nGot: "+JSON.stringify(req.query));
+  try{
+    const r = await fetch(SCHWAB_BASE+"/v1/oauth/token",{
+      method:"POST",
+      headers:{ "Authorization":"Basic "+schwabBasic(), "Content-Type":"application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ grant_type:"authorization_code", code, redirect_uri:SCHWAB_REDIRECT }),
+    });
+    const txt = await r.text();
+    if(!r.ok){
+      log("SCHWAB ERR","token exchange "+r.status+": "+txt.slice(0,300));
+      return res.status(500).type("text/plain").send("Token exchange FAILED "+r.status+"\n\n"+txt.slice(0,800)+
+        "\n\nCommon causes:\n - SCHWAB_REDIRECT_URI does not exactly match the portal Callback URL\n - App not in 'Ready For Use' status\n - Code expired (retry /schwab/auth, it must complete in ~30s)");
+    }
+    schwabSaveTokens(JSON.parse(txt));
+    log("SCHWAB","Tokens obtained and saved");
+    res.type("text/html").send("<h2>Schwab connected.</h2><p>Now open <a href='/schwab/probe'>/schwab/probe</a> to dump 0DTE greeks + open interest.</p>");
+  }catch(e){ res.status(500).type("text/plain").send("callback error: "+e.message); }
+});
+
+// Step 3 — the actual question: does Schwab return populated greeks + OI for 0DTE?
+app.get("/schwab/probe", async (req,res)=>{
+  const tok = await schwabAccessToken();
+  if(!tok) return res.status(400).type("text/plain").send("No Schwab token. Visit /schwab/auth first (or refresh token expired — 7 day limit).");
+  const today = new Date().toLocaleDateString("en-CA",{timeZone:"America/New_York"});
+  const date  = req.query.date || today;   // ?date=YYYY-MM-DD to probe a different expiry
+  const url = SCHWAB_BASE+"/marketdata/v1/chains?symbol=SPY&contractType=ALL&strikeCount=6"
+            + "&includeUnderlyingQuote=true&fromDate="+date+"&toDate="+date;
+  try{
+    const r = await fetch(url,{ headers:{ Authorization:"Bearer "+tok } });
+    const txt = await r.text();
+    if(!r.ok) return res.status(r.status).type("text/plain").send("Chain fetch "+r.status+"\n\n"+txt.slice(0,900));
+    const j = JSON.parse(txt);
+
+    // Walk callExpDateMap/putExpDateMap → flat contract list
+    const contracts = [];
+    for(const mapName of ["callExpDateMap","putExpDateMap"]){
+      const m = j[mapName] || {};
+      for(const exp of Object.keys(m))
+        for(const strike of Object.keys(m[exp]))
+          for(const c of m[exp][strike]) contracts.push({exp, strike:parseFloat(strike), ...c});
+    }
+    // Schwab uses -999.0 as a sentinel for "greek not available"
+    const isNum = v => typeof v==="number" && isFinite(v) && v !== -999 && v !== -999.0;
+    const withGreeks = contracts.filter(c=>isNum(c.delta)&&isNum(c.gamma));
+    const withOI     = contracts.filter(c=>typeof c.openInterest==="number" && c.openInterest>0);
+
+    const sample = contracts.slice(0,6).map(c=>({
+      symbol:c.symbol, type:c.putCall, strike:c.strike, exp:c.exp,
+      bid:c.bid, ask:c.ask,
+      delta:c.delta, gamma:c.gamma, theta:c.theta, vega:c.vega,
+      iv:c.volatility, openInterest:c.openInterest,
+    }));
+
+    const verdict = {
+      GREEKS: withGreeks.length ? "PRESENT ("+withGreeks.length+"/"+contracts.length+" contracts)" : "MISSING — Schwab returns no usable delta/gamma for this expiry",
+      OPEN_INTEREST: withOI.length ? "PRESENT ("+withOI.length+"/"+contracts.length+" contracts)" : "MISSING",
+      UNDERLYING_QUOTE: j.underlying ? "PRESENT" : "MISSING",
+      VERDICT: (withGreeks.length && withOI.length)
+        ? "GO — Schwab delivers greeks + OI for "+date+". Integration is worth building."
+        : "NO-GO — the gap Schwab was supposed to fill is not filled for "+date+". Do not build; consider local Black-Scholes instead.",
+    };
+    log("SCHWAB","Probe "+date+" — greeks:"+withGreeks.length+"/"+contracts.length+" OI:"+withOI.length+"/"+contracts.length);
+    res.json({ probedExpiry:date, contractsReturned:contracts.length, verdict,
+      underlyingLast: j.underlying?.last ?? null,
+      sample,
+      note:"Schwab uses -999.0 as a sentinel for unavailable greeks; those are counted as MISSING. Add ?date=YYYY-MM-DD to probe another expiry (e.g. compare 0DTE vs a weekly)." });
+  }catch(e){ res.status(500).type("text/plain").send("probe error: "+e.message); }
+});
+// ══════════════════ END TEMPORARY Schwab probe ═══════════════════════════════
 
 app.get("/db/gex",(req,res)=>{
   const rows=loadDB("gex_snapshots").reverse().slice(0,50);
@@ -2426,7 +2557,7 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"11.22-blocked-analysis-endpoint", mode:IS_PAPER?"PAPER":"LIVE",
+    version:"11.23-schwab-readonly-probe", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, marketMode:MARKET_MODE, marketScore, marketModeAuto:MARKET_MODE_AUTO,
     SIGNAL_SCAN_MINS, GEX_REFRESH_MINS,
     noTradingView:true,
