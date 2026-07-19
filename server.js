@@ -259,6 +259,21 @@ function saveSignalToDB(sig, indicators, fired, blockedReason) {
       gex_regime:     gexCache?.regime||null,
       gex_flip:       gexCache?.gammaFlip||null,
       nearest_wall:   sig.gexTarget||null,
+      // ── Unified reversal-risk feature vector (LOG-ONLY; scored by /db/blocked-analysis
+      //    segmented by GEX regime). Captures the candidates raised for reversal mitigation:
+      //    Bollinger extension, VWAP extension, and the DEX/VEX/CHEX exposures we weren't
+      //    logging per-signal. None gates a trade until the data proves it on the right regime.
+      percent_b:      indicators.squeeze?.percentB ?? null,
+      bb_upper:       indicators.squeeze?.bbUpper ?? null,
+      bb_lower:       indicators.squeeze?.bbLower ?? null,
+      vwap_dist:      (indicators.vwap!=null && sig.spyEntry!=null) ? parseFloat((sig.spyEntry-indicators.vwap).toFixed(2)) : null,
+      net_gex:        gexCache?.netGex ?? null,
+      dex:            gexCache?.dex ?? null,
+      vex:            gexCache?.vex ?? null,
+      chex:           gexCache?.chex ?? null,
+      dex_pct:        gexCache?.dexPctRank ?? null,
+      vex_pct:        gexCache?.vexPctRank ?? null,
+      chex_pct:       gexCache?.chexPctRank ?? null,
       signal_strength:sig.strength||null,
       signal_mode:    SIGNAL_MODE,
       market_mode:    MARKET_MODE,
@@ -591,7 +606,12 @@ function calcSqueeze(bars) {
   squeezeState.direction = momentum>0 ? "LONG" : momentum<0 ? "SHORT" : null;
   squeezeState.momentum  = momentum;
   if (fired) log("SQUEEZE","Fired "+squeezeState.direction+" — momentum "+momentum+" after "+(squeezeState.barsOn||"?")+" bars of compression");
-  return { on, barsOn:squeezeState.barsOn, fired:squeezeState.fired, direction:squeezeState.direction, momentum };
+  // %B = position within the Bollinger Bands: >1 above upper (extended long), <0 below
+  // lower (extended short). Volatility-normalized extension — a reversal-risk candidate.
+  const lastPx = closes[P-1];
+  const percentB = bbU>bbL ? parseFloat(((lastPx-bbL)/(bbU-bbL)).toFixed(3)) : null;
+  return { on, barsOn:squeezeState.barsOn, fired:squeezeState.fired, direction:squeezeState.direction, momentum,
+           bbUpper:parseFloat(bbU.toFixed(2)), bbLower:parseFloat(bbL.toFixed(2)), percentB };
 }
 
 /**
@@ -2048,12 +2068,54 @@ async function checkAccount(){
 
 // ── Express ───────────────────────────────────────────────────────────────────
 const app=express();
-app.use(cors({origin:"*",methods:["GET","POST","DELETE","OPTIONS"],allowedHeaders:["Content-Type"]}));
+app.set("trust proxy", true); // Railway is behind a proxy — needed for correct client IP in rate limiter
+app.use(cors({origin:"*",methods:["GET","POST","DELETE","OPTIONS"],allowedHeaders:["Content-Type","Authorization"]}));
 app.options("*",cors());
+
+// ── Rate limiting (in-memory, per-IP fixed window; no dependency) ─────────────
+// Protects against public scraping/abuse of the data + control endpoints.
+const DASH_USER = process.env.DASHBOARD_USER || "admin";
+const DASH_PASS = process.env.DASHBOARD_PASS || "";        // unset = OPEN (warned at startup)
+const RATE_MAX  = parseInt(process.env.RATE_LIMIT_PER_MIN || "120"); // requests/IP/min
+const rlBuckets = new Map(); // ip -> { count, resetAt }
+setInterval(()=>{ const now=Date.now(); for(const [ip,b] of rlBuckets) if(b.resetAt<now) rlBuckets.delete(ip); }, 120000).unref?.();
+app.use((req,res,next)=>{
+  const ip = req.ip || req.headers["x-forwarded-for"] || req.socket.remoteAddress || "unknown";
+  const now=Date.now();
+  let b=rlBuckets.get(ip);
+  if(!b || b.resetAt<now){ b={count:0, resetAt:now+60000}; rlBuckets.set(ip,b); }
+  b.count++;
+  if(b.count>RATE_MAX){
+    res.set("Retry-After", Math.ceil((b.resetAt-now)/1000));
+    return res.status(429).json({error:"rate limit exceeded"});
+  }
+  next();
+});
+
+// ── HTTP Basic Auth — password wall over the whole app ────────────────────────
+// When DASHBOARD_PASS is set, every route (dashboard, SSE, DB reads, settings,
+// close-all) requires credentials. The browser caches them for the origin, so SSE
+// /events authenticates automatically after the first prompt. Timing-safe compare.
+function timingSafeEq(a,b){
+  const ab=Buffer.from(a), bb=Buffer.from(b);
+  if(ab.length!==bb.length) return false;
+  try{ return require("crypto").timingSafeEqual(ab,bb); }catch{ return false; }
+}
+app.use((req,res,next)=>{
+  if(!DASH_PASS) return next(); // no password configured → open (startup warns loudly)
+  const hdr=req.headers.authorization||"";
+  if(hdr.startsWith("Basic ")){
+    const [u,p]=Buffer.from(hdr.slice(6),"base64").toString().split(":");
+    if(u!=null && p!=null && timingSafeEq(u,DASH_USER) && timingSafeEq(p,DASH_PASS)) return next();
+  }
+  res.set("WWW-Authenticate",'Basic realm="SPX COMMAND", charset="UTF-8"');
+  return res.status(401).json({error:"authentication required"});
+});
+
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"11.25-post-tp1-cooldown",status:"running",
+  service:"SPX COMMAND",version:"11.26-reversal-features-auth",status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,marketMode:MARKET_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -2227,6 +2289,66 @@ app.get("/db/blocked-analysis",(req,res)=>{
     days:     parseInt  (req.query.days   ?? "14"),
   };
   res.json(analyzeBlockedSignals(loadDB("signals"), opts));
+});
+
+// Reversal-feature analysis — does any feature predict which entries reverse? For every
+// directional signal we replay the forward SPY path (first-touch win/loss), then median-split
+// each candidate feature and compare would-win% of the low vs high half. A big gap = the
+// feature discriminates reversals. SEGMENTED BY GEX REGIME, because gamma-based signals only
+// mean-revert in positive-GEX (pinning) regimes, not negative-GEX (trending) ones.
+function analyzeReversalFeatures(signals, {win=1.0, stop=0.5, windowMin=30, days=21}={}){
+  const outcome=(dir,px,path,idx)=>{
+    const endT=new Date(path[idx].ts).getTime()+windowMin*60000;
+    for(let j=idx+1;j<path.length;j++){
+      if(new Date(path[j].ts).getTime()>endT) break;
+      const fav=dir==="LONG"?path[j].px-px:px-path[j].px;
+      if(fav>=win) return 1; if(-fav>=stop) return 0;
+    }
+    return null; // neutral — excluded from win-rate
+  };
+  const FEATURES=["percent_b","vwap_dist","gex_path_resist","dex","vex","chex","dex_pct","vex_pct","chex_pct","net_gex","rsi"];
+  const byDay={}; for(const s of signals){ (byDay[s.date] ||= []).push(s); }
+  const dayKeys=Object.keys(byDay).sort().slice(-days);
+  // collect scored signals per regime
+  const buckets={ positive:[], negative:[] };
+  for(const day of dayKeys){
+    const rows=byDay[day].filter(r=>r.spy_price!=null).sort((a,b)=>new Date(a.timestamp)-new Date(b.timestamp));
+    const path=rows.map(r=>({ts:r.timestamp,px:r.spy_price}));
+    rows.forEach((r,i)=>{
+      if(r.direction!=="LONG"&&r.direction!=="SHORT") return;
+      const o=outcome(r.direction,r.spy_price,path,i);
+      if(o===null) return;
+      const reg=(r.gex_regime==="positive")?"positive":(r.gex_regime==="negative")?"negative":null;
+      if(reg) buckets[reg].push({...r,_win:o});
+    });
+  }
+  const analyzeReg=(rows)=>{
+    const out={};
+    for(const f of FEATURES){
+      const vals=rows.filter(r=>typeof r[f]==="number").map(r=>({v:r[f],w:r._win}));
+      if(vals.length<8){ out[f]={n:vals.length,note:"insufficient"}; continue; }
+      vals.sort((a,b)=>a.v-b.v);
+      const mid=Math.floor(vals.length/2);
+      const lo=vals.slice(0,mid), hi=vals.slice(mid);
+      const wr=arr=>Math.round(arr.reduce((s,x)=>s+x.w,0)/arr.length*100);
+      out[f]={ n:vals.length, median:+vals[mid].v.toFixed(3),
+        lowHalfWin:wr(lo), highHalfWin:wr(hi), gap:wr(hi)-wr(lo) };
+    }
+    return out;
+  };
+  return { params:{win,stop,windowMin,days}, daysCovered:dayKeys,
+    counts:{positive:buckets.positive.length, negative:buckets.negative.length},
+    positiveGEX:analyzeReg(buckets.positive), negativeGEX:analyzeReg(buckets.negative),
+    note:"For each feature: would-win% of the low half vs high half of that feature. |gap| large (and n>=20) = predictive of reversal in that regime. Gamma features expected to matter in positiveGEX only." };
+}
+
+app.get("/db/reversal-analysis",(req,res)=>{
+  res.json(analyzeReversalFeatures(loadDB("signals"), {
+    win:      parseFloat(req.query.win    ?? "1.0"),
+    stop:     parseFloat(req.query.stop   ?? "0.5"),
+    windowMin:parseInt  (req.query.window ?? "30"),
+    days:     parseInt  (req.query.days   ?? "21"),
+  }));
 });
 
 
@@ -2443,7 +2565,7 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"11.25-post-tp1-cooldown", mode:IS_PAPER?"PAPER":"LIVE",
+    version:"11.26-reversal-features-auth", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, marketMode:MARKET_MODE, marketScore, marketModeAuto:MARKET_MODE_AUTO,
     SIGNAL_SCAN_MINS, GEX_REFRESH_MINS,
     noTradingView:true,
@@ -2530,6 +2652,8 @@ setInterval(async()=>{
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 app.listen(PORT,async()=>{
+  if(DASH_PASS) log("SECURITY","Password wall ACTIVE — Basic Auth required on all routes (user: "+DASH_USER+"). Rate limit "+RATE_MAX+"/min/IP.");
+  else log("SECURITY","*** WARNING: DASHBOARD_PASS not set — app is PUBLIC. Set DASHBOARD_PASS in Railway to close it. *** (rate limit "+RATE_MAX+"/min/IP still active)");
   console.log(`
  ╔══════════════════════════════════════════════════════╗
  ║  SPX COMMAND v11.8 · FlashAlpha · AutoMode       ║
