@@ -2101,8 +2101,14 @@ function timingSafeEq(a,b){
   if(ab.length!==bb.length) return false;
   try{ return require("crypto").timingSafeEqual(ab,bb); }catch{ return false; }
 }
+// Health check must stay public — Railway's healthcheckPath ("/") probes it unauthenticated
+// to decide whether to route traffic. A 401 here makes Railway mark the deploy unhealthy and
+// pull it out of rotation (the whole site goes dark). This endpoint leaks nothing sensitive.
+const AUTH_EXEMPT = new Set(["/","/healthz"]);
+app.get("/healthz",(req,res)=>res.json({ok:true}));
 app.use((req,res,next)=>{
   if(!DASH_PASS) return next(); // no password configured → open (startup warns loudly)
+  if(req.method==="GET" && AUTH_EXEMPT.has(req.path)) return next(); // liveness probe only
   const hdr=req.headers.authorization||"";
   if(hdr.startsWith("Basic ")){
     const [u,p]=Buffer.from(hdr.slice(6),"base64").toString().split(":");
@@ -2115,7 +2121,7 @@ app.use((req,res,next)=>{
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"11.26-reversal-features-auth",status:"running",
+  service:"SPX COMMAND",version:"11.26.1-healthcheck-auth-exempt",status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,marketMode:MARKET_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -2565,7 +2571,7 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"11.26-reversal-features-auth", mode:IS_PAPER?"PAPER":"LIVE",
+    version:"11.26.1-healthcheck-auth-exempt", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, marketMode:MARKET_MODE, marketScore, marketModeAuto:MARKET_MODE_AUTO,
     SIGNAL_SCAN_MINS, GEX_REFRESH_MINS,
     noTradingView:true,
