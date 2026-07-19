@@ -111,6 +111,7 @@ const SETTINGS_SCHEMA = {
   MARKET_MODE_OVERRIDE:  { type:"enum",   values:["","TREND","NEUTRAL","CHOP"], set:v=>MARKET_MODE_OVERRIDE=v },
   SIGNAL_SCAN_MINS:      { type:"number", min:5, max:30, integer:true, set:v=>SIGNAL_SCAN_MINS=snapTo5(v) },
   GEX_REFRESH_MINS:      { type:"number", min:5, max:30, integer:true, set:v=>GEX_REFRESH_MINS=snapTo5(v) },
+  POST_TP1_COOLDOWN_MINS:{ type:"number", min:0, max:120, integer:true, set:v=>POST_TP1_COOLDOWN_MINS=v },
 };
 
 function getSettingsSnapshot(){
@@ -123,7 +124,7 @@ function getSettingsSnapshot(){
     RSI_LONG_MAX, RSI_SHORT_MIN,
     DIRECTION_COOLDOWN, DIRECTION_COOLDOWN_MINS,
     MARKET_MODE_AUTO, MARKET_MODE_OVERRIDE,
-    SIGNAL_SCAN_MINS, GEX_REFRESH_MINS,
+    SIGNAL_SCAN_MINS, GEX_REFRESH_MINS, POST_TP1_COOLDOWN_MINS,
   };
 }
 
@@ -167,6 +168,11 @@ const MAX_LOGS      = 500;
 // 2500/day quota) — slow GEX to 10/15 from Settings if you want more headroom.
 let SIGNAL_SCAN_MINS = parseInt(process.env.SIGNAL_SCAN_MINS || "5");
 let GEX_REFRESH_MINS = parseInt(process.env.GEX_REFRESH_MINS || "5");
+// Post-TP1 cooldown: after a TP1 win, block new entries for this many minutes to avoid
+// chasing an exhausted move. Default 5 — backtested on 7/17: the two losing re-entries
+// came 3-4 min after a TP1 (chase), while a legit +$140 re-entry came 8 min after, so 5m
+// blocks only the instant chase ($175->$325) while 10m+ starts eating winners. 0 disables.
+let POST_TP1_COOLDOWN_MINS = parseInt(process.env.POST_TP1_COOLDOWN_MINS || "5");
 const snapTo5 = v => Math.max(5, Math.min(30, Math.round(v/5)*5)); // keep aligned to 5-min bars
 let faLevelsCache   = null;
 let faZeroDteCache  = null;
@@ -1348,6 +1354,7 @@ function startMonitor(signal, indicators) {
         signal.status="TP1_HIT"; signal.closePnl=pnl; signal.closePrice=price;
         signal.closeReason="TP1_HIT"; signal.durationMin=((Date.now()-entryTime)/60000).toFixed(1);
         signal.outcome="WIN";
+        lastTP1Time=Date.now();  // start the post-TP1 cooldown — the move is usually exhausted
         sessionPnL+=pnl;
         broadcast({type:"signal_update",id:signal.id,status:"TP1_HIT",pnl});
         saveTradeToDB(signal,signal._dbId,indicators);
@@ -1587,6 +1594,7 @@ async function pollFill(orderId,maxMs){
 // ── Signal Engine ─────────────────────────────────────────────────────────────
 let lastSignalBar = null;
 let lastStopTime  = 0;
+let lastTP1Time   = 0;      // epoch ms of the last TP1 win — drives POST_TP1_COOLDOWN_MINS
 const COOLDOWN_MS = 600000; // 10 min cooldown after stop before re-entering
 // Direction-specific cooldown — block a direction after 2 consecutive losses in that direction
 const dirStops = { LONG: 0, SHORT: 0 }; // consecutive fixed-stop count per direction
@@ -1814,6 +1822,14 @@ async function runSignalEngine() {
       scanActive=false;return;
     }
 
+    // Post-TP1 cooldown — the move is usually exhausted right after a TP1 win; re-entering
+    // chases it. Blocks ALL new entries for POST_TP1_COOLDOWN_MINS after a TP1 (0 disables).
+    if(POST_TP1_COOLDOWN_MINS>0 && lastTP1Time && (Date.now()-lastTP1Time)<POST_TP1_COOLDOWN_MINS*60000){
+      const remain=Math.ceil((POST_TP1_COOLDOWN_MINS*60000-(Date.now()-lastTP1Time))/60000);
+      log("SCAN","Post-TP1 cooldown — "+remain+" min remaining (avoid chasing exhausted move)");
+      scanActive=false;return;
+    }
+
     log("SCAN","Bar "+latestBar.t.slice(11,16)+
       " | SPY $"+currentPrice.toFixed(2)+
       " | VWAP $"+(ind.vwap||0).toFixed(2)+
@@ -2037,7 +2053,7 @@ app.options("*",cors());
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"11.24-stable",status:"running",
+  service:"SPX COMMAND",version:"11.25-post-tp1-cooldown",status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,marketMode:MARKET_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -2427,7 +2443,7 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"11.24-stable", mode:IS_PAPER?"PAPER":"LIVE",
+    version:"11.25-post-tp1-cooldown", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, marketMode:MARKET_MODE, marketScore, marketModeAuto:MARKET_MODE_AUTO,
     SIGNAL_SCAN_MINS, GEX_REFRESH_MINS,
     noTradingView:true,
@@ -2473,6 +2489,7 @@ setInterval(async()=>{
       orbState=null; lastBarTime=null;
       dirStops.LONG=0; dirStops.SHORT=0;
       dirCooldownUntil.LONG=0; dirCooldownUntil.SHORT=0;
+      lastStopTime=0; lastTP1Time=0;
       MARKET_MODE="NEUTRAL"; marketScore=0; marketModeDate="";
       log("DAY","New trading day — counters reset");
       await fetchDailyEMAs();
