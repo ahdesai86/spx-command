@@ -52,6 +52,9 @@ const ALPACA_KEY       = process.env.ALPACA_KEY       || "";
 const ALPACA_SECRET    = process.env.ALPACA_SECRET    || "";
 const ALPACA_BASE      = (process.env.ALPACA_BASE_URL || "https://paper-api.alpaca.markets").replace(/\/$/, "");
 const ALPACA_DATA      = "https://data.alpaca.markets";
+// Single source of truth for the version — used by /, /status, and the startup banner so
+// they can never drift apart again (the banner was stale at v11.8 while the app was v11.27).
+const APP_VERSION      = "11.28-prevday-host-and-version-unify";
 const ACCOUNT_SIZE     = parseFloat(process.env.ACCOUNT_SIZE     || "100000");
 const PORT             = parseInt(process.env.PORT               || "3001");
 const IS_PAPER         = ALPACA_BASE.includes("paper");
@@ -2162,7 +2165,7 @@ app.use((req,res,next)=>{
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"11.27-remote-logs-endpoint",status:"running",
+  service:"SPX COMMAND",version:APP_VERSION,status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,marketMode:MARKET_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -2632,7 +2635,7 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"11.27-remote-logs-endpoint", mode:IS_PAPER?"PAPER":"LIVE",
+    version:APP_VERSION, mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, marketMode:MARKET_MODE, marketScore, marketModeAuto:MARKET_MODE_AUTO,
     SIGNAL_SCAN_MINS, GEX_REFRESH_MINS,
     noTradingView:true,
@@ -2723,7 +2726,7 @@ app.listen(PORT,async()=>{
   else log("SECURITY","*** WARNING: DASHBOARD_PASS not set — app is PUBLIC. Set DASHBOARD_PASS in Railway to close it. *** (rate limit "+RATE_MAX+"/min/IP still active)");
   console.log(`
  ╔══════════════════════════════════════════════════════╗
- ║  SPX COMMAND v11.8 · FlashAlpha · AutoMode       ║
+ ║${("  SPX COMMAND v"+APP_VERSION.split("-")[0]+" · FlashAlpha · AutoMode").padEnd(54).slice(0,54)}║
  ╠══════════════════════════════════════════════════════╣
  ║  Signal engine : 5-min bar close scan               ║
  ║  Indicators    : ORB(15m) + VWAP + RSI + EMA        ║
