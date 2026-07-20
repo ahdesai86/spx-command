@@ -151,6 +151,24 @@ let dailyLoss       = 0;
 let signalHistory   = [];
 let sseClients      = [];
 let logHistory      = [];
+// Raw console mirror — captures BOTH console.log and console.error (the SCHEDULER ERR /
+// SSE INIT ERR lines that never go through log()/logHistory), so /logs shows what Railway's
+// stdout shows without needing the Railway API. Bounded ring buffer.
+const consoleBuffer = [];
+const CONSOLE_BUFFER_MAX = 1500;
+(function mirrorConsole(){
+  for (const level of ["log","error","warn"]) {
+    const orig = console[level].bind(console);
+    console[level] = (...args) => {
+      try {
+        const line = args.map(a => typeof a==="string" ? a : (()=>{try{return JSON.stringify(a);}catch{return String(a);}})()).join(" ");
+        consoleBuffer.push({ t:new Date().toISOString(), level, line });
+        if (consoleBuffer.length > CONSOLE_BUFFER_MAX) consoleBuffer.shift();
+      } catch(_){}
+      orig(...args);
+    };
+  }
+})();
 let gexCache        = null;
 let gexCacheTime    = 0;
 let gexFired        = new Set();
@@ -2087,6 +2105,10 @@ app.options("*",cors());
 // Protects against public scraping/abuse of the data + control endpoints.
 const DASH_USER = process.env.DASHBOARD_USER || "admin";
 const DASH_PASS = process.env.DASHBOARD_PASS || "";        // unset = OPEN (warned at startup)
+// Scoped, read-only log token — grants ONLY /logs (via X-Log-Token header), nothing else.
+// Lets an operator/agent pull logs without handing over the master dashboard password;
+// if it leaks it exposes read-only logs, not settings or close-all.
+const LOG_TOKEN = process.env.LOG_TOKEN || "";
 const RATE_MAX  = parseInt(process.env.RATE_LIMIT_PER_MIN || "120"); // requests/IP/min
 const rlBuckets = new Map(); // ip -> { count, resetAt }
 setInterval(()=>{ const now=Date.now(); for(const [ip,b] of rlBuckets) if(b.resetAt<now) rlBuckets.delete(ip); }, 120000).unref?.();
@@ -2120,6 +2142,11 @@ app.get("/healthz",(req,res)=>res.json({ok:true}));
 app.use((req,res,next)=>{
   if(!DASH_PASS) return next(); // no password configured → open (startup warns loudly)
   if(req.method==="GET" && AUTH_EXEMPT.has(req.path)) return next(); // liveness probe only
+  // Scoped log token: valid X-Log-Token grants /logs only (read-only), bypassing Basic Auth.
+  if(req.path==="/logs" && LOG_TOKEN){
+    const tok=req.headers["x-log-token"]||"";
+    if(tok && timingSafeEq(tok, LOG_TOKEN)) return next();
+  }
   const hdr=req.headers.authorization||"";
   if(hdr.startsWith("Basic ")){
     const [u,p]=Buffer.from(hdr.slice(6),"base64").toString().split(":");
@@ -2132,7 +2159,7 @@ app.use((req,res,next)=>{
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"11.26.2-fa-ratelimit-fix",status:"running",
+  service:"SPX COMMAND",version:"11.27-remote-logs-endpoint",status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,marketMode:MARKET_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -2374,6 +2401,26 @@ app.get("/db/gex",(req,res)=>{
   res.json({count:rows.length,snapshots:rows});
 });
 
+// Raw console mirror (what Railway's stdout shows) — for remote diagnostics. Auth: Basic
+// Auth OR the scoped X-Log-Token header. ?lines=N (default 300, max 1500), ?grep=regex
+// (case-insensitive), ?level=error|warn|log. Newest last (chronological, easy to read).
+app.get("/logs",(req,res)=>{
+  let out = consoleBuffer;
+  const lvl = req.query.level;
+  if(lvl) out = out.filter(e=>e.level===lvl);
+  if(req.query.grep){
+    let re; try{ re=new RegExp(req.query.grep,"i"); }catch{ return res.status(400).json({error:"bad grep regex"}); }
+    out = out.filter(e=>re.test(e.line));
+  }
+  const n = Math.min(parseInt(req.query.lines||"300"), CONSOLE_BUFFER_MAX);
+  out = out.slice(-n);
+  if(req.query.format==="text"){
+    res.type("text/plain").send(out.map(e=>e.t+" ["+e.level+"] "+e.line).join("\n"));
+  } else {
+    res.json({ count:out.length, bufferSize:consoleBuffer.length, lines:out });
+  }
+});
+
 app.get("/db/stats",(req,res)=>{
   const allTrades=loadDB("trades").filter(t=>t.close_reason);
   const wins=allTrades.filter(t=>t.outcome==="WIN");
@@ -2582,7 +2629,7 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"11.26.2-fa-ratelimit-fix", mode:IS_PAPER?"PAPER":"LIVE",
+    version:"11.27-remote-logs-endpoint", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, marketMode:MARKET_MODE, marketScore, marketModeAuto:MARKET_MODE_AUTO,
     SIGNAL_SCAN_MINS, GEX_REFRESH_MINS,
     noTradingView:true,
