@@ -1654,7 +1654,10 @@ const dirCooldownUntil = { LONG: 0, SHORT: 0 }; // epoch ms until direction is u
 // One lightweight Alpaca call, cached for the day.
 async function fetchPrevDayData() {
   try {
-    const bars = await aGet("/v2/stocks/SPY/bars?timeframe=1Day&limit=7&feed=iex&adjustment=raw");
+    // /v2/stocks/*/bars is a MARKET-DATA endpoint — must hit data.alpaca.markets (ALPACA_DATA),
+    // not the default trading host (paper-api), which 404s. This 404'd every startup, breaking
+    // the 5-day ADR + prev-close used by the market-mode classifier's gap/ADR signals.
+    const bars = await aGet("/v2/stocks/SPY/bars?timeframe=1Day&limit=7&feed=iex&adjustment=raw", ALPACA_DATA);
     const daily = bars?.bars || [];
     if (daily.length < 2) { log("MARKET","fetchPrevDayData: not enough bars"); return; }
     const prev = daily[daily.length - 2]; // yesterday
