@@ -808,11 +808,20 @@ async function faGet(endpoint, attempt=1) {
       const txt = await r.text();
       // 429 QUOTA EXCEEDED — do NOT retry (wastes more budget). Trip the circuit breaker.
       if (r.status === 429) {
-        faQuotaBlocked = true;
-        const m = txt.match(/resets at\s+([0-9T:\-\.Z+]+)/i);
-        const parsed = m ? Date.parse(m[1]) : NaN;
-        faQuotaResetAt = !isNaN(parsed) ? parsed : new Date(new Date().setUTCHours(24,0,0,0)).getTime();
-        log("FA ERR", "QUOTA EXCEEDED ("+faCallsToday+" calls today) — FlashAlpha calls SUSPENDED until "+new Date(faQuotaResetAt).toISOString());
+        // Distinguish a genuine DAILY-QUOTA 429 (suspend until reset) from a transient
+        // rate/burst 429 (skip this one call, next refresh retries). Misclassifying the
+        // latter as the former suspended FA for a WHOLE DAY on 2026-07-20 despite only
+        // 144/2500 used — the daily-quota body says "daily"; a rate-limit body does not.
+        const isDailyQuota = /daily/i.test(txt);
+        if (isDailyQuota) {
+          faQuotaBlocked = true;
+          const m = txt.match(/resets at\s+([0-9T:\-\.Z+]+)/i);
+          const parsed = m ? Date.parse(m[1]) : NaN;
+          faQuotaResetAt = !isNaN(parsed) ? parsed : new Date(new Date().setUTCHours(24,0,0,0)).getTime();
+          log("FA ERR", "DAILY QUOTA exhausted — FA suspended until "+new Date(faQuotaResetAt).toISOString());
+          return null;
+        }
+        log("FA ERR", "rate-limited (429) on "+endpoint+" — skipping this call only, retry next refresh");
         return null;
       }
       // Retry only genuine transient server errors (5xx); other 4xx won't fix on retry
@@ -847,13 +856,15 @@ async function calcGEX() {
     log("GEX", "Fetching from FlashAlpha API...");
     const today = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
 
-    const [gexData, levelsData, zeroDteData, summaryData, maxPainData] = await Promise.all([
-      faGet("/v1/exposure/gex/SPY?expiration=" + today),
-      faGet("/v1/exposure/levels/SPY"),
-      faGet("/v1/exposure/zero-dte/SPY"),
-      faGet("/v1/exposure/summary/SPY"),
-      faGet("/v1/maxpain/SPY?expiration=" + today),
-    ]);
+    // Fetch SEQUENTIALLY, not Promise.all — 5 concurrent requests was a burst that tripped
+    // FlashAlpha's per-second rate limit (→ the 429 that suspended us on 2026-07-20). At a
+    // 5-15 min cadence the extra ~1s of sequential latency is irrelevant. maxpain dropped:
+    // it returned "$—" on every call and threw 502s — a wasted request feeding nothing.
+    const gexData     = await faGet("/v1/exposure/gex/SPY?expiration=" + today);
+    const levelsData  = await faGet("/v1/exposure/levels/SPY");
+    const zeroDteData = await faGet("/v1/exposure/zero-dte/SPY");
+    const summaryData = await faGet("/v1/exposure/summary/SPY");
+    const maxPainData = null; // endpoint never returned usable data; magnet falls back to zeroDteMagnet
 
     if (!gexData) { log("GEX ERR", "FlashAlpha GEX endpoint returned no data"); broadcastHealth(); return null; }
 
@@ -2121,7 +2132,7 @@ app.use((req,res,next)=>{
 app.use(express.json());
 
 app.get("/",(req,res)=>res.json({
-  service:"SPX COMMAND",version:"11.26.1-healthcheck-auth-exempt",status:"running",
+  service:"SPX COMMAND",version:"11.26.2-fa-ratelimit-fix",status:"running",
   mode:IS_PAPER?"PAPER":"LIVE",signalMode:SIGNAL_MODE,marketMode:MARKET_MODE,
   exitStrategy:"price-monitor + DELETE /v2/positions",
   noTradingViewRequired:true,
@@ -2571,7 +2582,7 @@ app.get("/status",(req,res)=>{
   const wins=allTrades.filter(t=>t.outcome==="WIN");
   const s={t:allTrades.length,w:wins.length,p:parseFloat(allTrades.reduce((a,t)=>a+(t.pnl||0),0).toFixed(2))};
   res.json({
-    version:"11.26.1-healthcheck-auth-exempt", mode:IS_PAPER?"PAPER":"LIVE",
+    version:"11.26.2-fa-ratelimit-fix", mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, marketMode:MARKET_MODE, marketScore, marketModeAuto:MARKET_MODE_AUTO,
     SIGNAL_SCAN_MINS, GEX_REFRESH_MINS,
     noTradingView:true,
