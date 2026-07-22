@@ -54,7 +54,7 @@ const ALPACA_BASE      = (process.env.ALPACA_BASE_URL || "https://paper-api.alpa
 const ALPACA_DATA      = "https://data.alpaca.markets";
 // Single source of truth for the version — used by /, /status, and the startup banner so
 // they can never drift apart again (the banner was stale at v11.8 while the app was v11.27).
-const APP_VERSION      = "11.28-prevday-host-and-version-unify";
+const APP_VERSION      = "11.29-reversal-block-monitor-pause";
 const ACCOUNT_SIZE     = parseFloat(process.env.ACCOUNT_SIZE     || "100000");
 const PORT             = parseInt(process.env.PORT               || "3001");
 const IS_PAPER         = ALPACA_BASE.includes("paper");
@@ -115,6 +115,9 @@ const SETTINGS_SCHEMA = {
   SIGNAL_SCAN_MINS:      { type:"number", min:5, max:30, integer:true, set:v=>SIGNAL_SCAN_MINS=snapTo5(v) },
   GEX_REFRESH_MINS:      { type:"number", min:5, max:30, integer:true, set:v=>GEX_REFRESH_MINS=snapTo5(v) },
   POST_TP1_COOLDOWN_MINS:{ type:"number", min:0, max:120, integer:true, set:v=>POST_TP1_COOLDOWN_MINS=v },
+  REVERSAL_BLOCK:        { type:"enum",   values:["ON","OFF"], set:v=>REVERSAL_BLOCK=v },
+  PATH_RESIST_BLOCK:     { type:"number", min:0.5, max:1, set:v=>PATH_RESIST_BLOCK=v },
+  WALL_HARD_BLOCK:       { type:"number", min:2, max:20, set:v=>WALL_HARD_BLOCK=v },
 };
 
 function getSettingsSnapshot(){
@@ -128,6 +131,7 @@ function getSettingsSnapshot(){
     DIRECTION_COOLDOWN, DIRECTION_COOLDOWN_MINS,
     MARKET_MODE_AUTO, MARKET_MODE_OVERRIDE,
     SIGNAL_SCAN_MINS, GEX_REFRESH_MINS, POST_TP1_COOLDOWN_MINS,
+    REVERSAL_BLOCK, PATH_RESIST_BLOCK, WALL_HARD_BLOCK,
   };
 }
 
@@ -194,6 +198,14 @@ let GEX_REFRESH_MINS = parseInt(process.env.GEX_REFRESH_MINS || "5");
 // came 3-4 min after a TP1 (chase), while a legit +$140 re-entry came 8 min after, so 5m
 // blocks only the instant chase ($175->$325) while 10m+ starts eating winners. 0 disables.
 let POST_TP1_COOLDOWN_MINS = parseInt(process.env.POST_TP1_COOLDOWN_MINS || "5");
+// Reversal-risk entry block: refuse entries where GEX says the move will likely stall/reverse.
+// path_resist = fraction of opposing (pinning) GEX between entry and target (1 = all opposing);
+// wall hardness = target wall GEX vs profile mean (higher = sharper rejection expected). On
+// 2026-07-21 a LONG with path_resist=1 + wall 7.1x HARD was taken, never went green, held
+// overnight at a loss — every reversal signal fired but none gated. These make them gate.
+let REVERSAL_BLOCK      = (process.env.REVERSAL_BLOCK || "ON").toUpperCase(); // ON | OFF
+let PATH_RESIST_BLOCK   = parseFloat(process.env.PATH_RESIST_BLOCK || "0.85"); // block if >=
+let WALL_HARD_BLOCK     = parseFloat(process.env.WALL_HARD_BLOCK   || "6");    // block if >=
 const snapTo5 = v => Math.max(5, Math.min(30, Math.round(v/5)*5)); // keep aligned to 5-min bars
 let faLevelsCache   = null;
 let faZeroDteCache  = null;
@@ -1020,6 +1032,16 @@ function wallHardness(wallPrice) {
   return meanAbs ? parseFloat((Math.abs(wall.netGex)/meanAbs).toFixed(1)) : null;
 }
 
+// Returns a block reason string if this entry is a high reversal-risk setup, else null.
+function reversalBlock(direction, pathResist, hardness){
+  if (REVERSAL_BLOCK !== "ON") return null;
+  if (pathResist != null && pathResist >= PATH_RESIST_BLOCK)
+    return direction+" blocked — reversal risk: path resist "+pathResist+" (>= "+PATH_RESIST_BLOCK+", pinning gamma ahead)";
+  if (hardness != null && hardness >= WALL_HARD_BLOCK)
+    return direction+" blocked — reversal risk: wall "+hardness+"x HARD (>= "+WALL_HARD_BLOCK+"x, sharp rejection likely)";
+  return null;
+}
+
 function applyGEX(direction, entry, vwap) {
   // Fail-CLOSED when GEX is unavailable: without the flip/wall map we can't tell a
   // pin from a clean breakout, and pins are where directional entries die. Allow the
@@ -1091,6 +1113,8 @@ function applyGEX(direction, entry, vwap) {
     const target = magnet && magnet > entry && magnet < callWall ? magnet : callWall;
     const pathResist = pathResistance("LONG", entry);
     const hardness   = wallHardness(callWall);
+    const revBlock   = reversalBlock("LONG", pathResist, hardness);
+    if (revBlock) return { allowed: false, reason: revBlock, tp1: entry, tp2: entry, target: null, dexBias, pathResist, wallHardness: hardness };
     const profNote   = (pathResist!=null ? " | path resist "+pathResist : "") + (hardness!=null ? " | wall "+hardness+"x"+(hardness>=2?" HARD":" soft") : "");
     return { allowed: true, reason: "LONG → wall $" + callWall + (magnet ? " | magnet $" + magnet : "") + dexNote + profNote, tp1, tp2, target, dexBias, pathResist, wallHardness: hardness };
   }
@@ -1105,6 +1129,8 @@ function applyGEX(direction, entry, vwap) {
     const target = magnet && magnet < entry && magnet > putWall ? magnet : putWall;
     const pathResist = pathResistance("SHORT", entry);
     const hardness   = wallHardness(putWall);
+    const revBlock   = reversalBlock("SHORT", pathResist, hardness);
+    if (revBlock) return { allowed: false, reason: revBlock, tp1: entry, tp2: entry, target: null, dexBias, pathResist, wallHardness: hardness };
     const profNote   = (pathResist!=null ? " | path resist "+pathResist : "") + (hardness!=null ? " | wall "+hardness+"x"+(hardness>=2?" HARD":" soft") : "");
     return { allowed: true, reason: "SHORT → wall $" + putWall + (magnet ? " | magnet $" + magnet : "") + dexNote + profNote, tp1, tp2, target, dexBias, pathResist, wallHardness: hardness };
   }
@@ -1296,6 +1322,11 @@ function startMonitor(signal, indicators) {
 
   const iv=setInterval(async()=>{
     if(!["FILLED"].includes(signal.status)){clearInterval(iv);return;}
+    // Market closed → skip. A 1DTE position held overnight can't move on a stale price, so
+    // polling every 30s all night is wasted work and floods the log buffer (it pushed a whole
+    // morning of activity out of the ring buffer on 2026-07-21). Interval stays alive; real
+    // polling resumes at the next open. (Not a per-position log — silent skip by design.)
+    if(!isMarketHours(getETDate())) return;
     try{
       const pos=await aGet("/v2/positions/"+encodeURIComponent(signal.optionSymbol));
       consecutiveErrors = 0; // reset on any successful poll
@@ -2664,6 +2695,12 @@ app.get("/status",(req,res)=>{
 // burning API quota and producing confusing 404 log noise that lingers in the
 // rolling logHistory buffer into the next trading day.
 function isWeekday(etDate){ const d=etDate.getDay(); return d>=1&&d<=5; }
+// RTH 9:30–16:00 ET — options only trade then, so the monitor has nothing to do outside it.
+function isMarketHours(etDate){
+  if(!isWeekday(etDate)) return false;
+  const mins = etDate.getHours()*60 + etDate.getMinutes();
+  return mins >= 9*60+30 && mins < 16*60;
+}
 
 // Signal engine: runs on 5-min bar close (every minute, fires when new bar available)
 setInterval(async()=>{

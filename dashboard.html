@@ -909,6 +909,9 @@ const SETTINGS_META = {
   SIGNAL_SCAN_MINS:      {label:"Signal Scan (min)",         unit:"min",      step:5,    hint:"How often the signal engine evaluates entries. Default 5 (aligned to 5-min bars). Higher = later entries but fewer whipsaws. Snaps to multiples of 5."},
   GEX_REFRESH_MINS:      {label:"GEX Refresh (min)",         unit:"min",      step:5,    hint:"How often FlashAlpha GEX is refreshed. Default 5 (~385 FA calls/day). Raise to 10/15 for more quota headroom against the 2500/day limit. Snaps to multiples of 5."},
   POST_TP1_COOLDOWN_MINS:{label:"Post-TP1 Cooldown (min)",   unit:"min",      step:5,    hint:"After a TP1 win, block new entries for N min to avoid chasing an exhausted move. Default 5 (backtested optimal on 7/17: $175->$325; 10m+ starts blocking good re-entries). Set 0 to disable."},
+  REVERSAL_BLOCK:        {label:"Reversal Block",             enum:true,                  hint:"ON: refuse entries with high GEX reversal risk (path resistance or hard wall ahead). Caught a bad 7/21 LONG that never went green. OFF to disable."},
+  PATH_RESIST_BLOCK:     {label:"Path Resist Block ≥",        step:0.05,                  hint:"Block entry when this fraction of GEX between entry and target is opposing/pinning. Default 0.85 (1.0 = all opposing). Lower = stricter."},
+  WALL_HARD_BLOCK:       {label:"Wall Hardness Block ≥",      unit:"x",        step:1,    hint:"Block entry when the target wall's GEX is this many × the profile mean (sharp rejection likely). Default 6x. Lower = stricter."},
 };
 
 let settingsSchema = {};
