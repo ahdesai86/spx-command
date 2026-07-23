@@ -54,7 +54,7 @@ const ALPACA_BASE      = (process.env.ALPACA_BASE_URL || "https://paper-api.alpa
 const ALPACA_DATA      = "https://data.alpaca.markets";
 // Single source of truth for the version — used by /, /status, and the startup banner so
 // they can never drift apart again (the banner was stale at v11.8 while the app was v11.27).
-const APP_VERSION      = "11.31-magnet-direction-daily-lockout";
+const APP_VERSION      = "11.31.1-recover-live-indicators";
 const ACCOUNT_SIZE     = parseFloat(process.env.ACCOUNT_SIZE     || "100000");
 const PORT             = parseInt(process.env.PORT               || "3001");
 const IS_PAPER         = ALPACA_BASE.includes("paper");
@@ -2054,6 +2054,12 @@ async function recoverPositions(){
     const spyOpts=positions.filter(p=>/^SPY\d{6}[CP]\d{8}$/.test(p.symbol));
     if(!spyOpts.length){log("RECOVER","No open SPY option positions");return;}
     log("RECOVER","Found "+spyOpts.length+" open SPY option position(s) — re-attaching monitors");
+    // The original entry-time indicators died with the crashed process. Attach CURRENT market
+    // context (today's ORB + live VWAP/RSI/EMA) so the recovered open-position card isn't blank
+    // — for an open position, live context is what you want to see anyway.
+    let liveInd={};
+    try{ const b=await getSPYBars(); if(b.length) liveInd=calcIndicators(b, await getSPYQuote()||b[b.length-1].c)||{}; }
+    catch(e){ log("RECOVER","indicator snapshot failed: "+e.message); }
     for(const pos of spyOpts){
       const alreadyTracked=signalHistory.find(s=>s.optionSymbol===pos.symbol&&["FILLED"].includes(s.status));
       if(alreadyTracked) continue; // already monitored
@@ -2073,11 +2079,13 @@ async function recoverPositions(){
         stopPrice:stop, tp1Price:tp1,
         status:"FILLED", trigger:"Recovered on restart",
         is1DTE:true, expiry:pos.symbol.slice(3,9),
-        confidence:"MEDIUM", indicators:{},
+        confidence:"MEDIUM",
+        indicators:{ vwap:liveInd.vwap, rsi:liveInd.rsi, ema9:liveInd.ema9, ema21:liveInd.ema21,
+                     orbHigh:liveInd.orbHigh, orbLow:liveInd.orbLow, live:true },
       };
       signalHistory.unshift(recovered);
       log("RECOVER","Re-monitoring "+pos.symbol+" x"+contracts+" @ $"+avgEntry+" | stop $"+stop);
-      startMonitor(recovered, {});
+      startMonitor(recovered, recovered.indicators);
     }
   }catch(e){ log("RECOVER ERR","recoverPositions: "+e.message); }
 }
