@@ -912,6 +912,9 @@ const SETTINGS_META = {
   REVERSAL_BLOCK:        {label:"Reversal Block",             enum:true,                  hint:"ON: refuse entries with high GEX reversal risk (path resistance or hard wall ahead). Caught a bad 7/21 LONG that never went green. OFF to disable."},
   PATH_RESIST_BLOCK:     {label:"Path Resist Block ≥",        step:0.05,                  hint:"Block entry when this fraction of GEX between entry and target is opposing/pinning. Default 0.85 (1.0 = all opposing). Lower = stricter."},
   WALL_HARD_BLOCK:       {label:"Wall Hardness Block ≥",      unit:"x",        step:1,    hint:"Block entry when the target wall's GEX is this many × the profile mean (sharp rejection likely). Default 6x. Lower = stricter."},
+  MAGNET_DIRECTION_FILTER:{label:"Magnet Direction Filter",   enum:true,                  hint:"ON: block entries that trade AWAY from the 0DTE magnet (SHORT below it / LONG above it). Price reverts to the magnet. Caught the 8-short 7/23 loss day. OFF to disable."},
+  MAGNET_RANGE:          {label:"Magnet Pull Range ($)",      unit:"$",        step:0.5,  hint:"Only apply the magnet filter when the magnet is within this many $ of entry (close enough to pull price). Default 2.5."},
+  MAX_DIR_LOSSES_DAY:    {label:"Max Losses/Direction/Day",   step:1,                     hint:"After this many losses in one direction in a day, lock that direction until tomorrow. Backstops the 30-min cooldown that let 7 shorts bleed on 7/23. Default 3."},
 };
 
 let settingsSchema = {};

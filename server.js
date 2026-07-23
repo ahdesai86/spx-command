@@ -54,7 +54,7 @@ const ALPACA_BASE      = (process.env.ALPACA_BASE_URL || "https://paper-api.alpa
 const ALPACA_DATA      = "https://data.alpaca.markets";
 // Single source of truth for the version — used by /, /status, and the startup banner so
 // they can never drift apart again (the banner was stale at v11.8 while the app was v11.27).
-const APP_VERSION      = "11.30-daily-bars-fix-eod-close-1dte";
+const APP_VERSION      = "11.31-magnet-direction-daily-lockout";
 const ACCOUNT_SIZE     = parseFloat(process.env.ACCOUNT_SIZE     || "100000");
 const PORT             = parseInt(process.env.PORT               || "3001");
 const IS_PAPER         = ALPACA_BASE.includes("paper");
@@ -118,6 +118,9 @@ const SETTINGS_SCHEMA = {
   REVERSAL_BLOCK:        { type:"enum",   values:["ON","OFF"], set:v=>REVERSAL_BLOCK=v },
   PATH_RESIST_BLOCK:     { type:"number", min:0.5, max:1, set:v=>PATH_RESIST_BLOCK=v },
   WALL_HARD_BLOCK:       { type:"number", min:2, max:20, set:v=>WALL_HARD_BLOCK=v },
+  MAGNET_DIRECTION_FILTER:{ type:"enum",  values:["ON","OFF"], set:v=>MAGNET_DIRECTION_FILTER=v },
+  MAGNET_RANGE:          { type:"number", min:0.5, max:10, set:v=>MAGNET_RANGE=v },
+  MAX_DIR_LOSSES_DAY:    { type:"number", min:1, max:20, integer:true, set:v=>MAX_DIR_LOSSES_DAY=v },
 };
 
 function getSettingsSnapshot(){
@@ -132,6 +135,7 @@ function getSettingsSnapshot(){
     MARKET_MODE_AUTO, MARKET_MODE_OVERRIDE,
     SIGNAL_SCAN_MINS, GEX_REFRESH_MINS, POST_TP1_COOLDOWN_MINS,
     REVERSAL_BLOCK, PATH_RESIST_BLOCK, WALL_HARD_BLOCK,
+    MAGNET_DIRECTION_FILTER, MAGNET_RANGE, MAX_DIR_LOSSES_DAY,
   };
 }
 
@@ -206,6 +210,15 @@ let POST_TP1_COOLDOWN_MINS = parseInt(process.env.POST_TP1_COOLDOWN_MINS || "5")
 let REVERSAL_BLOCK      = (process.env.REVERSAL_BLOCK || "ON").toUpperCase(); // ON | OFF
 let PATH_RESIST_BLOCK   = parseFloat(process.env.PATH_RESIST_BLOCK || "0.85"); // block if >=
 let WALL_HARD_BLOCK     = parseFloat(process.env.WALL_HARD_BLOCK   || "6");    // block if >=
+// Magnet-direction filter (see applyGEX): don't trade away from the 0DTE magnet.
+let MAGNET_DIRECTION_FILTER = (process.env.MAGNET_DIRECTION_FILTER || "ON").toUpperCase();
+let MAGNET_RANGE        = parseFloat(process.env.MAGNET_RANGE || "2.5"); // magnet within $X pulls
+// Daily per-direction loss circuit breaker: after N losses in a direction in one day, lock
+// that direction until tomorrow. The 30-min cooldown resets and lets the bot bleed all day
+// (2026-07-23: 7 short losses); this caps it. Rebuilt from today's trades on restart.
+let MAX_DIR_LOSSES_DAY  = parseInt(process.env.MAX_DIR_LOSSES_DAY || "3");
+let dirLossesToday      = { LONG:0, SHORT:0 };
+let dirLockedToday      = { LONG:false, SHORT:false };
 const snapTo5 = v => Math.max(5, Math.min(30, Math.round(v/5)*5)); // keep aligned to 5-min bars
 let faLevelsCache   = null;
 let faZeroDteCache  = null;
@@ -1115,6 +1128,18 @@ function applyGEX(direction, entry, vwap) {
     if (direction === "SHORT" && magnet < entry && (entry - magnet) < MIN_MAGNET_ROOM) {
       return { allowed: false, reason: "SHORT blocked — already at 0DTE magnet $" + magnet + " ($" + (entry - magnet).toFixed(2) + " room < $0.25)", tp1: magnet, tp2: magnet, target: magnet, dexBias };
     }
+    // ── Magnet-DIRECTION filter ──────────────────────────────────────────────
+    // The 0DTE magnet pulls price toward it. Trading AWAY from it — SHORT below the magnet
+    // or LONG above it — fights that pull. On 2026-07-23 the bot shorted below the $740
+    // magnet 8x and price reverted up to it every time (1W/7L). Block entries against the
+    // magnet when it's close enough to actively pull (within MAGNET_RANGE).
+    if (MAGNET_DIRECTION_FILTER === "ON") {
+      const dist = magnet - entry; // + = magnet is above entry
+      if (direction === "SHORT" && dist > MIN_MAGNET_ROOM && dist <= MAGNET_RANGE)
+        return { allowed: false, reason: "SHORT blocked — 0DTE magnet $" + magnet + " is $" + dist.toFixed(2) + " ABOVE entry (pulls price up, against short)", tp1: entry, tp2: entry, target: null, dexBias };
+      if (direction === "LONG" && dist < -MIN_MAGNET_ROOM && -dist <= MAGNET_RANGE)
+        return { allowed: false, reason: "LONG blocked — 0DTE magnet $" + magnet + " is $" + (-dist).toFixed(2) + " BELOW entry (pulls price down, against long)", tp1: entry, tp2: entry, target: null, dexBias };
+    }
   }
 
   // ── Call/put wall TP targets ──────────────────────────────────────────────────
@@ -1489,6 +1514,16 @@ function startMonitor(signal, indicators) {
           if(dir==="LONG"||dir==="SHORT") dirStops[dir]=0;
         }
         sessionPnL+=pnl; dailyLoss+=Math.abs(Math.min(0,pnl));
+        // Daily per-direction loss circuit breaker: count ANY losing close (trailing or not)
+        // and lock the direction for the day once it hits the cap.
+        if(pnl<0 && (signal.direction==="LONG"||signal.direction==="SHORT")){
+          const dir=signal.direction;
+          dirLossesToday[dir]=(dirLossesToday[dir]||0)+1;
+          if(dirLossesToday[dir]>=MAX_DIR_LOSSES_DAY && !dirLockedToday[dir]){
+            dirLockedToday[dir]=true;
+            log("SAFETY","DAILY LOCKOUT: "+dir+" blocked for the rest of the day — "+dirLossesToday[dir]+" losses (cap "+MAX_DIR_LOSSES_DAY+")");
+          }
+        }
         broadcast({type:"signal_update",id:signal.id,status:"STOPPED",closeReason:reason,pnl});
         saveTradeToDB(signal,signal._dbId,indicators);
         return;
@@ -1947,6 +1982,12 @@ async function runSignalEngine() {
       scanActive=false;return;
     }
 
+    // Daily per-direction lockout — hard cap on losses in one direction per day
+    if(dirLockedToday[eval_result.direction]){
+      log("SCAN","Direction LOCKED for the day: "+eval_result.direction+" — hit "+MAX_DIR_LOSSES_DAY+" losses");
+      scanActive=false;return;
+    }
+
     // Direction-specific cooldown check
     if(DIRECTION_COOLDOWN==="ON"){
       const cd=dirCooldownUntil[eval_result.direction]||0;
@@ -2073,7 +2114,13 @@ function reconstructDayState(){
     sessionPnL = todays.reduce((a,t)=>a+(t.pnl||0),0);
     dailyLoss  = todays.reduce((a,t)=>a+(t.pnl<0?Math.abs(t.pnl):0),0);
     tradesDay  = todays.length;
-    log("RECOVER","Day state rebuilt from "+todays.length+" trade(s) today — sessionPnL $"+sessionPnL.toFixed(2)+" | dailyLoss $"+dailyLoss.toFixed(2)+" | tradesDay "+tradesDay);
+    // Rebuild the daily per-direction loss lockout so it survives a mid-day restart too —
+    // otherwise a redeploy would forget a direction was locked and let the bleed resume.
+    dirLossesToday = { LONG:0, SHORT:0 };
+    for(const t of todays){ if(t.pnl<0 && (t.direction==="LONG"||t.direction==="SHORT")) dirLossesToday[t.direction]++; }
+    dirLockedToday = { LONG: dirLossesToday.LONG>=MAX_DIR_LOSSES_DAY, SHORT: dirLossesToday.SHORT>=MAX_DIR_LOSSES_DAY };
+    log("RECOVER","Day state rebuilt from "+todays.length+" trade(s) today — sessionPnL $"+sessionPnL.toFixed(2)+" | dailyLoss $"+dailyLoss.toFixed(2)+" | tradesDay "+tradesDay+
+      " | dir losses L:"+dirLossesToday.LONG+" S:"+dirLossesToday.SHORT+(dirLockedToday.LONG?" [LONG LOCKED]":"")+(dirLockedToday.SHORT?" [SHORT LOCKED]":""));
   }catch(e){ log("RECOVER ERR","reconstructDayState: "+e.message); }
 }
 
@@ -2728,6 +2775,8 @@ setInterval(async()=>{
       orbState=null; lastBarTime=null;
       dirStops.LONG=0; dirStops.SHORT=0;
       dirCooldownUntil.LONG=0; dirCooldownUntil.SHORT=0;
+      dirLossesToday.LONG=0; dirLossesToday.SHORT=0;
+      dirLockedToday.LONG=false; dirLockedToday.SHORT=false;
       lastStopTime=0; lastTP1Time=0;
       MARKET_MODE="NEUTRAL"; marketScore=0; marketModeDate="";
       log("DAY","New trading day — counters reset");
