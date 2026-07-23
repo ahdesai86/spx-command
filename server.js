@@ -54,7 +54,7 @@ const ALPACA_BASE      = (process.env.ALPACA_BASE_URL || "https://paper-api.alpa
 const ALPACA_DATA      = "https://data.alpaca.markets";
 // Single source of truth for the version — used by /, /status, and the startup banner so
 // they can never drift apart again (the banner was stale at v11.8 while the app was v11.27).
-const APP_VERSION      = "11.29-reversal-block-monitor-pause";
+const APP_VERSION      = "11.30-daily-bars-fix-eod-close-1dte";
 const ACCOUNT_SIZE     = parseFloat(process.env.ACCOUNT_SIZE     || "100000");
 const PORT             = parseInt(process.env.PORT               || "3001");
 const IS_PAPER         = ALPACA_BASE.includes("paper");
@@ -544,12 +544,27 @@ async function getSPYQuote() {
  * 105 minutes of 5-min data to accumulate. The bot calculates EMA from intraday
  * bars; without this seed the first ~100 minutes of each session have null EMA21.
  */
+// Shared SPY daily-bar fetch. The bug both callers hit: WITHOUT a `start` date the Alpaca
+// IEX bars API returns a near-empty window (0-1 bars) — that's why EMA seed said "0/21" and
+// fetchPrevDayData said "not enough bars" for weeks. An explicit start/end date range fixes
+// it. end=yesterday to only pull COMPLETED sessions and dodge any free-tier recency limit.
+async function fetchSpyDailyBars(calendarDays=60) {
+  const today = new Date();
+  const end   = new Date(today.getTime() - 1*86400000);
+  const start = new Date(today.getTime() - calendarDays*86400000);
+  const url = ALPACA_DATA+"/v2/stocks/SPY/bars?timeframe=1Day"
+            + "&start="+start.toISOString().slice(0,10)
+            + "&end="+end.toISOString().slice(0,10)
+            + "&feed=iex&adjustment=raw&limit=100";
+  const r = await fetch(url,{headers:aH()});
+  if(!r.ok){ const t=await r.text(); throw new Error("daily bars "+r.status+": "+t.slice(0,120)); }
+  const data = await r.json();
+  return (data.bars||[]).sort((a,b)=>new Date(a.t)-new Date(b.t));
+}
+
 async function fetchDailyEMAs() {
   try {
-    const r = await fetch(ALPACA_DATA+"/v2/stocks/SPY/bars?timeframe=1Day&limit=30&feed=iex",{headers:aH()});
-    if (!r.ok) { log("DATA ERR","Daily bars for EMA seed "+r.status); return; }
-    const data = await r.json();
-    const allBars = (data.bars||[]).sort((a,b)=>new Date(a.t)-new Date(b.t));
+    const allBars = await fetchSpyDailyBars(60);
     // Exclude today's bar (incomplete intraday)
     const etToday = new Date().toLocaleDateString("en-CA",{timeZone:"America/New_York"});
     const hist = allBars.filter(b=>b.t.slice(0,10)<etToday);
@@ -1688,11 +1703,9 @@ const dirCooldownUntil = { LONG: 0, SHORT: 0 }; // epoch ms until direction is u
 // One lightweight Alpaca call, cached for the day.
 async function fetchPrevDayData() {
   try {
-    // /v2/stocks/*/bars is a MARKET-DATA endpoint — must hit data.alpaca.markets (ALPACA_DATA),
-    // not the default trading host (paper-api), which 404s. This 404'd every startup, breaking
-    // the 5-day ADR + prev-close used by the market-mode classifier's gap/ADR signals.
-    const bars = await aGet("/v2/stocks/SPY/bars?timeframe=1Day&limit=7&feed=iex&adjustment=raw", ALPACA_DATA);
-    const daily = bars?.bars || [];
+    // Uses the shared date-ranged fetch (a bare limit=7 query returned <2 bars — the "not
+    // enough bars" bug that left the classifier's gap + 5-day-ADR inputs dead for weeks).
+    const daily = await fetchSpyDailyBars(20);
     if (daily.length < 2) { log("MARKET","fetchPrevDayData: not enough bars"); return; }
     const prev = daily[daily.length - 2]; // yesterday
     // 5-day ADR from last 5 complete sessions
@@ -2066,16 +2079,13 @@ function reconstructDayState(){
 
 // ── EOD force close ───────────────────────────────────────────────────────────
 async function forceCloseAll(){
-  // Normally skip 1DTE positions at EOD — they expire tomorrow, intentionally held
-  // overnight. BUT when the next trading day is >1 calendar day away (Friday/holiday),
-  // a "1DTE" hold is a weekend hold — force-close those too. No unmonitored multi-day holds.
-  const now=getETDate();
-  const nextTd=getNextTradingDay();
-  const gapDays=Math.round((new Date(nextTd.toDateString()) - new Date(now.toDateString()))/86400000);
-  const weekendGap = gapDays>1;
-  const active=signalHistory.filter(s=>["FILLED","SENT"].includes(s.status) && (!s.is1DTE || weekendGap));
-  if(!active.length){log("EOD","No positions to close"+(weekendGap?" (weekend gap — 1DTE included)":""));return;}
-  log("EOD","Force closing "+active.length+" position(s)"+(weekendGap?" — WEEKEND/HOLIDAY GAP ("+gapDays+"d), closing 1DTE too":" (1DTE positions held overnight)"));
+  // Close EVERYTHING at EOD — 0DTE AND 1DTE. Overnight 1DTE holds were 0-for-2 (both gapped
+  // through their stops at the open, e.g. the 748C on 2026-07-22 opened -49.6%). The 1DTE-
+  // after-2:30 switch still gives theta protection in the final 90 min, but we now exit the
+  // same day at 3:45 rather than carrying unmonitored overnight gap risk.
+  const active=signalHistory.filter(s=>["FILLED","SENT"].includes(s.status));
+  if(!active.length){log("EOD","No positions to close");return;}
+  log("EOD","Force closing "+active.length+" position(s) (0DTE + 1DTE — no overnight holds)");
   for(const sig of active){
     if(sig._monitorInterval) clearInterval(sig._monitorInterval);
     try{
