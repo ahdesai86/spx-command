@@ -54,7 +54,7 @@ const ALPACA_BASE      = (process.env.ALPACA_BASE_URL || "https://paper-api.alpa
 const ALPACA_DATA      = "https://data.alpaca.markets";
 // Single source of truth for the version — used by /, /status, and the startup banner so
 // they can never drift apart again (the banner was stale at v11.8 while the app was v11.27).
-const APP_VERSION      = "11.31.2-rebuild-signalhistory-reconcile";
+const APP_VERSION      = "11.31.3-recovered-strike-fix";
 const ACCOUNT_SIZE     = parseFloat(process.env.ACCOUNT_SIZE     || "100000");
 const PORT             = parseInt(process.env.PORT               || "3001");
 const IS_PAPER         = ALPACA_BASE.includes("paper");
@@ -2074,8 +2074,12 @@ async function recoverPositions(){
         id:Date.now(),
         time:new Date().toLocaleTimeString("en-US",{hour12:false,timeZone:"America/New_York"}),
         symbol:"SPY", direction:dir, right,
+        strike: parseInt(pos.symbol.slice(-8))/1000,   // OCC strike (fixes "$undefined PUT" header)
         optionSymbol:pos.symbol, contracts,
         fillPrice:avgEntry, midPrice:avgEntry,
+        // SPY-underlying row: stop = today's ORB low (available); entry-time SPY price and the
+        // GEX walls at entry are genuinely lost on recovery, so ENTRY/TRAIL/WALL stay blank.
+        spyEntry:null, stop: liveInd.orbLow ?? null, tp1:null, tp2:null,
         stopPrice:stop, tp1Price:tp1,
         status:"FILLED", trigger:"Recovered on restart",
         is1DTE:true, expiry:pos.symbol.slice(3,9),
