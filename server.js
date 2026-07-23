@@ -54,7 +54,7 @@ const ALPACA_BASE      = (process.env.ALPACA_BASE_URL || "https://paper-api.alpa
 const ALPACA_DATA      = "https://data.alpaca.markets";
 // Single source of truth for the version — used by /, /status, and the startup banner so
 // they can never drift apart again (the banner was stale at v11.8 while the app was v11.27).
-const APP_VERSION      = "11.31.1-recover-live-indicators";
+const APP_VERSION      = "11.31.2-rebuild-signalhistory-reconcile";
 const ACCOUNT_SIZE     = parseFloat(process.env.ACCOUNT_SIZE     || "100000");
 const PORT             = parseInt(process.env.PORT               || "3001");
 const IS_PAPER         = ALPACA_BASE.includes("paper");
@@ -2084,6 +2084,7 @@ async function recoverPositions(){
                      orbHigh:liveInd.orbHigh, orbLow:liveInd.orbLow, live:true },
       };
       signalHistory.unshift(recovered);
+      tradesDay++; // an open position is a trade taken today but not yet in the trades DB
       log("RECOVER","Re-monitoring "+pos.symbol+" x"+contracts+" @ $"+avgEntry+" | stop $"+stop);
       startMonitor(recovered, recovered.indicators);
     }
@@ -2127,8 +2128,28 @@ function reconstructDayState(){
     dirLossesToday = { LONG:0, SHORT:0 };
     for(const t of todays){ if(t.pnl<0 && (t.direction==="LONG"||t.direction==="SHORT")) dirLossesToday[t.direction]++; }
     dirLockedToday = { LONG: dirLossesToday.LONG>=MAX_DIR_LOSSES_DAY, SHORT: dirLossesToday.SHORT>=MAX_DIR_LOSSES_DAY };
+    // Rebuild signalHistory (the array the dashboard cards + stats render from) from today's
+    // persisted trades — otherwise after a restart the live view shows only the 1 recovered
+    // open position ("Trades today: 1") while tradesDay says 8. Map each trade row to a
+    // closed signal-card shape so cards, win/loss counts and signals-derived P&L all match.
+    const cards = todays
+      .slice().sort((a,b)=>new Date(a.timestamp)-new Date(b.timestamp))
+      .map(t=>({
+        id: t.signal_id || Date.parse(t.timestamp)||Date.now(),
+        time: t.time, symbol:"SPY", direction: t.direction, right: t.right_type,
+        strike: t.strike, optionSymbol: t.symbol, contracts: t.contracts,
+        spyEntry: t.spy_price ?? null, fillPrice: t.fill_price,
+        stopPrice: t.stop_price, tp1Price: t.tp1_price,
+        closePrice: t.close_price, closePnl: t.pnl, closeReason: t.close_reason,
+        maxPrice: t.max_price, minPrice: t.min_price,
+        outcome: t.outcome, status: /TP1/.test(t.close_reason||"") ? "TP1_HIT" : (/EOD/.test(t.close_reason||"")?"EOD_CLOSED":"STOPPED"),
+        indicators:{ vwap:t.vwap_at_entry, rsi:t.rsi_at_entry, ema9:t.ema9_at_entry, orbHigh:t.orb_high, orbLow:t.orb_low },
+        recovered:true,
+      }));
+    // newest first (matches the live unshift convention); recoverPositions prepends the open one after
+    signalHistory = cards.reverse();
     log("RECOVER","Day state rebuilt from "+todays.length+" trade(s) today — sessionPnL $"+sessionPnL.toFixed(2)+" | dailyLoss $"+dailyLoss.toFixed(2)+" | tradesDay "+tradesDay+
-      " | dir losses L:"+dirLossesToday.LONG+" S:"+dirLossesToday.SHORT+(dirLockedToday.LONG?" [LONG LOCKED]":"")+(dirLockedToday.SHORT?" [SHORT LOCKED]":""));
+      " | cards "+signalHistory.length+" | dir losses L:"+dirLossesToday.LONG+" S:"+dirLossesToday.SHORT+(dirLockedToday.LONG?" [LONG LOCKED]":"")+(dirLockedToday.SHORT?" [SHORT LOCKED]":""));
   }catch(e){ log("RECOVER ERR","reconstructDayState: "+e.message); }
 }
 
