@@ -54,7 +54,7 @@ const ALPACA_BASE      = (process.env.ALPACA_BASE_URL || "https://paper-api.alpa
 const ALPACA_DATA      = "https://data.alpaca.markets";
 // Single source of truth for the version — used by /, /status, and the startup banner so
 // they can never drift apart again (the banner was stale at v11.8 while the app was v11.27).
-const APP_VERSION      = "11.31.3-recovered-strike-fix";
+const APP_VERSION      = "11.32-trend-recalibration";
 const ACCOUNT_SIZE     = parseFloat(process.env.ACCOUNT_SIZE     || "100000");
 const PORT             = parseInt(process.env.PORT               || "3001");
 const IS_PAPER         = ALPACA_BASE.includes("paper");
@@ -121,6 +121,7 @@ const SETTINGS_SCHEMA = {
   MAGNET_DIRECTION_FILTER:{ type:"enum",  values:["ON","OFF"], set:v=>MAGNET_DIRECTION_FILTER=v },
   MAGNET_RANGE:          { type:"number", min:0.5, max:10, set:v=>MAGNET_RANGE=v },
   MAX_DIR_LOSSES_DAY:    { type:"number", min:1, max:20, integer:true, set:v=>MAX_DIR_LOSSES_DAY=v },
+  TREND_MIN_SCORE:       { type:"number", min:2, max:5, integer:true, set:v=>TREND_MIN_SCORE=v },
 };
 
 function getSettingsSnapshot(){
@@ -135,7 +136,7 @@ function getSettingsSnapshot(){
     MARKET_MODE_AUTO, MARKET_MODE_OVERRIDE,
     SIGNAL_SCAN_MINS, GEX_REFRESH_MINS, POST_TP1_COOLDOWN_MINS,
     REVERSAL_BLOCK, PATH_RESIST_BLOCK, WALL_HARD_BLOCK,
-    MAGNET_DIRECTION_FILTER, MAGNET_RANGE, MAX_DIR_LOSSES_DAY,
+    MAGNET_DIRECTION_FILTER, MAGNET_RANGE, MAX_DIR_LOSSES_DAY, TREND_MIN_SCORE,
   };
 }
 
@@ -217,6 +218,9 @@ let MAGNET_RANGE        = parseFloat(process.env.MAGNET_RANGE || "2.5"); // magn
 // that direction until tomorrow. The 30-min cooldown resets and lets the bot bleed all day
 // (2026-07-23: 7 short losses); this caps it. Rebuilt from today's trades on restart.
 let MAX_DIR_LOSSES_DAY  = parseInt(process.env.MAX_DIR_LOSSES_DAY || "3");
+// TREND requires score >= this (raised 2→3 on 2026-08-06 — see detectMarketMode). Higher =
+// stricter = fewer days get the scalp profile, more fall back to NEUTRAL (run-to-TP1).
+let TREND_MIN_SCORE     = parseInt(process.env.TREND_MIN_SCORE || "3");
 let dirLossesToday      = { LONG:0, SHORT:0 };
 let dirLockedToday      = { LONG:false, SHORT:false };
 const snapTo5 = v => Math.max(5, Math.min(30, Math.round(v/5)*5)); // keep aligned to 5-min bars
@@ -1761,11 +1765,12 @@ function getModeParams() {
     //   fill <= $0.70 → keep 25% (cheap contracts, spread noise too wide for 15%)
     TREND: {
       rsiLongMax:70, rsiShortMin:30, cooldownMins:30, fibEntryFilter:false,
-      premiumStopPct:0.15,   // tighter initial stop (conditional on fill price — see executeTrade)
-      trailTriggerPct:0.30,  // activate trailing at +30% gain (vs 50% default)
-      trailDistancePct:0.25, // WIDE catastrophe backstop — primary TREND exit is the VWAP-cross
-                             // (premium trails get noise-flicked by IV/theta on trend days);
-                             // magnet-proximity tightening in startMonitor still overrides near walls
+      // FIX #2 (2026-08-06): let TREND winners RUN. The old 15% stop + 30% trail exited winners
+      // around +26% (avg win collapsed $916→$152). On a genuine trend (now rare: score>=3) the
+      // move is big, so give it room: wider stop, trail activates late so it can reach TP1.
+      premiumStopPct:0.22,   // was 0.15 — tight stop got chopped up (conditional on fill in executeTrade)
+      trailTriggerPct:0.60,  // was 0.30 — don't start trailing until +60%; let the trend run toward TP1
+      trailDistancePct:0.25, // wide catastrophe backstop; magnet-proximity tightening still overrides near walls
     },
     // NEUTRAL: use env var settings unchanged
     NEUTRAL: {
@@ -1847,16 +1852,26 @@ function detectMarketMode() {
     }
 
     marketScore = score;
-    let classified = score >= 2 ? "TREND" : score <= -2 ? "CHOP" : "NEUTRAL";
+    // FIX #1 (2026-08-06): TREND now needs score >= TREND_MIN_SCORE (3, was 2). The v11.14
+    // classifier fix flipped 78% of trades into TREND, whose scalp profile cut winners small
+    // and took tight-stop losses (net +$718 before → -$2013 after). Raising the bar sends
+    // most negative-GEX days back to the NEUTRAL "run to TP1" profile that was actually winning.
+    let classified = score >= TREND_MIN_SCORE ? "TREND" : score <= -2 ? "CHOP" : "NEUTRAL";
 
-    // Pin floor: positive GEX (dealer long-gamma) with VWAP sitting on the gamma flip is
-    // the definition of a pin/chop day — it must never be classified TREND, no matter how
-    // many secondary signals (squeeze/VEX/gap) fire. This is the same VWAP-on-flip condition
-    // that blocks entries in applyGEX; here it caps the regime. Prevents the 2026-07-13
-    // trade-2 case (positive GEX pin classified TREND → tight 15% stop → 1-min stop-out).
+    // Pin floor: positive GEX with VWAP on the gamma flip = pin/chop, never TREND.
     if (classified === "TREND" && gexCache?.netGex > 0 && gexCache?.gammaFlip != null &&
         lastVwap != null && Math.abs(lastVwap - gexCache.gammaFlip) < GEX_BUFFER) {
       reasons.push("PIN FLOOR: +GEX & VWAP $"+lastVwap.toFixed(2)+" on flip $"+gexCache.gammaFlip+" — capped TREND→NEUTRAL");
+      classified = "NEUTRAL";
+    }
+    // FIX #3 (2026-08-06): Magnet-pin override. A strong 0DTE magnet pulling price to it is a
+    // REVERTING (chop) day even on negative GEX — the tape pins, it doesn't trend. If VWAP is
+    // within MAGNET_RANGE of the 0DTE magnet, it's not a trend: cap TREND→NEUTRAL so we use the
+    // wide stop / run-to-TP1 profile instead of the scalp. Directly targets the 7/23 & 8/6
+    // reverting-short days (negative GEX, price pinned to the magnet).
+    if (classified === "TREND" && gexCache?.zeroDteMagnet != null && lastVwap != null &&
+        Math.abs(lastVwap - gexCache.zeroDteMagnet) < MAGNET_RANGE) {
+      reasons.push("MAGNET PIN: VWAP $"+lastVwap.toFixed(2)+" within $"+MAGNET_RANGE+" of 0DTE magnet $"+gexCache.zeroDteMagnet+" — capped TREND→NEUTRAL (reverting, not trending)");
       classified = "NEUTRAL";
     }
 
