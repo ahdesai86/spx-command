@@ -54,7 +54,7 @@ const ALPACA_BASE      = (process.env.ALPACA_BASE_URL || "https://paper-api.alpa
 const ALPACA_DATA      = "https://data.alpaca.markets";
 // Single source of truth for the version — used by /, /status, and the startup banner so
 // they can never drift apart again (the banner was stale at v11.8 while the app was v11.27).
-const APP_VERSION      = "11.32-trend-recalibration";
+const APP_VERSION      = "11.33-tier1-execution-correctness";
 const ACCOUNT_SIZE     = parseFloat(process.env.ACCOUNT_SIZE     || "100000");
 const PORT             = parseInt(process.env.PORT               || "3001");
 const IS_PAPER         = ALPACA_BASE.includes("paper");
@@ -364,8 +364,14 @@ function saveTradeToDB(trade, signalDbId, indicators) {
       pnl_pct:        pnlPct,
       duration_min:   trade.durationMin||null,
       outcome:        trade.outcome||null,
-      gex_regime:     gexCache?.regime||null,
-      gex_flip:       gexCache?.gammaFlip||null,
+      // entry-time context (frozen at fill in executeTrade) — NOT the live close-time cache
+      gex_regime:     trade.gexRegimeAtEntry ?? null,
+      gex_flip:       trade.gexFlipAtEntry ?? null,
+      net_gex_entry:  trade.netGexAtEntry ?? null,
+      dex_entry:      trade.dexAtEntry ?? null,
+      vex_entry:      trade.vexAtEntry ?? null,
+      chex_entry:     trade.chexAtEntry ?? null,
+      magnet_entry:   trade.magnetAtEntry ?? null,
       orb_high:       indicators?.orbHigh||null,
       orb_low:        indicators?.orbLow||null,
       vwap_at_entry:  indicators?.vwap||null,
@@ -534,7 +540,7 @@ async function getSPYBars() {
   try {
     const now    = new Date(new Date().toLocaleString("en-US",{timeZone:"America/New_York"}));
     const today  = now.toISOString().slice(0,10);
-    const start  = today+"T09:30:00-04:00";
+    const start  = today+"T09:30:00"+etOffset(today);
     const url    = ALPACA_DATA+"/v2/stocks/SPY/bars?timeframe=5Min&start="+
                    encodeURIComponent(start)+"&limit=100&feed=iex";
     const r      = await fetch(url,{headers:aH()});
@@ -550,7 +556,10 @@ async function getSPYQuote() {
     if (!r.ok) return null;
     const d = await r.json();
     const q = d.quote||{};
-    const p = parseFloat(q.ap||q.bp||0);
+    // Midpoint, not ask-first: ap||bp biased the underlying up on every scan (helped LONG
+    // confirmations, hurt SHORT). Use (bid+ask)/2 when both sides quote; fall back otherwise.
+    const bid=parseFloat(q.bp||0), ask=parseFloat(q.ap||0);
+    const p = (bid>0&&ask>0) ? (bid+ask)/2 : (ask||bid||0);
     return p>0?p:null;
   } catch(_) { return null; }
 }
@@ -730,12 +739,12 @@ function buildORB(bars) {
   if (orbState.built) return orbState;
 
   // ORB bars: 9:30 to 9:30+ORB_MINUTES
-  const orbEnd = new Date(today+"T09:30:00-04:00");
+  const orbEnd = new Date(today+"T09:30:00"+etOffset(today));
   orbEnd.setMinutes(orbEnd.getMinutes()+ORB_MINUTES);
 
   const orbBars = bars.filter(b=>{
     const bt = new Date(b.t);
-    return bt >= new Date(today+"T09:30:00-04:00") && bt < orbEnd;
+    return bt >= new Date(today+"T09:30:00"+etOffset(today)) && bt < orbEnd;
   });
 
   if (orbBars.length < 3) return null; // need at least 3 bars to confirm ORB
@@ -1314,6 +1323,14 @@ function buildSymbol(strike,right,date) {
   return "SPY"+yy+mm+dd+right+String(Math.round(strike*1000)).padStart(8,"0");
 }
 function getETDate(){return new Date(new Date().toLocaleString("en-US",{timeZone:"America/New_York"}));}
+// DST-safe ET UTC-offset for a given YYYY-MM-DD ("-04:00" in EDT, "-05:00" in EST). Replaces
+// hardcoded "-04:00" which was wrong Nov–Mar (ORB window + bar filtering off by an hour).
+function etOffset(dateStr){
+  const utcNoon = new Date(dateStr+"T12:00:00Z");
+  const etHour = parseInt(new Intl.DateTimeFormat("en-US",{timeZone:"America/New_York",hour:"numeric",hour12:false}).format(utcNoon),10);
+  let off = etHour - 12; if(off>0) off-=24;   // 12:00Z → 08:00 EDT(-4) or 07:00 EST(-5)
+  return (off<=0?"-":"+")+String(Math.abs(off)).padStart(2,"0")+":00";
+}
 function getExpiry(){const d=getETDate();return d.getFullYear()+String(d.getMonth()+1).padStart(2,"0")+String(d.getDate()).padStart(2,"0");}
 function getNextTradingDay(){
   const d=getETDate();
@@ -1336,6 +1353,29 @@ async function getMidPrice(symbol){
 // ── Position close ────────────────────────────────────────────────────────────
 async function closePosition(symbol){
   return await aDel("/v2/positions/"+encodeURIComponent(symbol));
+}
+
+// Confirmed close: verify the DELETE succeeded (retry once), treat a 404 as already-gone, and
+// derive the REAL exit price from the resulting close order's fill (not the pre-close mark).
+// Returns { ok, fillPrice }. ok=false means the position may STILL BE OPEN — caller must NOT
+// mark the trade closed; it should retry on the next monitor tick.
+async function closePositionConfirmed(symbol, fallbackPrice){
+  let r = await closePosition(symbol);
+  if(!r.ok){
+    if(String(r.status)==="404") return { ok:true, fillPrice:fallbackPrice }; // already gone/expired
+    await new Promise(res=>setTimeout(res,600));
+    r = await closePosition(symbol); // one retry
+    if(!r.ok){
+      if(String(r.status)==="404") return { ok:true, fillPrice:fallbackPrice };
+      log("MONITOR ERR","closePosition "+symbol+" FAILED ("+r.status+") — position may still be open");
+      return { ok:false, fillPrice:fallbackPrice, error:r.data };
+    }
+  }
+  // r.data is the close order — poll for its actual fill price
+  let fillPrice=fallbackPrice;
+  const oid=r.data?.id;
+  if(oid){ const f=await pollFill(oid,8000).catch(()=>null); if(f?.filled_avg_price) fillPrice=parseFloat(f.filled_avg_price); }
+  return { ok:true, fillPrice };
 }
 
 // ── Price monitor ─────────────────────────────────────────────────────────────
@@ -1366,11 +1406,16 @@ function startMonitor(signal, indicators) {
 
   const iv=setInterval(async()=>{
     if(!["FILLED"].includes(signal.status)){clearInterval(iv);return;}
+    // Re-entrancy guard: a poll/close call can take >30s; without this, a second tick could
+    // fire while the first is still awaiting a close → duplicate DELETE requests. Skip if busy.
+    if(signal._monitorBusy) return;
+    signal._monitorBusy=true;
+    try{
     // Market closed → skip. A 1DTE position held overnight can't move on a stale price, so
     // polling every 30s all night is wasted work and floods the log buffer (it pushed a whole
     // morning of activity out of the ring buffer on 2026-07-21). Interval stays alive; real
     // polling resumes at the next open. (Not a per-position log — silent skip by design.)
-    if(!isMarketHours(getETDate())) return;
+    if(!isMarketHours(getETDate())){ signal._monitorBusy=false; return; }
     try{
       const pos=await aGet("/v2/positions/"+encodeURIComponent(signal.optionSymbol));
       consecutiveErrors = 0; // reset on any successful poll
@@ -1456,12 +1501,13 @@ function startMonitor(signal, indicators) {
 
       // TREND VWAP-cross exit — flagged by the scan loop on a 5-min close through VWAP
       if (signal.vwapExit) {
+        const cc=await closePositionConfirmed(signal.optionSymbol, price);
+        if(!cc.ok){ log("MONITOR ERR","VWAP-exit close FAILED — retrying next tick"); broadcast({type:"signal_update",id:signal.id,status:"CLOSE_FAILED"}); return; }
         clearInterval(iv);
-        log("TREND","Closing "+signal.optionSymbol+" on VWAP-cross exit at $"+price+
-          " | peak $"+signal.maxPrice+" ("+signal.maxPnlPct+"%)");
-        await closePosition(signal.optionSymbol);
-        const pnl=(price-entry)*100*signal.contracts;
-        signal.status="STOPPED"; signal.closePnl=pnl; signal.closePrice=price;
+        const exitPx=cc.fillPrice;
+        log("TREND","Closed "+signal.optionSymbol+" on VWAP-cross exit @ $"+exitPx+" | peak $"+signal.maxPrice+" ("+signal.maxPnlPct+"%)");
+        const pnl=(exitPx-entry)*100*signal.contracts;
+        signal.status="STOPPED"; signal.closePnl=pnl; signal.closePrice=exitPx;
         signal.closeReason="VWAP_TREND_EXIT"; signal.durationMin=((Date.now()-entryTime)/60000).toFixed(1);
         signal.outcome=pnl>=0?"WIN":"LOSS";
         sessionPnL+=pnl; dailyLoss+=Math.abs(Math.min(0,pnl));
@@ -1474,28 +1520,32 @@ function startMonitor(signal, indicators) {
       broadcast({type:"signal_update",id:signal.id,currentPrice:price,maxPrice:signal.maxPrice,minPrice:signal.minPrice,maxPnlPct:signal.maxPnlPct,minPnlPct:signal.minPnlPct});
 
       if(price>=signal.tp1Price){
+        const cc=await closePositionConfirmed(signal.optionSymbol, price);
+        if(!cc.ok){ log("MONITOR ERR","TP1 close FAILED — retrying next tick"); broadcast({type:"signal_update",id:signal.id,status:"CLOSE_FAILED"}); return; }
         clearInterval(iv);
-        log("TP1","Hit $"+price+" >= $"+signal.tp1Price+" | peak $"+signal.maxPrice+" ("+signal.maxPnlPct+"%)");
-        await closePosition(signal.optionSymbol);
-        const pnl=(price-entry)*100*signal.contracts;
-        signal.status="TP1_HIT"; signal.closePnl=pnl; signal.closePrice=price;
+        const exitPx=cc.fillPrice;
+        log("TP1","Hit $"+price+" >= $"+signal.tp1Price+" — closed @ $"+exitPx+" | peak $"+signal.maxPrice+" ("+signal.maxPnlPct+"%)");
+        const pnl=(exitPx-entry)*100*signal.contracts;
+        signal.status="TP1_HIT"; signal.closePnl=pnl; signal.closePrice=exitPx;
         signal.closeReason="TP1_HIT"; signal.durationMin=((Date.now()-entryTime)/60000).toFixed(1);
-        signal.outcome="WIN";
+        signal.outcome=pnl>=0?"WIN":"LOSS";
         lastTP1Time=Date.now();  // start the post-TP1 cooldown — the move is usually exhausted
-        sessionPnL+=pnl;
+        sessionPnL+=pnl; dailyLoss+=Math.abs(Math.min(0,pnl));
         broadcast({type:"signal_update",id:signal.id,status:"TP1_HIT",pnl});
         saveTradeToDB(signal,signal._dbId,indicators);
         return;
       }
       if(price<=signal.stopPrice){
-        clearInterval(iv);
         const reason=signal.trailingActive?"TRAIL_STOP_HIT":signal.ratchetActive?"RATCHET_STOP_HIT":"STOP_HIT";
+        const cc=await closePositionConfirmed(signal.optionSymbol, price);
+        if(!cc.ok){ log("MONITOR ERR","stop close FAILED — retrying next tick"); broadcast({type:"signal_update",id:signal.id,status:"CLOSE_FAILED"}); return; }
+        clearInterval(iv);
+        const exitPx=cc.fillPrice;
         log(signal.trailingActive?"TRAIL":"STOP",
-          (signal.trailingActive?"Trailing stop":"Stop")+" hit $"+price+" <= $"+signal.stopPrice+
+          (signal.trailingActive?"Trailing stop":"Stop")+" hit $"+price+" <= $"+signal.stopPrice+" — closed @ $"+exitPx+
           " | peak $"+signal.maxPrice+" ("+signal.maxPnlPct+"%) | trough $"+signal.minPrice+" ("+signal.minPnlPct+"%)");
-        await closePosition(signal.optionSymbol);
-        const pnl=(price-entry)*100*signal.contracts;
-        signal.status="STOPPED"; signal.closePnl=pnl; signal.closePrice=price;
+        const pnl=(exitPx-entry)*100*signal.contracts;
+        signal.status="STOPPED"; signal.closePnl=pnl; signal.closePrice=exitPx;
         signal.closeReason=reason; signal.durationMin=((Date.now()-entryTime)/60000).toFixed(1);
         signal.outcome=pnl>=0?"WIN":"LOSS";
         // Cooldown only applies to genuine losses on the initial fixed stop — a trailing
@@ -1554,6 +1604,7 @@ function startMonitor(signal, indicators) {
         broadcast({type:"signal_update",id:signal.id,status:"MONITOR_FAILED"});
       }
     }
+    } finally { signal._monitorBusy=false; } // always release the re-entrancy lock
   },30000); // 30s poll
   signal._monitorInterval=iv;
 }
@@ -1676,8 +1727,26 @@ async function executeTrade(direction, price, indicators, gexResult) {
     broadcast({type:"signal_update",id:sig.id,status:"SENT",optionSymbol:sig.optionSymbol,contracts,midPrice:mid,totalCost});
     log("ALPACA","Order: "+order.id+" | "+sig.optionSymbol+" x"+contracts+" @ $"+mid);
 
-    const filled=await pollFill(order.id,60000);
-    if(!filled){log("ORDER","Unfilled after 60s");sig.status="PENDING";return;}
+    let filled=await pollFill(order.id,60000).catch(()=>null);
+    if(!filled){
+      // Don't leave a live limit order the bot no longer watches — it could fill later,
+      // unmonitored, while the bot takes another trade. Cancel, then check for a partial fill.
+      log("ORDER","Unfilled after 60s — cancelling order "+order.id);
+      try{ await aDel("/v2/orders/"+order.id); }catch(e){ log("ORDER ERR","cancel: "+e.message); }
+      let final=null; try{ final=await aGet("/v2/orders/"+order.id); }catch(_){}
+      const fq=parseInt(final?.filled_qty||0);
+      if(fq>0){
+        // Partially filled before cancel — that's a real position; monitor it.
+        log("ORDER","Partial fill "+fq+"/"+contracts+" before cancel — monitoring as position");
+        filled={ filled_avg_price: final.filled_avg_price||mid };
+        contracts=fq; sig.contracts=fq;
+      } else {
+        sig.status="CANCELLED";
+        broadcast({type:"signal_update",id:sig.id,status:"CANCELLED"});
+        log("ORDER","No fill — order cancelled, no position");
+        return;
+      }
+    }
 
     sig.fillPrice=parseFloat(filled.filled_avg_price||mid);
 
@@ -1700,6 +1769,15 @@ async function executeTrade(direction, price, indicators, gexResult) {
     sig.trailTriggerPct  = effectiveTrailTriggerPct;
     sig.trailDistancePct = effectiveTrailDistancePct;
     sig.modeAtFill       = mp ? (MARKET_MODE_OVERRIDE || MARKET_MODE) : "NEUTRAL";
+    // Freeze entry-time GEX context so the trade row reflects conditions AT ENTRY, not at close
+    // (reading the live cache at close time contaminated later performance analysis).
+    sig.gexRegimeAtEntry = gexCache?.regime || null;
+    sig.gexFlipAtEntry   = gexCache?.gammaFlip || null;
+    sig.netGexAtEntry    = gexCache?.netGex ?? null;
+    sig.dexAtEntry       = gexCache?.dex ?? null;
+    sig.vexAtEntry       = gexCache?.vex ?? null;
+    sig.chexAtEntry      = gexCache?.chex ?? null;
+    sig.magnetAtEntry    = gexCache?.zeroDteMagnet ?? null;
 
     sig.stopPrice=stop; sig.tp1Price=tp1; sig.status="FILLED";
     sig.entryTime=Date.now();
@@ -2000,6 +2078,7 @@ async function runSignalEngine() {
     // Daily per-direction lockout — hard cap on losses in one direction per day
     if(dirLockedToday[eval_result.direction]){
       log("SCAN","Direction LOCKED for the day: "+eval_result.direction+" — hit "+MAX_DIR_LOSSES_DAY+" losses");
+      saveSignalToDB({direction:eval_result.direction,spyEntry:currentPrice,gexTarget:null,strength:eval_result.strength},{...ind},false,"LOCKOUT: "+eval_result.direction+" hit "+MAX_DIR_LOSSES_DAY+" losses today");
       scanActive=false;return;
     }
 
@@ -2009,6 +2088,7 @@ async function runSignalEngine() {
       if(Date.now()<cd){
         const remain=Math.ceil((cd-Date.now())/60000);
         log("SCAN","Direction cooldown: "+eval_result.direction+" blocked ("+remain+" min) — 2 consecutive stops");
+        saveSignalToDB({direction:eval_result.direction,spyEntry:currentPrice,gexTarget:null,strength:eval_result.strength},{...ind},false,"COOLDOWN: "+eval_result.direction+" blocked "+remain+"m after 2 stops");
         scanActive=false;return;
       }
     }
