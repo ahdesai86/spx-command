@@ -46,6 +46,7 @@ const express = require("express");
 const cors    = require("cors");
 const fs      = require("fs");
 const path    = require("path");
+const crypto  = require("crypto");
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const ALPACA_KEY       = process.env.ALPACA_KEY       || "";
@@ -55,6 +56,12 @@ const ALPACA_DATA      = "https://data.alpaca.markets";
 // Single source of truth for the version — used by /, /status, and the startup banner so
 // they can never drift apart again (the banner was stale at v11.8 while the app was v11.27).
 const APP_VERSION      = "11.34-2dte-immediate-strikes";
+// A stable cohort tag, deliberately separate from the display version. Every new
+// journal row carries it, so the 2DTE/immediate-strike strategy can be measured
+// without mixing it with the historical 0DTE/GEX-strike records.
+const STRATEGY_ID      = process.env.STRATEGY_ID || "orb-2dte-immediate-v1";
+const JOURNAL_SCHEMA_VERSION = 2;
+const STRATEGY_RUN_ID  = "run_"+crypto.randomUUID();
 const ACCOUNT_SIZE     = parseFloat(process.env.ACCOUNT_SIZE     || "100000");
 const PORT             = parseInt(process.env.PORT               || "3001");
 const IS_PAPER         = ALPACA_BASE.includes("paper");
@@ -304,7 +311,16 @@ function loadDB(table) {
 
 function saveDB(table, rows) {
   const file = path.join(DB_DIR, table+".json");
-  try { fs.writeFileSync(file, JSON.stringify(rows, null, 2)); } catch(e) { log("DB ERR","Save "+table+": "+e.message); }
+  // Atomic replacement on the same Railway volume: a restart/crash can leave a
+  // disposable .tmp file, but it cannot truncate the last good journal file.
+  const tmp=file+"."+process.pid+"."+crypto.randomUUID()+".tmp";
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(rows, null, 2));
+    fs.renameSync(tmp,file);
+  } catch(e) {
+    try{ if(fs.existsSync(tmp)) fs.unlinkSync(tmp); }catch(_){}
+    log("DB ERR","Save "+table+": "+e.message);
+  }
 }
 
 function insertDB(table, row) {
@@ -313,6 +329,34 @@ function insertDB(table, row) {
   rows.push(row);
   saveDB(table, rows);
   return row;
+}
+
+function journalId(kind){ return kind+"_"+crypto.randomUUID(); }
+function strategyConfigSnapshot(){
+  return {
+    strategy_id:STRATEGY_ID, app_version:APP_VERSION,
+    expiry_dte:2, strike_selection:"immediate-directional-$1",
+    signal_mode:SIGNAL_MODE, market_mode_auto:MARKET_MODE_AUTO,
+    premium_stop_pct:PREMIUM_STOP_PCT, trail_trigger_pct:TRAIL_TRIGGER_PCT,
+    trail_distance_pct:TRAIL_DISTANCE_PCT, max_option_spread_pct:MAX_OPTION_SPREAD_PCT,
+  };
+}
+function decisionMeta(fired, reason=""){
+  const r=String(reason).toLowerCase();
+  if(fired) return {stage:"entry",code:"ENTRY_ALLOWED"};
+  if(/no orb/.test(r)) return {stage:"signal",code:"SIGNAL_ORB"};
+  if(/no vwap/.test(r)) return {stage:"signal",code:"SIGNAL_VWAP"};
+  if(/no rsi|rsi /.test(r)) return {stage:"signal",code:"SIGNAL_RSI"};
+  if(/ema/.test(r)) return {stage:"signal",code:"SIGNAL_EMA"};
+  if(/lockout/.test(r)) return {stage:"risk",code:"RISK_DIRECTION_LOCKOUT"};
+  if(/cooldown/.test(r)) return {stage:"risk",code:"RISK_COOLDOWN"};
+  if(/chex/.test(r)) return {stage:"gex",code:"GEX_CHEX"};
+  if(/no gex cache|fail-closed/.test(r)) return {stage:"gex",code:"GEX_UNAVAILABLE"};
+  if(/gamma flip|pinned to gamma/.test(r)) return {stage:"gex",code:"GEX_GAMMA_FLIP"};
+  if(/pin risk/.test(r)) return {stage:"gex",code:"GEX_PIN_RISK"};
+  if(/magnet/.test(r)) return {stage:"gex",code:"GEX_MAGNET"};
+  if(/wall|target|path resist|reversal risk/.test(r)) return {stage:"gex",code:"GEX_WALL_OR_PATH"};
+  return {stage:"other",code:"OTHER_BLOCK"};
 }
 
 function initDB() {
@@ -333,7 +377,12 @@ function initDB() {
 
 function saveSignalToDB(sig, indicators, fired, blockedReason) {
   try {
+    const decision=decisionMeta(fired, blockedReason);
     return insertDB("signals", {
+      journal_id:    sig.journalId||journalId("signal"),
+      strategy_id:   sig.strategyId||STRATEGY_ID,
+      strategy_run_id:STRATEGY_RUN_ID,
+      journal_schema_version:JOURNAL_SCHEMA_VERSION,
       timestamp:      new Date().toISOString(),
       date:           new Date().toLocaleDateString("en-CA",{timeZone:"America/New_York"}),
       time:           new Date().toLocaleTimeString("en-US",{hour12:false,timeZone:"America/New_York"}),
@@ -372,6 +421,10 @@ function saveSignalToDB(sig, indicators, fired, blockedReason) {
       signal_strength:sig.strength||null,
       signal_mode:    SIGNAL_MODE,
       market_mode:    MARKET_MODE,
+      strategy_config:sig.strategyConfig||strategyConfigSnapshot(),
+      signal_checks:  indicators.decisionChecks||null,
+      decision_stage: decision.stage,
+      decision_code:  decision.code,
       fired:          fired?1:0,
       blocked_reason: blockedReason||null,
     });
@@ -383,7 +436,12 @@ function saveTradeToDB(trade, signalDbId, indicators) {
     const pnlPct = trade.closePnl&&trade.totalCost
       ? parseFloat(((trade.closePnl/trade.totalCost)*100).toFixed(1)) : null;
     return insertDB("trades", {
+      journal_id:      journalId("trade"),
+      strategy_id:     trade.strategyId||STRATEGY_ID,
+      strategy_run_id: STRATEGY_RUN_ID,
+      journal_schema_version:JOURNAL_SCHEMA_VERSION,
       signal_id:      signalDbId||null,
+      signal_journal_id:trade.journalId||null,
       timestamp:      new Date().toISOString(),
       date:           new Date().toLocaleDateString("en-CA",{timeZone:"America/New_York"}),
       time:           new Date().toLocaleTimeString("en-US",{hour12:false,timeZone:"America/New_York"}),
@@ -432,6 +490,11 @@ function saveTradeToDB(trade, signalDbId, indicators) {
       signal_mode:    SIGNAL_MODE,
       market_mode:    MARKET_MODE,
       mode_at_fill:   trade.modeAtFill||null,
+      strategy_config:trade.strategyConfig||strategyConfigSnapshot(),
+      // Captured quotes and actual order fills make execution drag measurable from
+      // the journal rather than estimated with a blanket slippage assumption.
+      entry_execution: trade.entryExecution||null,
+      exit_execution:  trade.exitExecution||null,
       // Shadow trail counterfactuals — what each virtual config WOULD have exited at.
       // Unexited shadows finalize at the real close price (they rode to the actual exit).
       shadow_exits:   (trade.shadows||[]).map(sh=>({
@@ -482,6 +545,10 @@ function enrichWithPercentiles(result) {
 function saveGEXSnapshot(g) {
   try {
     insertDB("gex_snapshots", {
+      journal_id:   journalId("gex"),
+      strategy_id:  STRATEGY_ID,
+      strategy_run_id:STRATEGY_RUN_ID,
+      journal_schema_version:JOURNAL_SCHEMA_VERSION,
       timestamp:   new Date().toISOString(),
       spot_price:  g.spotPrice,
       net_gex:     g.netGex,
@@ -1516,8 +1583,30 @@ async function getOptionQuote(symbol){
     const bid=parseFloat(s.latestQuote.bp||0),ask=parseFloat(s.latestQuote.ap||0);
     if(!(bid>0&&ask>0&&ask>=bid)) return null;
     const mid=parseFloat(((bid+ask)/2).toFixed(2));
-    return { bid, ask, mid, spreadPct:(ask-bid)/mid };
+    return { bid, ask, mid, spreadPct:(ask-bid)/mid,
+      quoteTimestamp:s.latestQuote.t||null, capturedAt:new Date().toISOString() };
   }catch(_){return null;}
+}
+
+function quoteSnapshot(q){
+  return q ? {bid:q.bid,ask:q.ask,mid:q.mid,spread_pct:q.spreadPct,
+    quote_timestamp:q.quoteTimestamp||null,captured_at:q.capturedAt||new Date().toISOString()} : null;
+}
+async function captureExitQuote(trade){
+  if(!trade?.optionSymbol) return null;
+  const quote=await getOptionQuote(trade.optionSymbol);
+  if(quote) trade.exitExecution={quote:quoteSnapshot(quote), close_requested_at:new Date().toISOString()};
+  else trade.exitExecution={quote:null, close_requested_at:new Date().toISOString()};
+  return quote;
+}
+function recordExitFill(trade, fillPrice){
+  if(!trade) return;
+  trade.exitExecution ||= {quote:null,close_requested_at:null};
+  const q=trade.exitExecution.quote;
+  trade.exitExecution.fill_price=fillPrice??null;
+  trade.exitExecution.filled_at=new Date().toISOString();
+  trade.exitExecution.fill_vs_bid=(q?.bid!=null&&fillPrice!=null) ? +((fillPrice-q.bid).toFixed(4)) : null;
+  trade.exitExecution.fill_vs_mid=(q?.mid!=null&&fillPrice!=null) ? +((fillPrice-q.mid).toFixed(4)) : null;
 }
 
 // ── Position close ────────────────────────────────────────────────────────────
@@ -1529,14 +1618,15 @@ async function closePosition(symbol){
 // derive the REAL exit price from the resulting close order's fill (not the pre-close mark).
 // Returns { ok, fillPrice }. ok=false means the position may STILL BE OPEN — caller must NOT
 // mark the trade closed; it should retry on the next monitor tick.
-async function closePositionConfirmed(symbol, fallbackPrice){
+async function closePositionConfirmed(symbol, fallbackPrice, trade=null){
+  if(trade) await captureExitQuote(trade);
   let r = await closePosition(symbol);
   if(!r.ok){
-    if(String(r.status)==="404") return { ok:true, fillPrice:fallbackPrice }; // already gone/expired
+    if(String(r.status)==="404"){ recordExitFill(trade,fallbackPrice); return { ok:true, fillPrice:fallbackPrice }; } // already gone/expired
     await new Promise(res=>setTimeout(res,600));
     r = await closePosition(symbol); // one retry
     if(!r.ok){
-      if(String(r.status)==="404") return { ok:true, fillPrice:fallbackPrice };
+      if(String(r.status)==="404"){ recordExitFill(trade,fallbackPrice); return { ok:true, fillPrice:fallbackPrice }; }
       log("MONITOR ERR","closePosition "+symbol+" FAILED ("+r.status+") — position may still be open");
       return { ok:false, fillPrice:fallbackPrice, error:r.data };
     }
@@ -1545,6 +1635,7 @@ async function closePositionConfirmed(symbol, fallbackPrice){
   let fillPrice=fallbackPrice;
   const oid=r.data?.id;
   if(oid){ const f=await pollFill(oid,8000).catch(()=>null); if(f?.filled_avg_price) fillPrice=parseFloat(f.filled_avg_price); }
+  recordExitFill(trade,fillPrice);
   return { ok:true, fillPrice };
 }
 
@@ -1671,7 +1762,7 @@ function startMonitor(signal, indicators) {
 
       // TREND VWAP-cross exit — flagged by the scan loop on a 5-min close through VWAP
       if (signal.vwapExit) {
-        const cc=await closePositionConfirmed(signal.optionSymbol, price);
+        const cc=await closePositionConfirmed(signal.optionSymbol, price, signal);
         if(!cc.ok){ log("MONITOR ERR","VWAP-exit close FAILED — retrying next tick"); broadcast({type:"signal_update",id:signal.id,status:"CLOSE_FAILED"}); return; }
         clearInterval(iv);
         const exitPx=cc.fillPrice;
@@ -1698,7 +1789,7 @@ function startMonitor(signal, indicators) {
       }
       if(price<=signal.stopPrice){
         const reason=signal.trailingActive?"TRAIL_STOP_HIT":signal.ratchetActive?"RATCHET_STOP_HIT":"STOP_HIT";
-        const cc=await closePositionConfirmed(signal.optionSymbol, price);
+        const cc=await closePositionConfirmed(signal.optionSymbol, price, signal);
         if(!cc.ok){ log("MONITOR ERR","stop close FAILED — retrying next tick"); broadcast({type:"signal_update",id:signal.id,status:"CLOSE_FAILED"}); return; }
         clearInterval(iv);
         const exitPx=cc.fillPrice;
@@ -1793,6 +1884,9 @@ async function executeTrade(direction, price, indicators, gexResult) {
 
   const sig = {
     id:          Date.now(),
+    journalId:   journalId("signal"),
+    strategyId:  STRATEGY_ID,
+    strategyConfig:strategyConfigSnapshot(),
     time:        new Date().toLocaleTimeString("en-US",{hour12:false,timeZone:"America/New_York"}),
     symbol:      "SPY", direction, right,
     spyEntry:    price, strike:si.strike,
@@ -1865,11 +1959,17 @@ async function executeTrade(direction, price, indicators, gexResult) {
 
     log("SAFETY","Guards passed — "+sig.optionSymbol+" x"+contracts+" @ ask $"+quote.ask+" | spread "+(quote.spreadPct*100).toFixed(1)+"% | planned loss $"+((quote.ask-plannedStop)*100*contracts).toFixed(2));
 
+    sig.entryExecution={
+      quote:quoteSnapshot(quote), limit_price:quote.ask,
+      planned_stop_price:plannedStop, planned_contracts:contracts,
+      order_submitted_at:new Date().toISOString(),
+    };
     const order=await aPost("/v2/orders",{
       symbol:sig.optionSymbol, qty:String(contracts),
       side:"buy", type:"limit", limit_price:String(quote.ask),
       time_in_force:"day", client_order_id:"spxcmd_"+sig.id,
     });
+    sig.entryExecution.order_id=order.id||null;
 
     sig.contracts=contracts; sig.midPrice=quote.mid; sig.totalCost=totalCost;
     sig.status="SENT";
@@ -1899,6 +1999,10 @@ async function executeTrade(direction, price, indicators, gexResult) {
 
     sig.fillPrice=parseFloat(filled.filled_avg_price||quote.ask);
     sig.totalCost=parseFloat((sig.fillPrice*100*sig.contracts).toFixed(2));
+    sig.entryExecution.filled_at=filled.filled_at||new Date().toISOString();
+    sig.entryExecution.fill_latency_ms=Date.parse(sig.entryExecution.filled_at)-Date.parse(sig.entryExecution.order_submitted_at);
+    sig.entryExecution.fill_vs_ask=+(sig.fillPrice-quote.ask).toFixed(4);
+    sig.entryExecution.fill_vs_mid=+(sig.fillPrice-quote.mid).toFixed(4);
 
     // Freeze mode-specific exit params at fill time so mid-session mode changes don't affect open position
     const mp = MARKET_MODE_AUTO==="ON" ? getModeParams() : null;
@@ -2224,14 +2328,14 @@ async function runSignalEngine() {
     if(!eval_result.fire){
       log("SCAN","No signal — "+eval_result.reason);
       // Still save to DB for analysis
-      saveSignalToDB({direction:ind.orbBreak||"NONE",spyEntry:currentPrice,gexTarget:null,strength:"WEAK"},{...ind},false,eval_result.reason);
+      saveSignalToDB({direction:ind.orbBreak||"NONE",spyEntry:currentPrice,gexTarget:null,strength:"WEAK"},{...ind,decisionChecks:{passed:eval_result.passed,failed:eval_result.failed}},false,eval_result.reason);
       scanActive=false;return;
     }
 
     // Daily per-direction lockout — hard cap on losses in one direction per day
     if(dirLockedToday[eval_result.direction]){
       log("SCAN","Direction LOCKED for the day: "+eval_result.direction+" — hit "+MAX_DIR_LOSSES_DAY+" losses");
-      saveSignalToDB({direction:eval_result.direction,spyEntry:currentPrice,gexTarget:null,strength:eval_result.strength},{...ind},false,"LOCKOUT: "+eval_result.direction+" hit "+MAX_DIR_LOSSES_DAY+" losses today");
+      saveSignalToDB({direction:eval_result.direction,spyEntry:currentPrice,gexTarget:null,strength:eval_result.strength},{...ind,decisionChecks:{passed:eval_result.passed,failed:eval_result.failed}},false,"LOCKOUT: "+eval_result.direction+" hit "+MAX_DIR_LOSSES_DAY+" losses today");
       scanActive=false;return;
     }
 
@@ -2241,7 +2345,7 @@ async function runSignalEngine() {
       if(Date.now()<cd){
         const remain=Math.ceil((cd-Date.now())/60000);
         log("SCAN","Direction cooldown: "+eval_result.direction+" blocked ("+remain+" min) — 2 consecutive stops");
-        saveSignalToDB({direction:eval_result.direction,spyEntry:currentPrice,gexTarget:null,strength:eval_result.strength},{...ind},false,"COOLDOWN: "+eval_result.direction+" blocked "+remain+"m after 2 stops");
+        saveSignalToDB({direction:eval_result.direction,spyEntry:currentPrice,gexTarget:null,strength:eval_result.strength},{...ind,decisionChecks:{passed:eval_result.passed,failed:eval_result.failed}},false,"COOLDOWN: "+eval_result.direction+" blocked "+remain+"m after 2 stops");
         scanActive=false;return;
       }
     }
@@ -2255,13 +2359,13 @@ async function runSignalEngine() {
       if(eval_result.direction==="LONG" && chex>CHEX_THRESHOLD){
         const reason="CHEX +" + (chex/1e9).toFixed(1)+"B after 1PM — MM charm decay selling into close";
         log("GEX","CHEX EOD filter: LONG skipped — "+reason);
-        saveSignalToDB({direction:eval_result.direction,spyEntry:currentPrice,gexTarget:null,strength:eval_result.strength},{...ind},false,"CHEX: "+reason);
+        saveSignalToDB({direction:eval_result.direction,spyEntry:currentPrice,gexTarget:null,strength:eval_result.strength},{...ind,decisionChecks:{passed:eval_result.passed,failed:eval_result.failed}},false,"CHEX: "+reason);
         scanActive=false;return;
       }
       if(eval_result.direction==="SHORT" && chex<-CHEX_THRESHOLD){
         const reason="CHEX "+(chex/1e9).toFixed(1)+"B after 1PM — MM charm decay buying into close";
         log("GEX","CHEX EOD filter: SHORT skipped — "+reason);
-        saveSignalToDB({direction:eval_result.direction,spyEntry:currentPrice,gexTarget:null,strength:eval_result.strength},{...ind},false,"CHEX: "+reason);
+        saveSignalToDB({direction:eval_result.direction,spyEntry:currentPrice,gexTarget:null,strength:eval_result.strength},{...ind,decisionChecks:{passed:eval_result.passed,failed:eval_result.failed}},false,"CHEX: "+reason);
         scanActive=false;return;
       }
     }
@@ -2279,14 +2383,14 @@ async function runSignalEngine() {
     const gexResult=applyGEX(eval_result.direction,currentPrice,ind.vwap);
     if(!gexResult.allowed){
       log("GEX","Signal BLOCKED — "+gexResult.reason);
-      saveSignalToDB({direction:eval_result.direction,spyEntry:currentPrice,gexTarget:gexResult.target,strength:eval_result.strength},{...ind},false,"GEX: "+gexResult.reason);
+      saveSignalToDB({direction:eval_result.direction,spyEntry:currentPrice,gexTarget:gexResult.target,strength:eval_result.strength},{...ind,decisionChecks:{passed:eval_result.passed,failed:eval_result.failed,gex:{allowed:false,reason:gexResult.reason}}},false,"GEX: "+gexResult.reason);
       scanActive=false;return;
     }
 
     log("SIGNAL","FIRED ✓ | "+eval_result.direction+" | "+eval_result.reason+" | GEX: "+gexResult.reason);
     broadcast({type:"signal_fired",direction:eval_result.direction,price:currentPrice,reason:eval_result.reason});
 
-    await executeTrade(eval_result.direction, currentPrice, {...ind,strength:eval_result.strength}, gexResult);
+    await executeTrade(eval_result.direction, currentPrice, {...ind,strength:eval_result.strength,decisionChecks:{passed:eval_result.passed,failed:eval_result.failed,gex:{allowed:true,reason:gexResult.reason}}}, gexResult);
 
   }catch(e){ log("SCAN ERR","runSignalEngine: "+e.message); }
   scanActive=false;
@@ -2424,6 +2528,7 @@ async function forceCloseAll(){
         const pos=await aGet("/v2/positions/"+encodeURIComponent(sig.optionSymbol));
         lastKnownPrice=parseFloat(pos.current_price||0)||null;
       }catch(_){}
+      await captureExitQuote(sig);
 
       const r=await closePosition(sig.optionSymbol);
       log("EOD","Closed "+sig.optionSymbol+" → "+r.status);
@@ -2439,6 +2544,7 @@ async function forceCloseAll(){
           if(filled&&filled.filled_avg_price) closePrice=parseFloat(filled.filled_avg_price);
         }
         if(!closePrice) closePrice=lastKnownPrice;
+        recordExitFill(sig,closePrice);
 
         const pnl=(closePrice!=null&&entry)?(closePrice-entry)*100*sig.contracts:null;
 
@@ -3035,6 +3141,7 @@ app.get("/status",(req,res)=>{
     tp1Config:{mode:"trail-trigger",value:TRAIL_TRIGGER_DOLLARS>0?"$"+TRAIL_TRIGGER_DOLLARS:"+"+(TRAIL_TRIGGER_PCT*100)+"%"},
     strikeSelection:"immediate $1 strike in signal direction",
     expiry:"2DTE (Alpaca trading calendar)",
+    strategyJournal:{strategyId:STRATEGY_ID,schemaVersion:JOURNAL_SCHEMA_VERSION,runId:STRATEGY_RUN_ID},
     trailingStop:{triggerPct:(TRAIL_TRIGGER_PCT*100)+"%",trailDistance:(TRAIL_DISTANCE_PCT*100)+"%"},
     sessionPnL:sessionPnL.toFixed(2), dailyLoss:dailyLoss.toFixed(2),
     tradeEcho:{enabled:!!TRADEECHO_PAT,requestCount:tradeEchoQuota?.count||0,requestLimit:TRADEECHO_MAX_REQUESTS_HOUR,hour:tradeEchoQuota?.hour||null,quotaBlocked:tradeEchoQuotaBlocked},
@@ -3125,6 +3232,7 @@ app.listen(PORT,async()=>{
   if(DASH_PASS) log("SECURITY","Password wall ACTIVE — Basic Auth required on all routes (user: "+DASH_USER+"). Rate limit "+RATE_MAX+"/min/IP.");
   else log("SECURITY","*** WARNING: DASHBOARD_PASS not set — app is PUBLIC. Set DASHBOARD_PASS in Railway to close it. *** (rate limit "+RATE_MAX+"/min/IP still active)");
   if(READONLY_TOKEN) log("SECURITY","Read-only token ACTIVE — limited to dashboard and selected data GET endpoints.");
+  log("JOURNAL","Strategy cohort "+STRATEGY_ID+" | schema v"+JOURNAL_SCHEMA_VERSION+" | run "+STRATEGY_RUN_ID);
   console.log(`
  ╔══════════════════════════════════════════════════════╗
  ║${("  SPX COMMAND v"+APP_VERSION.split("-")[0]+" · TradeEcho · AutoMode").padEnd(54).slice(0,54)}║
