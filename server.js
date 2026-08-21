@@ -70,6 +70,9 @@ const TP1_FIXED_MOVE   = parseFloat(process.env.TP1_FIXED_MOVE   || "0");
 const TRADEECHO_PAT    = process.env.TRADEECHO_PAT || "";
 const TRADEECHO_MCP    = "https://api.tradeecho.com/api/mcp/intel";
 const TRADEECHO_MAX_REQUESTS_HOUR = 20;
+// Preserve capacity for the GEX safety filter. Flow/AlgoEdge are measurement-only
+// and must yield before they can starve the entry gate of Dealer Edge data.
+const TRADEECHO_GEX_RESERVE = 5;
 
 // ── Runtime-tunable settings ───────────────────────────────────────────────────
 // These start from env vars but can be changed live via GET/POST /settings (and
@@ -270,7 +273,7 @@ const TRADEECHO_QUOTA_FILE = path.join(DB_DIR, "tradeecho_quota.json");
 let tradeEchoQuota = null;
 let tradeEchoQuotaBlocked = false;
 let tradeEchoSessionId = null;
-let tradeEchoDealerTool = null;
+let tradeEchoTools = null;
 let tradeEchoRpcId = 0;
 
 function tradeEchoHourKey(){
@@ -282,13 +285,15 @@ function loadTradeEchoQuota(){
   if(tradeEchoQuota) return;
   try{ tradeEchoQuota=JSON.parse(fs.readFileSync(TRADEECHO_QUOTA_FILE,"utf8")); }catch(_){ tradeEchoQuota={hour:"",count:0}; }
 }
-function consumeTradeEchoRequest(){
+function consumeTradeEchoRequest(measurementOnly=false){
   loadTradeEchoQuota();
   const hour=tradeEchoHourKey();
   if(tradeEchoQuota.hour!==hour) tradeEchoQuota={hour,count:0};
-  if(tradeEchoQuota.count>=TRADEECHO_MAX_REQUESTS_HOUR){
-    if(!tradeEchoQuotaBlocked) log("TRADEECHO","20-request/hour cap reached — GEX refresh paused until next ET hour");
-    tradeEchoQuotaBlocked=true;
+  const limit=measurementOnly ? TRADEECHO_MAX_REQUESTS_HOUR-TRADEECHO_GEX_RESERVE : TRADEECHO_MAX_REQUESTS_HOUR;
+  if(tradeEchoQuota.count>=limit){
+    if(measurementOnly) log("TRADEECHO","Measurement calls paused at "+limit+"/hour — "+TRADEECHO_GEX_RESERVE+" requests reserved for GEX");
+    else if(!tradeEchoQuotaBlocked) log("TRADEECHO","20-request/hour cap reached — GEX refresh paused until next ET hour");
+    if(!measurementOnly) tradeEchoQuotaBlocked=true;
     return false;
   }
   tradeEchoQuota.count++;
@@ -350,6 +355,7 @@ function decisionMeta(fired, reason=""){
   if(/ema/.test(r)) return {stage:"signal",code:"SIGNAL_EMA"};
   if(/lockout/.test(r)) return {stage:"risk",code:"RISK_DIRECTION_LOCKOUT"};
   if(/cooldown/.test(r)) return {stage:"risk",code:"RISK_COOLDOWN"};
+  if(/macro/.test(r)) return {stage:"macro",code:"MACRO_EVENT_WINDOW"};
   if(/chex/.test(r)) return {stage:"gex",code:"GEX_CHEX"};
   if(/no gex cache|fail-closed/.test(r)) return {stage:"gex",code:"GEX_UNAVAILABLE"};
   if(/gamma flip|pinned to gamma/.test(r)) return {stage:"gex",code:"GEX_GAMMA_FLIP"};
@@ -363,7 +369,7 @@ function initDB() {
   // Ensure DB dir exists
   if (!fs.existsSync(DB_DIR)) { try { fs.mkdirSync(DB_DIR, {recursive:true}); } catch(_){} }
   // Create empty tables if missing
-  ["signals","trades","gex_snapshots"].forEach(t => {
+  ["signals","trades","gex_snapshots","macro_events"].forEach(t => {
     const file = path.join(DB_DIR, t+".json");
     if (!fs.existsSync(file)) saveDB(t, []);
   });
@@ -423,6 +429,7 @@ function saveSignalToDB(sig, indicators, fired, blockedReason) {
       market_mode:    MARKET_MODE,
       strategy_config:sig.strategyConfig||strategyConfigSnapshot(),
       signal_checks:  indicators.decisionChecks||null,
+      market_intel:   indicators.marketIntel||null,
       decision_stage: decision.stage,
       decision_code:  decision.code,
       fired:          fired?1:0,
@@ -495,6 +502,7 @@ function saveTradeToDB(trade, signalDbId, indicators) {
       // the journal rather than estimated with a blanket slippage assumption.
       entry_execution: trade.entryExecution||null,
       exit_execution:  trade.exitExecution||null,
+      market_intel:    trade.marketIntel||indicators?.marketIntel||null,
       // Shadow trail counterfactuals — what each virtual config WOULD have exited at.
       // Unexited shadows finalize at the real close price (they rode to the actual exit).
       shadow_exits:   (trade.shadows||[]).map(sh=>({
@@ -1034,9 +1042,9 @@ async function faGet(endpoint, attempt=1) {
 }
 
 // ── TradeEcho MCP-powered Dealer Edge / GEX ───────────────────────────────────
-async function tradeEchoRpc(method, params={}){
+async function tradeEchoRpc(method, params={}, {measurementOnly=false}={}){
   if(!TRADEECHO_PAT){ log("TRADEECHO","No TRADEECHO_PAT — GEX disabled"); return null; }
-  if(!consumeTradeEchoRequest()) return null;
+  if(!consumeTradeEchoRequest(measurementOnly)) return null;
   try{
     const headers={"Authorization":"Bearer "+TRADEECHO_PAT,"Content-Type":"application/json","Accept":"application/json, text/event-stream"};
     if(tradeEchoSessionId) headers["Mcp-Session-Id"]=tradeEchoSessionId;
@@ -1074,6 +1082,34 @@ function tradeEchoPick(obj, names){
   return null;
 }
 function tradeEchoNumber(v){ const n=parseFloat(v); return Number.isFinite(n)?n:null; }
+async function tradeEchoTool(name, opts={}){
+  if(!tradeEchoSessionId){
+    const init=await tradeEchoRpc("initialize",{protocolVersion:"2024-11-05",capabilities:{},clientInfo:{name:"spx-command",version:APP_VERSION}},opts);
+    if(!init) return null;
+    await tradeEchoRpc("notifications/initialized",{},opts);
+  }
+  if(!tradeEchoTools){
+    const list=await tradeEchoRpc("tools/list",{},opts);
+    tradeEchoTools=new Map((list?.tools||[]).map(t=>[t.name,t]));
+  }
+  return tradeEchoTools.get(name)||null;
+}
+function tradeEchoToolArgs(tool, {symbol="SPY", date=etDateString(), direction=null, dte=null}={}){
+  const props=tool?.inputSchema?.properties||{}, args={};
+  for(const key of Object.keys(props)){
+    const k=key.toLowerCase();
+    if(["symbol","ticker","underlying","root"].includes(k)) args[key]=symbol;
+    else if(["date","as_of_date","trade_date","start_date","end_date"].includes(k)) args[key]=date;
+    else if(["direction","side","bias"].includes(k)&&direction) args[key]=direction;
+    else if(["dte","days_to_expiry","days_to_expiration"].includes(k)&&dte!=null) args[key]=dte;
+  }
+  return args;
+}
+async function tradeEchoCallTool(name, context={}, opts={}){
+  const tool=await tradeEchoTool(name,opts);
+  if(!tool){ log("TRADEECHO",""+name+" unavailable for this PAT — skipping"); return null; }
+  return tradeEchoRpc("tools/call",{name,arguments:tradeEchoToolArgs(tool,context)},opts);
+}
 function normalizeTradeEchoDealerEdge(payload){
   const raw=tradeEchoValue(payload);
   if(!raw||typeof raw!=="object") return null;
@@ -1099,29 +1135,83 @@ function normalizeTradeEchoDealerEdge(payload){
     profile,zeroDteMagnet:magnet,maxPain:magnet,pinRisk,source:"TradeEcho MCP",hasRealGreeks:false,updatedAt:new Date().toISOString()};
 }
 async function calcTradeEchoGEX(){
-  if(!tradeEchoSessionId){
-    const init=await tradeEchoRpc("initialize",{protocolVersion:"2024-11-05",capabilities:{},clientInfo:{name:"spx-command",version:APP_VERSION}});
-    if(!init) return null;
-    await tradeEchoRpc("notifications/initialized",{});
-  }
-  if(!tradeEchoDealerTool){
-    const list=await tradeEchoRpc("tools/list",{});
-    tradeEchoDealerTool=list?.tools?.find(t=>t.name==="get_dealer_edge_data");
-    if(!tradeEchoDealerTool){ log("TRADEECHO ERR","get_dealer_edge_data is unavailable — confirm Dealer Edge scope on the PAT"); return null; }
-  }
-  const props=tradeEchoDealerTool.inputSchema?.properties||{};
-  const args={};
-  for(const key of Object.keys(props)){
-    const k=key.toLowerCase();
-    if(["symbol","ticker","underlying","root"].includes(k)) args[key]="SPY";
-    else if(["date","as_of_date","trade_date"].includes(k)) args[key]=etDateString();
-  }
-  const result=await tradeEchoRpc("tools/call",{name:"get_dealer_edge_data",arguments:args});
+  const result=await tradeEchoCallTool("get_dealer_edge_data",{symbol:"SPY",date:etDateString()});
   const normalized=normalizeTradeEchoDealerEdge(result);
   if(!normalized){ log("TRADEECHO ERR","Dealer Edge response lacked required SPY GEX levels"); return null; }
   enrichWithPercentiles(normalized);
   log("GEX","TradeEcho — Flip:$"+normalized.gammaFlip+" | CallWall:$"+normalized.callWall+" | PutWall:$"+normalized.putWall+" | Net:"+(normalized.netGex/1e9).toFixed(2)+"B");
   broadcast({type:"gex_update",...normalized}); saveGEXSnapshot(normalized); return normalized;
+}
+
+// ── TradeEcho macro safety + log-only signal intelligence ───────────────────
+let macroEventsToday=null;
+function objectRows(value, out=[]){
+  if(!value||typeof value!=="object") return out;
+  if(Array.isArray(value)){ for(const x of value) objectRows(x,out); return out; }
+  out.push(value); for(const x of Object.values(value)) objectRows(x,out); return out;
+}
+function macroEventTime(row){
+  const direct=row.timestamp??row.datetime??row.date_time??row.release_time??row.event_time??null;
+  if(direct){ const n=Date.parse(direct); if(Number.isFinite(n)) return n; }
+  const date=row.date??row.event_date??null, time=row.time??row.release_time_et??null;
+  if(date&&time){ const n=Date.parse(String(date)+"T"+String(time)+etOffset(String(date).slice(0,10))); if(Number.isFinite(n)) return n; }
+  return null;
+}
+function normalizeMacroEvents(payload){
+  const raw=tradeEchoValue(payload), rows=objectRows(raw);
+  const events=rows.map(row=>{
+    const impact=String(row.impact??row.importance??row.priority??"").toUpperCase();
+    const at=macroEventTime(row);
+    const name=String(row.name??row.event??row.title??row.description??"macro event");
+    return {name,impact,at:at?new Date(at).toISOString():null,at_ms:at};
+  }).filter(x=>x.impact.includes("HIGH")&&x.at_ms);
+  return {events, high_impact_count:events.length};
+}
+async function ensureMacroEvents(){
+  const date=etDateString();
+  if(macroEventsToday?.date===date) return macroEventsToday;
+  const stored=loadDB("macro_events").find(x=>x.date===date);
+  if(stored){ macroEventsToday=stored; return stored; }
+  const payload=await tradeEchoCallTool("get_macro_events",{date});
+  const normalized=payload?normalizeMacroEvents(payload):null;
+  const row={journal_id:journalId("macro"),strategy_id:STRATEGY_ID,strategy_run_id:STRATEGY_RUN_ID,
+    journal_schema_version:JOURNAL_SCHEMA_VERSION,date,timestamp:new Date().toISOString(),
+    status:normalized?"ok":"unavailable",events:normalized?.events||[],high_impact_count:normalized?.high_impact_count||0};
+  insertDB("macro_events",row); macroEventsToday=row;
+  log("MACRO",normalized?"Loaded "+row.high_impact_count+" timed high-impact event(s) for "+date:"Macro data unavailable — entry failsafe active for "+date);
+  return row;
+}
+function macroGate(){
+  const m=macroEventsToday;
+  if(!m||m.date!==etDateString()||m.status!=="ok") return {allowed:false,reason:"Macro calendar unavailable — entry blocked by failsafe"};
+  const now=Date.now(), active=m.events.find(e=>Math.abs(now-e.at_ms)<=10*60000);
+  return active ? {allowed:false,reason:"High-impact macro window: "+active.name+" at "+active.at+" (±10m)"} : {allowed:true,reason:"No high-impact macro event within ±10m"};
+}
+function normalizeOptionFlow(payload, direction){
+  const raw=tradeEchoValue(payload);
+  const callPremium=tradeEchoNumber(tradeEchoPick(raw,["call_premium","callPremium","calls_premium"]));
+  const putPremium=tradeEchoNumber(tradeEchoPick(raw,["put_premium","putPremium","puts_premium"]));
+  const sweepCount=tradeEchoNumber(tradeEchoPick(raw,["sweep_count","sweeps","aggressive_sweeps"]));
+  const aggressive=tradeEchoPick(raw,["aggressive","aggressive_activity","sweep_activity"]);
+  const bias=callPremium!=null&&putPremium!=null ? (callPremium>putPremium?"LONG":putPremium>callPremium?"SHORT":"NEUTRAL") : null;
+  return {available:true,call_premium:callPremium,put_premium:putPremium,
+    premium_imbalance:callPremium!=null&&putPremium!=null?+(callPremium-putPremium).toFixed(2):null,
+    sweep_count:sweepCount,aggressive_activity:aggressive??(sweepCount!=null?sweepCount>0:null),
+    directional_bias:bias,agrees_with_orb:bias!=null?bias===direction:null};
+}
+function normalizeAlgoEdge(payload, direction){
+  const rows=objectRows(tradeEchoValue(payload)); let long=0, short=0;
+  for(const row of rows){ const text=String(row.direction??row.signal??row.side??row.bias??"").toUpperCase();
+    if(/LONG|BULL|CALL/.test(text)) long++; else if(/SHORT|BEAR|PUT/.test(text)) short++; }
+  const bias=long>short?"LONG":short>long?"SHORT":"NEUTRAL";
+  return {available:true,long_signals:long,short_signals:short,directional_bias:bias,agrees_with_orb:bias!=="NEUTRAL"?bias===direction:null};
+}
+async function collectSignalIntel(direction){
+  const opts={measurementOnly:true};
+  const flowPayload=await tradeEchoCallTool("get_option_flow",{symbol:"SPY",date:etDateString(),direction,dte:0},opts);
+  const algoPayload=await tradeEchoCallTool("get_algo_edge_signals",{symbol:"SPY",date:etDateString(),direction,dte:0},opts);
+  return {captured_at:new Date().toISOString(),option_flow:flowPayload?normalizeOptionFlow(flowPayload,direction):{available:false},
+    algo_edge:algoPayload?normalizeAlgoEdge(algoPayload,direction):{available:false}};
 }
 
 // Legacy FlashAlpha implementation is retained only for historical journal compatibility.
@@ -1909,6 +1999,7 @@ async function executeTrade(direction, price, indicators, gexResult) {
     durationMin:null, outcome:null,
     trigger:"Internal Signal Engine",
     confidence:indicators.strength||"MEDIUM",
+    marketIntel:indicators.marketIntel||null,
     status:"PENDING",
     indicators: {...indicators},
     // Full greek context frozen at signal-fire time — displayed on signal card, stored for data mining
@@ -2332,6 +2423,20 @@ async function runSignalEngine() {
       scanActive=false;return;
     }
 
+    // Macro calendar is fetched once and persisted before the session. If it is
+    // unavailable after a restart, fail closed rather than exposing a 0DTE stop
+    // to a scheduled high-impact release we cannot see.
+    await ensureMacroEvents();
+    const macroResult=macroGate();
+    const macroIntel={status:macroEventsToday?.status||"unavailable",high_impact_count:macroEventsToday?.high_impact_count||0,
+      gate_allowed:macroResult.allowed,gate_reason:macroResult.reason};
+    if(!macroResult.allowed){
+      log("MACRO","Signal BLOCKED — "+macroResult.reason);
+      saveSignalToDB({direction:eval_result.direction,spyEntry:currentPrice,gexTarget:null,strength:eval_result.strength},
+        {...ind,marketIntel:{macro:macroIntel},decisionChecks:{passed:eval_result.passed,failed:eval_result.failed,macro:{allowed:false,reason:macroResult.reason}}},false,"MACRO: "+macroResult.reason);
+      scanActive=false;return;
+    }
+
     // Daily per-direction lockout — hard cap on losses in one direction per day
     if(dirLockedToday[eval_result.direction]){
       log("SCAN","Direction LOCKED for the day: "+eval_result.direction+" — hit "+MAX_DIR_LOSSES_DAY+" losses");
@@ -2390,7 +2495,13 @@ async function runSignalEngine() {
     log("SIGNAL","FIRED ✓ | "+eval_result.direction+" | "+eval_result.reason+" | GEX: "+gexResult.reason);
     broadcast({type:"signal_fired",direction:eval_result.direction,price:currentPrice,reason:eval_result.reason});
 
-    await executeTrade(eval_result.direction, currentPrice, {...ind,strength:eval_result.strength,decisionChecks:{passed:eval_result.passed,failed:eval_result.failed,gex:{allowed:true,reason:gexResult.reason}}}, gexResult);
+    // Flow and AlgoEdge are measurement-only. They are captured only after all
+    // entry gates pass, never block the order, and reserve five MCP requests/hr
+    // for the GEX safety filter.
+    const signalIntel=await collectSignalIntel(eval_result.direction);
+    signalIntel.macro=macroIntel;
+    await executeTrade(eval_result.direction, currentPrice, {...ind,strength:eval_result.strength,marketIntel:signalIntel,
+      decisionChecks:{passed:eval_result.passed,failed:eval_result.failed,gex:{allowed:true,reason:gexResult.reason},macro:{allowed:true,reason:macroResult.reason}}}, gexResult);
 
   }catch(e){ log("SCAN ERR","runSignalEngine: "+e.message); }
   scanActive=false;
@@ -3144,7 +3255,8 @@ app.get("/status",(req,res)=>{
     strategyJournal:{strategyId:STRATEGY_ID,schemaVersion:JOURNAL_SCHEMA_VERSION,runId:STRATEGY_RUN_ID},
     trailingStop:{triggerPct:(TRAIL_TRIGGER_PCT*100)+"%",trailDistance:(TRAIL_DISTANCE_PCT*100)+"%"},
     sessionPnL:sessionPnL.toFixed(2), dailyLoss:dailyLoss.toFixed(2),
-    tradeEcho:{enabled:!!TRADEECHO_PAT,requestCount:tradeEchoQuota?.count||0,requestLimit:TRADEECHO_MAX_REQUESTS_HOUR,hour:tradeEchoQuota?.hour||null,quotaBlocked:tradeEchoQuotaBlocked},
+    tradeEcho:{enabled:!!TRADEECHO_PAT,requestCount:tradeEchoQuota?.count||0,requestLimit:TRADEECHO_MAX_REQUESTS_HOUR,measurementReserve:TRADEECHO_GEX_RESERVE,hour:tradeEchoQuota?.hour||null,quotaBlocked:tradeEchoQuotaBlocked},
+    macro:{date:macroEventsToday?.date||null,status:macroEventsToday?.status||"not loaded",highImpactCount:macroEventsToday?.high_impact_count??null},
     classifierHealth: classifierHealth(),
     dailyLossLimit:(ACCOUNT_SIZE*MAX_DAILY_LOSS).toFixed(2),
     tradesDay:tradesDay+"/"+MAX_TRADES_DAY,
@@ -3175,6 +3287,8 @@ setInterval(async()=>{
     const now=new Date(new Date().toLocaleString("en-US",{timeZone:"America/New_York"}));
     if(!isWeekday(now)) return;
     const h=now.getHours(),m=now.getMinutes();
+    // One daily premarket macro fetch. A persisted row is reused after restart.
+    if(h===8&&m===0) await ensureMacroEvents();
     // 5-min bars close at :00, :05, :10, :15, :20, :25, :30, :35, :40, :45, :50, :55
     if(m % SIGNAL_SCAN_MINS === 0){
       await runSignalEngine();
