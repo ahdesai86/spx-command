@@ -2473,7 +2473,7 @@ async function checkAccount(){
 // ── Express ───────────────────────────────────────────────────────────────────
 const app=express();
 app.set("trust proxy", true); // Railway is behind a proxy — needed for correct client IP in rate limiter
-app.use(cors({origin:"*",methods:["GET","POST","DELETE","OPTIONS"],allowedHeaders:["Content-Type","Authorization"]}));
+app.use(cors({origin:"*",methods:["GET","POST","DELETE","OPTIONS"],allowedHeaders:["Content-Type","Authorization","X-Log-Token","X-Read-Only-Token"]}));
 app.options("*",cors());
 
 // ── Rate limiting (in-memory, per-IP fixed window; no dependency) ─────────────
@@ -2484,6 +2484,9 @@ const DASH_PASS = process.env.DASHBOARD_PASS || "";        // unset = OPEN (warn
 // Lets an operator/agent pull logs without handing over the master dashboard password;
 // if it leaks it exposes read-only logs, not settings or close-all.
 const LOG_TOKEN = process.env.LOG_TOKEN || "";
+// Scoped read-only token — valid only for the explicitly-listed data endpoints
+// below. It can never submit a signal, change settings, or close a position.
+const READONLY_TOKEN = process.env.READONLY_TOKEN || "";
 const RATE_MAX  = parseInt(process.env.RATE_LIMIT_PER_MIN || "120"); // requests/IP/min
 const rlBuckets = new Map(); // ip -> { count, resetAt }
 setInterval(()=>{ const now=Date.now(); for(const [ip,b] of rlBuckets) if(b.resetAt<now) rlBuckets.delete(ip); }, 120000).unref?.();
@@ -2513,6 +2516,17 @@ function timingSafeEq(a,b){
 // to decide whether to route traffic. A 401 here makes Railway mark the deploy unhealthy and
 // pull it out of rotation (the whole site goes dark). This endpoint leaks nothing sensitive.
 const AUTH_EXEMPT = new Set(["/","/healthz"]);
+// Keep this allow-list deliberately narrow.  In particular, /gex?refresh=true
+// is excluded because it triggers an upstream TradeEcho request and consumes quota.
+const READONLY_PATHS = new Set([
+  "/dashboard", "/events", "/status", "/gex", "/logs",
+  "/db/trades", "/db/signals", "/db/blocked-analysis", "/db/reversal-analysis",
+  "/db/gex", "/db/stats", "/db/export",
+]);
+function isReadOnlyRequest(req){
+  return req.method==="GET" && READONLY_PATHS.has(req.path) &&
+    !(req.path==="/gex" && req.query.refresh==="true");
+}
 app.get("/healthz",(req,res)=>res.json({ok:true}));
 app.use((req,res,next)=>{
   if(!DASH_PASS) return next(); // no password configured → open (startup warns loudly)
@@ -2521,6 +2535,12 @@ app.use((req,res,next)=>{
   if(req.path==="/logs" && LOG_TOKEN){
     const tok=req.headers["x-log-token"]||"";
     if(tok && timingSafeEq(tok, LOG_TOKEN)) return next();
+  }
+  // Scoped read-only token: permits only the data/dashboard allow-list above.
+  // It is intentionally not accepted for GET /settings or /gex?refresh=true.
+  if(READONLY_TOKEN && isReadOnlyRequest(req)){
+    const tok=req.headers["x-read-only-token"]||"";
+    if(tok && timingSafeEq(tok, READONLY_TOKEN)) return next();
   }
   const hdr=req.headers.authorization||"";
   if(hdr.startsWith("Basic ")){
@@ -3104,6 +3124,7 @@ setInterval(async()=>{
 app.listen(PORT,async()=>{
   if(DASH_PASS) log("SECURITY","Password wall ACTIVE — Basic Auth required on all routes (user: "+DASH_USER+"). Rate limit "+RATE_MAX+"/min/IP.");
   else log("SECURITY","*** WARNING: DASHBOARD_PASS not set — app is PUBLIC. Set DASHBOARD_PASS in Railway to close it. *** (rate limit "+RATE_MAX+"/min/IP still active)");
+  if(READONLY_TOKEN) log("SECURITY","Read-only token ACTIVE — limited to dashboard and selected data GET endpoints.");
   console.log(`
  ╔══════════════════════════════════════════════════════╗
  ║${("  SPX COMMAND v"+APP_VERSION.split("-")[0]+" · TradeEcho · AutoMode").padEnd(54).slice(0,54)}║
