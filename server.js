@@ -54,7 +54,7 @@ const ALPACA_BASE      = (process.env.ALPACA_BASE_URL || "https://paper-api.alpa
 const ALPACA_DATA      = "https://data.alpaca.markets";
 // Single source of truth for the version — used by /, /status, and the startup banner so
 // they can never drift apart again (the banner was stale at v11.8 while the app was v11.27).
-const APP_VERSION      = "11.33-tier1-execution-correctness";
+const APP_VERSION      = "11.34-2dte-immediate-strikes";
 const ACCOUNT_SIZE     = parseFloat(process.env.ACCOUNT_SIZE     || "100000");
 const PORT             = parseInt(process.env.PORT               || "3001");
 const IS_PAPER         = ALPACA_BASE.includes("paper");
@@ -78,6 +78,7 @@ let TRAIL_TRIGGER_PCT     = parseFloat(process.env.TRAIL_TRIGGER_PCT     || "0.5
 let TRAIL_DISTANCE_PCT    = parseFloat(process.env.TRAIL_DISTANCE_PCT    || "0.20"); // trail this far below peak (overridden by $ if set)
 let TRAIL_TRIGGER_DOLLARS = parseFloat(process.env.TRAIL_TRIGGER_DOLLARS || "0");    // > 0: use $ gain to trigger instead of %
 let TRAIL_DISTANCE_DOLLARS= parseFloat(process.env.TRAIL_DISTANCE_DOLLARS|| "0");    // > 0: trail $ below peak instead of %
+let MAX_OPTION_SPREAD_PCT = parseFloat(process.env.MAX_OPTION_SPREAD_PCT || "0.15"); // reject illiquid contracts
 let GEX_BUFFER         = parseFloat(process.env.GEX_BUFFER       || "1.0");
 let SIGNAL_MODE        = (process.env.SIGNAL_MODE || "MODERATE").toUpperCase().split(" ")[0]; // MODERATE or STRICT
 let MAX_TRADES_DAY     = parseInt(process.env.MAX_TRADES_DAY || "3");
@@ -103,6 +104,7 @@ const SETTINGS_SCHEMA = {
   TRAIL_DISTANCE_PCT:    { type:"number", min:0.01, max:0.95, set:v=>TRAIL_DISTANCE_PCT=v },
   TRAIL_TRIGGER_DOLLARS: { type:"number", min:0,    max:50,   set:v=>TRAIL_TRIGGER_DOLLARS=v },
   TRAIL_DISTANCE_DOLLARS:{ type:"number", min:0,    max:50,   set:v=>TRAIL_DISTANCE_DOLLARS=v },
+  MAX_OPTION_SPREAD_PCT:{ type:"number", min:0.01, max:1,     set:v=>MAX_OPTION_SPREAD_PCT=v },
   GEX_BUFFER:            { type:"number", min:0,    max:20,   set:v=>GEX_BUFFER=v },
   SIGNAL_MODE:           { type:"enum",   values:["MODERATE","STRICT"], set:v=>SIGNAL_MODE=v },
   MAX_TRADES_DAY:        { type:"number", min:0,    max:50, integer:true, set:v=>MAX_TRADES_DAY=v },
@@ -129,7 +131,7 @@ function getSettingsSnapshot(){
     RISK_DOLLARS, RISK_PER_TRADE, MAX_DAILY_LOSS, PREMIUM_STOP_PCT,
     TP1_MULTIPLIER, TP1_MIN_MULT, TP1_MAX_MULT,
     TRAIL_TRIGGER_PCT, TRAIL_DISTANCE_PCT,
-    TRAIL_TRIGGER_DOLLARS, TRAIL_DISTANCE_DOLLARS,
+    TRAIL_TRIGGER_DOLLARS, TRAIL_DISTANCE_DOLLARS, MAX_OPTION_SPREAD_PCT,
     GEX_BUFFER, SIGNAL_MODE, MAX_TRADES_DAY,
     RSI_LONG_MAX, RSI_SHORT_MIN,
     DIRECTION_COOLDOWN, DIRECTION_COOLDOWN_MINS,
@@ -141,7 +143,13 @@ function getSettingsSnapshot(){
 }
 
 function getRiskBudget() { return RISK_DOLLARS > 0 ? RISK_DOLLARS : ACCOUNT_SIZE * RISK_PER_TRADE; }
-function calcContracts(p) { return !p||p<=0 ? 1 : Math.max(1, Math.floor(getRiskBudget()/(p*100))); }
+// RISK_DOLLARS is a stop-loss budget, not premium outlay. Size from the per-contract
+// loss between the entry limit and the software stop; account/notional caps still apply.
+function calcContracts(entryPrice, stopPrice) {
+  const perContractRisk = (entryPrice - stopPrice) * 100;
+  return !Number.isFinite(perContractRisk) || perContractRisk <= 0
+    ? 0 : Math.floor(getRiskBudget() / perContractRisk);
+}
 /**
  * TP1 now represents the trailing stop TRIGGER price — the option premium level
  * at which the trailing stop activates. This replaces the old theoretical 3x/GEX-wall
@@ -354,6 +362,7 @@ function saveTradeToDB(trade, signalDbId, indicators) {
       total_cost:     trade.totalCost,
       stop_price:     trade.stopPrice,
       tp1_price:      trade.tp1Price,
+      tp1_armed:      trade.tp1Armed ? 1 : 0,
       close_price:    trade.closePrice||null,
       close_reason:   trade.closeReason||null,
       max_price:      trade.maxPrice!=null?trade.maxPrice:null,
@@ -1191,7 +1200,25 @@ function applyGEX(direction, entry, vwap) {
   return { allowed: true, reason: "No GEX filter" + dexNote, tp1: entry, tp2: entry, target: null, dexBias };
 }
 
-// ── Strike selection (greeks-optimized when real data available) ─────────────
+// ── Strike selection ──────────────────────────────────────────────────────────
+// Deliberately independent of GEX, Greeks, IV, and walls. A call uses the next
+// whole-dollar strike above spot; a put uses the next whole-dollar strike below.
+// Exact-dollar spot still moves one strike in the trade direction.
+function selectStrike(price, direction) {
+  if (!Number.isFinite(price)) throw new Error("Invalid SPY price for strike selection");
+  const strike = direction === "LONG" ? Math.floor(price) + 1 : Math.ceil(price) - 1;
+  return {
+    strike,
+    reason: "Immediate $1 strike "+(direction === "LONG" ? "above" : "below")+" SPY $"+price.toFixed(2),
+    delta: null,
+    gamma: null,
+    impliedVol: null,
+    otm: Math.abs(strike-price),
+    method: "immediate-directional",
+  };
+}
+
+/* Retained temporarily as historical reference only; no production path calls it. */
 /**
  * Score each candidate strike between ATM and the GEX target by:
  *   payoff_score = estimated_gain_at_target / premium_cost
@@ -1211,7 +1238,7 @@ function applyGEX(direction, entry, vwap) {
  *   DEX OPPOSED — MM hedging flows work against the trade; penalize low-delta
  *     strikes (need the move to overcome the hedging headwind before OTM pays).
  */
-function selectStrike(price, direction, target, dexBias, pathResist) {
+function _legacyGexStrikeSelectionBody(price, direction, target, dexBias, pathResist) {
   const atm = Math.round(price);
 
   // No GEX cache at all → pure ATM fallback
@@ -1332,21 +1359,35 @@ function etOffset(dateStr){
   return (off<=0?"-":"+")+String(Math.abs(off)).padStart(2,"0")+":00";
 }
 function getExpiry(){const d=getETDate();return d.getFullYear()+String(d.getMonth()+1).padStart(2,"0")+String(d.getDate()).padStart(2,"0");}
-function getNextTradingDay(){
-  const d=getETDate();
-  d.setDate(d.getDate()+1);
-  while(d.getDay()===0||d.getDay()===6) d.setDate(d.getDate()+1); // skip weekends
-  return d;
+function etDateString(date=getETDate()){
+  const parts=new Intl.DateTimeFormat("en-US",{timeZone:"America/New_York",year:"numeric",month:"2-digit",day:"2-digit"}).formatToParts(date);
+  const p=Object.fromEntries(parts.filter(x=>x.type!=="literal").map(x=>[x.type,x.value]));
+  return p.year+"-"+p.month+"-"+p.day;
 }
 
-async function getMidPrice(symbol){
+// Resolve 2DTE against Alpaca's trading calendar, rather than assuming weekdays are
+// sessions. This correctly skips market holidays and deliberately fails closed if the
+// calendar cannot be obtained, avoiding an invalid or unintended expiration.
+async function getTradingDayOffset(daysAhead){
+  const today=etDateString();
+  const end=new Date(Date.now()+21*86400000).toISOString().slice(0,10);
+  const rows=await aGet("/v2/calendar?start="+today+"&end="+end);
+  const future=(rows||[]).map(r=>r.date).filter(d=>d>today);
+  if(future.length<daysAhead) throw new Error("Trading calendar did not return "+daysAhead+" future sessions");
+  const [y,m,d]=future[daysAhead-1].split("-").map(Number);
+  return new Date(y,m-1,d,12,0,0);
+}
+
+async function getOptionQuote(symbol){
   try{
     const r=await fetch(ALPACA_DATA+"/v1beta1/options/snapshots?symbols="+symbol,{headers:aH()});
     if(!r.ok) return null;
     const d=await r.json(), s=(d.snapshots||{})[symbol];
     if(!s||!s.latestQuote) return null;
     const bid=parseFloat(s.latestQuote.bp||0),ask=parseFloat(s.latestQuote.ap||0);
-    return bid>0&&ask>0 ? parseFloat(((bid+ask)/2).toFixed(2)) : null;
+    if(!(bid>0&&ask>0&&ask>=bid)) return null;
+    const mid=parseFloat(((bid+ask)/2).toFixed(2));
+    return { bid, ask, mid, spreadPct:(ask-bid)/mid };
   }catch(_){return null;}
 }
 
@@ -1519,21 +1560,12 @@ function startMonitor(signal, indicators) {
       log("MONITOR",signal.optionSymbol+" $"+price+" | P&L "+pct+"% | stop $"+signal.stopPrice+(signal.trailingActive?" (trailing)":signal.ratchetActive?" (ratchet +"+signal.ratchetLock+"%)":"")+" | tp1 $"+signal.tp1Price+" | max $"+signal.maxPrice+" | min $"+signal.minPrice);
       broadcast({type:"signal_update",id:signal.id,currentPrice:price,maxPrice:signal.maxPrice,minPrice:signal.minPrice,maxPnlPct:signal.maxPnlPct,minPnlPct:signal.minPnlPct});
 
-      if(price>=signal.tp1Price){
-        const cc=await closePositionConfirmed(signal.optionSymbol, price);
-        if(!cc.ok){ log("MONITOR ERR","TP1 close FAILED — retrying next tick"); broadcast({type:"signal_update",id:signal.id,status:"CLOSE_FAILED"}); return; }
-        clearInterval(iv);
-        const exitPx=cc.fillPrice;
-        log("TP1","Hit $"+price+" >= $"+signal.tp1Price+" — closed @ $"+exitPx+" | peak $"+signal.maxPrice+" ("+signal.maxPnlPct+"%)");
-        const pnl=(exitPx-entry)*100*signal.contracts;
-        signal.status="TP1_HIT"; signal.closePnl=pnl; signal.closePrice=exitPx;
-        signal.closeReason="TP1_HIT"; signal.durationMin=((Date.now()-entryTime)/60000).toFixed(1);
-        signal.outcome=pnl>=0?"WIN":"LOSS";
-        lastTP1Time=Date.now();  // start the post-TP1 cooldown — the move is usually exhausted
-        sessionPnL+=pnl; dailyLoss+=Math.abs(Math.min(0,pnl));
-        broadcast({type:"signal_update",id:signal.id,status:"TP1_HIT",pnl});
-        saveTradeToDB(signal,signal._dbId,indicators);
-        return;
+      // TP1 is the trailing-stop trigger, not a fixed-profit exit. The first hit is
+      // journaled and blocks re-entry only after the eventual profitable trailing exit.
+      if(price>=signal.tp1Price && !signal.tp1Armed){
+        signal.tp1Armed=true;
+        log("TP1","Triggered @ $"+price+" — runner remains open with stop $"+signal.stopPrice);
+        broadcast({type:"signal_update",id:signal.id,tp1Armed:true,stopPrice:signal.stopPrice});
       }
       if(price<=signal.stopPrice){
         const reason=signal.trailingActive?"TRAIL_STOP_HIT":signal.ratchetActive?"RATCHET_STOP_HIT":"STOP_HIT";
@@ -1548,6 +1580,7 @@ function startMonitor(signal, indicators) {
         signal.status="STOPPED"; signal.closePnl=pnl; signal.closePrice=exitPx;
         signal.closeReason=reason; signal.durationMin=((Date.now()-entryTime)/60000).toFixed(1);
         signal.outcome=pnl>=0?"WIN":"LOSS";
+        if(signal.tp1Armed && pnl>=0) lastTP1Time=Date.now();
         // Cooldown only applies to genuine losses on the initial fixed stop — a trailing
         // or ratchet stop exit at/above entry isn't evidence the thesis failed.
         if(!signal.trailingActive && !signal.ratchetActive){
@@ -1624,22 +1657,10 @@ async function executeTrade(direction, price, indicators, gexResult) {
   if(dailyLoss>=ACCOUNT_SIZE*MAX_DAILY_LOSS){log("GUARD","Daily loss limit reached");return;}
 
   const right = direction==="LONG"?"C":"P";
-  const now2  = getETDate();
-  const isLateSession = now2.getHours() > 14 || (now2.getHours() === 14 && now2.getMinutes() >= 30);
-  const date  = isLateSession ? getNextTradingDay() : now2;
-  // Weekend/holiday gap guard: a late-session 1DTE whose expiry is >1 calendar day out
-  // (Friday, or before a holiday) would hold directional long premium through the weekend
-  // UNMONITORED, exposed to 3 days of theta + a gap open. This cost -$1,053 on 2026-07-13
-  // (a Friday $754C carried to Monday). Block the entry outright — no weekend holds.
-  if (isLateSession) {
-    const gapDays = Math.round((new Date(date.toDateString()) - new Date(now2.toDateString())) / 86400000);
-    if (gapDays > 1) {
-      log("SAFETY","Late-session entry BLOCKED — 1DTE expiry $"+date.toLocaleDateString("en-CA")+" is "+gapDays+" days out (weekend/holiday). No unmonitored multi-day holds.");
-      return;
-    }
-    log("SIGNAL","After 2:30 PM — using 1DTE expiry ("+date.toLocaleDateString("en-CA")+") for theta protection");
-  }
-  const si    = selectStrike(price, direction, gexResult?.target, gexResult?.dexBias, gexResult?.pathResist);
+  let date;
+  try { date=await getTradingDayOffset(2); }
+  catch(e){ log("SAFETY","2DTE calendar lookup failed — entry blocked: "+e.message); return; }
+  const si=selectStrike(price, direction);
 
   const sig = {
     id:          Date.now(),
@@ -1656,7 +1677,7 @@ async function executeTrade(direction, price, indicators, gexResult) {
     squeezeAtEntry: indicators.squeeze ? {on:indicators.squeeze.on, fired:indicators.squeeze.fired, dir:indicators.squeeze.direction} : null,
     flagAtEntry: indicators.flag||null,
     expiry:      date.getFullYear()+String(date.getMonth()+1).padStart(2,"0")+String(date.getDate()).padStart(2,"0"),
-    is1DTE:      isLateSession,
+    is2DTE:      true,
     riskBudget:getRiskBudget(),
     contracts:null, midPrice:null, totalCost:null,
     fillPrice:null, stopPrice:null, tp1Price:null,
@@ -1701,31 +1722,30 @@ async function executeTrade(direction, price, indicators, gexResult) {
     if(!/^SPY\d{6}[CP]\d{8}$/.test(symbol)) throw new Error("SAFETY: Bad OCC symbol: "+symbol);
     sig.optionSymbol = symbol;
 
-    let mid = await getMidPrice(symbol);
-    if(!mid||mid<0.05||mid>50){
-      const atm = buildSymbol(Math.round(price),right,date);
-      mid = await getMidPrice(atm);
-      if(!mid) throw new Error("No valid option price — market closed?");
-      sig.optionSymbol=atm; sig.strike=Math.round(price); sig.strikeReason="ATM fallback";
-    }
-
-    const contracts=calcContracts(mid);
-    const totalCost=parseFloat((mid*100*contracts).toFixed(2));
+    const quote=await getOptionQuote(symbol);
+    if(!quote||quote.ask<0.05||quote.ask>50) throw new Error("No valid quote for immediate 2DTE strike");
+    if(quote.spreadPct>MAX_OPTION_SPREAD_PCT) throw new Error("SAFETY: option spread "+(quote.spreadPct*100).toFixed(1)+"% exceeds "+(MAX_OPTION_SPREAD_PCT*100).toFixed(1)+"% cap");
+    const mpForRisk=MARKET_MODE_AUTO==="ON"?getModeParams():null;
+    const plannedStopPct=(mpForRisk?.premiumStopPct&&quote.ask>0.70)?mpForRisk.premiumStopPct:PREMIUM_STOP_PCT;
+    const plannedStop=parseFloat((quote.ask*(1-plannedStopPct)).toFixed(2));
+    let contracts=calcContracts(quote.ask,plannedStop);
+    if(contracts<1) throw new Error("SAFETY: risk budget is below one contract at the configured stop");
+    const totalCost=parseFloat((quote.ask*100*contracts).toFixed(2));
     if(contracts>50)               throw new Error("SAFETY: "+contracts+" contracts > 50");
     if(totalCost>ACCOUNT_SIZE*0.10) throw new Error("SAFETY: $"+totalCost+" > 10% of account");
 
-    log("SAFETY","Guards passed — "+sig.optionSymbol+" x"+contracts+" @ $"+mid+" = $"+totalCost);
+    log("SAFETY","Guards passed — "+sig.optionSymbol+" x"+contracts+" @ ask $"+quote.ask+" | spread "+(quote.spreadPct*100).toFixed(1)+"% | planned loss $"+((quote.ask-plannedStop)*100*contracts).toFixed(2));
 
     const order=await aPost("/v2/orders",{
       symbol:sig.optionSymbol, qty:String(contracts),
-      side:"buy", type:"limit", limit_price:String(mid),
+      side:"buy", type:"limit", limit_price:String(quote.ask),
       time_in_force:"day", client_order_id:"spxcmd_"+sig.id,
     });
 
-    sig.contracts=contracts; sig.midPrice=mid; sig.totalCost=totalCost;
+    sig.contracts=contracts; sig.midPrice=quote.mid; sig.totalCost=totalCost;
     sig.status="SENT";
-    broadcast({type:"signal_update",id:sig.id,status:"SENT",optionSymbol:sig.optionSymbol,contracts,midPrice:mid,totalCost});
-    log("ALPACA","Order: "+order.id+" | "+sig.optionSymbol+" x"+contracts+" @ $"+mid);
+    broadcast({type:"signal_update",id:sig.id,status:"SENT",optionSymbol:sig.optionSymbol,contracts,midPrice:quote.mid,totalCost});
+    log("ALPACA","Order: "+order.id+" | "+sig.optionSymbol+" x"+contracts+" @ ask $"+quote.ask);
 
     let filled=await pollFill(order.id,60000).catch(()=>null);
     if(!filled){
@@ -1738,7 +1758,7 @@ async function executeTrade(direction, price, indicators, gexResult) {
       if(fq>0){
         // Partially filled before cancel — that's a real position; monitor it.
         log("ORDER","Partial fill "+fq+"/"+contracts+" before cancel — monitoring as position");
-        filled={ filled_avg_price: final.filled_avg_price||mid };
+        filled={ filled_avg_price: final.filled_avg_price||quote.ask };
         contracts=fq; sig.contracts=fq;
       } else {
         sig.status="CANCELLED";
@@ -1748,7 +1768,8 @@ async function executeTrade(direction, price, indicators, gexResult) {
       }
     }
 
-    sig.fillPrice=parseFloat(filled.filled_avg_price||mid);
+    sig.fillPrice=parseFloat(filled.filled_avg_price||quote.ask);
+    sig.totalCost=parseFloat((sig.fillPrice*100*sig.contracts).toFixed(2));
 
     // Freeze mode-specific exit params at fill time so mid-session mode changes don't affect open position
     const mp = MARKET_MODE_AUTO==="ON" ? getModeParams() : null;
@@ -1998,10 +2019,13 @@ async function runSignalEngine() {
   scanActive=true;
   try{
     const bars=await getSPYBars();
-    if(!bars.length){scanActive=false;return;}
+    // Alpaca timestamps bars at their OPEN. Exclude a bar until its full five-minute
+    // interval has elapsed so an in-progress candle is never marked processed as final.
+    const closedBars=bars.filter(b=>new Date(b.t).getTime()+5*60000<=Date.now());
+    if(!closedBars.length){scanActive=false;return;}
 
     // Build ORB if not built yet
-    buildORB(bars);
+    buildORB(closedBars);
     if(!orbState?.built){log("SCAN","ORB not built yet — waiting");scanActive=false;return;}
 
     // Market mode: classify once after ORB builds, re-check at 11:00 AM
@@ -2009,13 +2033,13 @@ async function runSignalEngine() {
     if(marketModeDate!==today || (h===11&&m===0)) detectMarketMode();
 
     // Get latest bar
-    const latestBar=bars[bars.length-1];
+    const latestBar=closedBars[closedBars.length-1];
     if(lastBarTime===latestBar.t){scanActive=false;return;}
     lastBarTime=latestBar.t;
 
     // Get live quote
     const currentPrice=await getSPYQuote()||latestBar.c;
-    const ind=calcIndicators(bars,currentPrice);
+    const ind=calcIndicators(closedBars,currentPrice);
     if(!ind){scanActive=false;return;}
 
     // Check if already in a trade
@@ -2177,7 +2201,7 @@ async function recoverPositions(){
         spyEntry:null, stop: liveInd.orbLow ?? null, tp1:null, tp2:null,
         stopPrice:stop, tp1Price:tp1,
         status:"FILLED", trigger:"Recovered on restart",
-        is1DTE:true, expiry:pos.symbol.slice(3,9),
+        is2DTE:true, expiry:pos.symbol.slice(3,9),
         confidence:"MEDIUM",
         indicators:{ vwap:liveInd.vwap, rsi:liveInd.rsi, ema9:liveInd.ema9, ema21:liveInd.ema21,
                      orbHigh:liveInd.orbHigh, orbLow:liveInd.orbLow, live:true },
@@ -2859,7 +2883,9 @@ app.get("/status",(req,res)=>{
     riskBudget:"$"+getRiskBudget(),
     optionsFeed:OPTIONS_FEED,
     realGreeks:gexCache?.hasRealGreeks||false,
-    tp1Config:{mode:TP1_FIXED_MOVE>0?"fixed":"gex-adaptive",value:TP1_FIXED_MOVE>0?"$"+TP1_FIXED_MOVE:"GEX wall ("+TP1_MIN_MULT+"x-"+TP1_MAX_MULT+"x bounds, "+TP1_MULTIPLIER+"x fallback)"},
+    tp1Config:{mode:"trail-trigger",value:TRAIL_TRIGGER_DOLLARS>0?"$"+TRAIL_TRIGGER_DOLLARS:"+"+(TRAIL_TRIGGER_PCT*100)+"%"},
+    strikeSelection:"immediate $1 strike in signal direction",
+    expiry:"2DTE (Alpaca trading calendar)",
     trailingStop:{triggerPct:(TRAIL_TRIGGER_PCT*100)+"%",trailDistance:(TRAIL_DISTANCE_PCT*100)+"%"},
     sessionPnL:sessionPnL.toFixed(2), dailyLoss:dailyLoss.toFixed(2),
     faCallsToday, faQuotaLimit:2500, faQuotaBlocked, faQuotaResetAt:faQuotaResetAt?new Date(faQuotaResetAt).toISOString():null,
