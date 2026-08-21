@@ -60,8 +60,9 @@ const PORT             = parseInt(process.env.PORT               || "3001");
 const IS_PAPER         = ALPACA_BASE.includes("paper");
 const ORB_MINUTES      = 15; // 9:30–9:45 ET
 const TP1_FIXED_MOVE   = parseFloat(process.env.TP1_FIXED_MOVE   || "0");
-const FLASHALPHA_KEY   = process.env.FLASHALPHA_API_KEY || "";
-const FLASHALPHA_BASE  = "https://lab.flashalpha.com";
+const TRADEECHO_PAT    = process.env.TRADEECHO_PAT || "";
+const TRADEECHO_MCP    = "https://api.tradeecho.com/api/mcp/intel";
+const TRADEECHO_MAX_REQUESTS_HOUR = 20;
 
 // ── Runtime-tunable settings ───────────────────────────────────────────────────
 // These start from env vars but can be changed live via GET/POST /settings (and
@@ -253,6 +254,42 @@ let dailyEMA21 = null;
 // on every redeploy) if no volume is attached at all.
 const RAILWAY_VOLUME = process.env.RAILWAY_VOLUME_MOUNT_PATH || null;
 const DB_DIR  = RAILWAY_VOLUME || (fs.existsSync("/data") ? "/data" : __dirname);
+
+// ── TradeEcho MCP request budget ─────────────────────────────────────────────
+// The vendor limit is higher, but this bot deliberately stays within 20 requests
+// per ET clock hour. Count every JSON-RPC request (including initialize/list and
+// failures) before sending it, and persist the count so a restart cannot bypass it.
+const TRADEECHO_QUOTA_FILE = path.join(DB_DIR, "tradeecho_quota.json");
+let tradeEchoQuota = null;
+let tradeEchoQuotaBlocked = false;
+let tradeEchoSessionId = null;
+let tradeEchoDealerTool = null;
+let tradeEchoRpcId = 0;
+
+function tradeEchoHourKey(){
+  const parts=new Intl.DateTimeFormat("en-US",{timeZone:"America/New_York",year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",hourCycle:"h23"}).formatToParts(new Date());
+  const p=Object.fromEntries(parts.filter(x=>x.type!=="literal").map(x=>[x.type,x.value]));
+  return p.year+"-"+p.month+"-"+p.day+"T"+p.hour;
+}
+function loadTradeEchoQuota(){
+  if(tradeEchoQuota) return;
+  try{ tradeEchoQuota=JSON.parse(fs.readFileSync(TRADEECHO_QUOTA_FILE,"utf8")); }catch(_){ tradeEchoQuota={hour:"",count:0}; }
+}
+function consumeTradeEchoRequest(){
+  loadTradeEchoQuota();
+  const hour=tradeEchoHourKey();
+  if(tradeEchoQuota.hour!==hour) tradeEchoQuota={hour,count:0};
+  if(tradeEchoQuota.count>=TRADEECHO_MAX_REQUESTS_HOUR){
+    if(!tradeEchoQuotaBlocked) log("TRADEECHO","20-request/hour cap reached — GEX refresh paused until next ET hour");
+    tradeEchoQuotaBlocked=true;
+    return false;
+  }
+  tradeEchoQuota.count++;
+  tradeEchoQuotaBlocked=false;
+  try{ fs.writeFileSync(TRADEECHO_QUOTA_FILE,JSON.stringify(tradeEchoQuota)); }
+  catch(e){ log("TRADEECHO ERR","Could not persist request quota: "+e.message); return false; }
+  return true;
+}
 
 // ── JSON-based database (no native deps, persists to Railway Volume) ─────────
 // Stores trades, signals, gex_snapshots as JSON files
@@ -929,7 +966,99 @@ async function faGet(endpoint, attempt=1) {
   }
 }
 
-// ── FlashAlpha-powered GEX + exposure analytics ──────────────────────────────
+// ── TradeEcho MCP-powered Dealer Edge / GEX ───────────────────────────────────
+async function tradeEchoRpc(method, params={}){
+  if(!TRADEECHO_PAT){ log("TRADEECHO","No TRADEECHO_PAT — GEX disabled"); return null; }
+  if(!consumeTradeEchoRequest()) return null;
+  try{
+    const headers={"Authorization":"Bearer "+TRADEECHO_PAT,"Content-Type":"application/json","Accept":"application/json, text/event-stream"};
+    if(tradeEchoSessionId) headers["Mcp-Session-Id"]=tradeEchoSessionId;
+    const r=await fetch(TRADEECHO_MCP,{method:"POST",headers,body:JSON.stringify({jsonrpc:"2.0",id:++tradeEchoRpcId,method,params}),signal:AbortSignal.timeout(15000)});
+    const sid=r.headers.get("mcp-session-id"); if(sid) tradeEchoSessionId=sid;
+    const body=await r.json();
+    if(!r.ok||body.error){ log("TRADEECHO ERR",method+": "+(body.error?.message||("HTTP "+r.status))); return null; }
+    return body.result||null;
+  }catch(e){ log("TRADEECHO ERR",method+": "+e.message); return null; }
+}
+function tradeEchoValue(value){
+  if(value==null) return null;
+  if(typeof value==="string"){ try{return JSON.parse(value);}catch(_){return value;} }
+  if(Array.isArray(value)) return value.map(tradeEchoValue);
+  if(typeof value==="object"){
+    if(Array.isArray(value.content)){
+      const text=value.content.find(x=>x.type==="text")?.text;
+      if(text) return tradeEchoValue(text);
+    }
+    return value;
+  }
+  return value;
+}
+function tradeEchoPick(obj, names){
+  if(!obj||typeof obj!=="object") return null;
+  const wanted=new Set(names.map(x=>x.toLowerCase().replace(/[^a-z0-9]/g,"")));
+  const stack=[obj];
+  while(stack.length){
+    const cur=stack.pop();
+    for(const [key,val] of Object.entries(cur)){
+      if(wanted.has(key.toLowerCase().replace(/[^a-z0-9]/g,""))) return val;
+      if(val&&typeof val==="object") stack.push(val);
+    }
+  }
+  return null;
+}
+function tradeEchoNumber(v){ const n=parseFloat(v); return Number.isFinite(n)?n:null; }
+function normalizeTradeEchoDealerEdge(payload){
+  const raw=tradeEchoValue(payload);
+  if(!raw||typeof raw!=="object") return null;
+  const spot=tradeEchoNumber(tradeEchoPick(raw,["spot_price","spot","underlying_price","price"]));
+  const gammaFlip=tradeEchoNumber(tradeEchoPick(raw,["gamma_flip","gammaFlip","flip"]));
+  const netGex=tradeEchoNumber(tradeEchoPick(raw,["net_gex","netGamma","net_gamma"]));
+  const callWall=tradeEchoNumber(tradeEchoPick(raw,["call_wall","callWall"]));
+  const putWall=tradeEchoNumber(tradeEchoPick(raw,["put_wall","putWall"]));
+  const magnet=tradeEchoNumber(tradeEchoPick(raw,["zero_dte_magnet","zeroDteMagnet","magnet","max_pain"]));
+  const pinRisk=tradeEchoNumber(tradeEchoPick(raw,["pin_risk_score","pinRisk","pin_risk"]));
+  const strikes=tradeEchoPick(raw,["strikes","strike_data","levels"]);
+  const rows=Array.isArray(strikes)?strikes:[];
+  const profile=rows.map(s=>{
+    const strike=tradeEchoNumber(s.strike??s.price);
+    const call=tradeEchoNumber(s.call_gex??s.callGex)??0, put=tradeEchoNumber(s.put_gex??s.putGex)??0;
+    return strike==null?null:{strike,netGex:tradeEchoNumber(s.net_gex??s.netGex)??call+put,callGex:call,putGex:put};
+  }).filter(Boolean).sort((a,b)=>a.strike-b.strike);
+  const callWalls=profile.filter(x=>x.callGex>0&&(!spot||x.strike>spot)).sort((a,b)=>b.callGex-a.callGex).slice(0,5).map(x=>({price:x.strike,gex:Math.round(x.callGex)}));
+  const putWalls=profile.filter(x=>x.putGex<0&&(!spot||x.strike<spot)).sort((a,b)=>a.putGex-b.putGex).slice(0,5).map(x=>({price:x.strike,gex:Math.round(Math.abs(x.putGex))}));
+  if(!spot||gammaFlip==null||!callWall||!putWall) return null;
+  return {spotPrice:spot,gammaFlip,netGex:netGex??0,regime:(netGex??0)>=0?"positive":"negative",callWall,putWall,
+    callWalls:callWalls.length?callWalls:[{price:callWall,gex:0}],putWalls:putWalls.length?putWalls:[{price:putWall,gex:0}],
+    profile,zeroDteMagnet:magnet,maxPain:magnet,pinRisk,source:"TradeEcho MCP",hasRealGreeks:false,updatedAt:new Date().toISOString()};
+}
+async function calcTradeEchoGEX(){
+  if(!tradeEchoSessionId){
+    const init=await tradeEchoRpc("initialize",{protocolVersion:"2024-11-05",capabilities:{},clientInfo:{name:"spx-command",version:APP_VERSION}});
+    if(!init) return null;
+    await tradeEchoRpc("notifications/initialized",{});
+  }
+  if(!tradeEchoDealerTool){
+    const list=await tradeEchoRpc("tools/list",{});
+    tradeEchoDealerTool=list?.tools?.find(t=>t.name==="get_dealer_edge_data");
+    if(!tradeEchoDealerTool){ log("TRADEECHO ERR","get_dealer_edge_data is unavailable — confirm Dealer Edge scope on the PAT"); return null; }
+  }
+  const props=tradeEchoDealerTool.inputSchema?.properties||{};
+  const args={};
+  for(const key of Object.keys(props)){
+    const k=key.toLowerCase();
+    if(["symbol","ticker","underlying","root"].includes(k)) args[key]="SPY";
+    else if(["date","as_of_date","trade_date"].includes(k)) args[key]=etDateString();
+  }
+  const result=await tradeEchoRpc("tools/call",{name:"get_dealer_edge_data",arguments:args});
+  const normalized=normalizeTradeEchoDealerEdge(result);
+  if(!normalized){ log("TRADEECHO ERR","Dealer Edge response lacked required SPY GEX levels"); return null; }
+  enrichWithPercentiles(normalized);
+  log("GEX","TradeEcho — Flip:$"+normalized.gammaFlip+" | CallWall:$"+normalized.callWall+" | PutWall:$"+normalized.putWall+" | Net:"+(normalized.netGex/1e9).toFixed(2)+"B");
+  broadcast({type:"gex_update",...normalized}); saveGEXSnapshot(normalized); return normalized;
+}
+
+// Legacy FlashAlpha implementation is retained only for historical journal compatibility.
+// Production GEX retrieval routes exclusively through calcTradeEchoGEX().
 async function calcGEX() {
   if (!FLASHALPHA_KEY) {
     log("GEX", "No FLASHALPHA_API_KEY — GEX disabled");
@@ -1039,7 +1168,7 @@ async function getGEX(force) {
   const today = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
   if (today !== gexLastDate) { gexFired = new Set(); gexLastDate = today; gexCache = null; gexCacheTime = 0; }
   if (!force && gexCache && (now - gexCacheTime) < 300000) return gexCache; // 5 min cache (FlashAlpha data is fresher)
-  const r = await calcGEX();
+  const r = await calcTradeEchoGEX();
   if (r) {
     gexCache = r; gexCacheTime = now;
     // Re-classify on every fresh GEX — a midday net-GEX sign flip (positive pin → negative
@@ -2142,7 +2271,7 @@ async function runSignalEngine() {
     // 5-min scan (~375 calls/day), a major contributor to blowing the 2500/day quota on
     // 2026-07-13. Only refresh here as a last resort if the cache is truly stale (>20 min),
     // and never when the quota breaker is tripped.
-    if(!faQuotaBlocked && (!gexCache || (Date.now()-gexCacheTime)>1200000)){
+    if(!tradeEchoQuotaBlocked && (!gexCache || (Date.now()-gexCacheTime)>1200000)){
       try{ await getGEX(false); }catch(e){ log("GEX ERR","pre-signal refresh: "+e.message); }
     }
 
@@ -2230,11 +2359,11 @@ function classifierHealth(){
   const available = !!(gexCache && gexCache.netGex != null);
   const stale = available && ageMin != null && ageMin > staleAfter;
   let status="OK", reason="GEX live";
-  if (faQuotaBlocked)      { status="FAILED";   reason="FlashAlpha quota exhausted — classifier blind (GEX unavailable)"; }
+  if (tradeEchoQuotaBlocked) { status="FAILED"; reason="TradeEcho 20-request/hour cap reached — classifier paused until next hour"; }
   else if (!available)     { status="FAILED";   reason="No GEX data — classifier running without its primary signal"; }
   else if (stale)          { status="DEGRADED"; reason="GEX stale ("+ageMin+"m old) — classifier may be acting on outdated regime"; }
   return { status, reason, gexAvailable:available, gexAgeMin:ageMin, gexStale:stale,
-           quotaBlocked:faQuotaBlocked, marketMode:MARKET_MODE, marketScore, auto:MARKET_MODE_AUTO==="ON" };
+           quotaBlocked:tradeEchoQuotaBlocked, marketMode:MARKET_MODE, marketScore, auto:MARKET_MODE_AUTO==="ON" };
 }
 function broadcastHealth(){ try{ broadcast({ type:"health", ...classifierHealth() }); }catch(_){} }
 
@@ -2888,12 +3017,12 @@ app.get("/status",(req,res)=>{
     expiry:"2DTE (Alpaca trading calendar)",
     trailingStop:{triggerPct:(TRAIL_TRIGGER_PCT*100)+"%",trailDistance:(TRAIL_DISTANCE_PCT*100)+"%"},
     sessionPnL:sessionPnL.toFixed(2), dailyLoss:dailyLoss.toFixed(2),
-    faCallsToday, faQuotaLimit:2500, faQuotaBlocked, faQuotaResetAt:faQuotaResetAt?new Date(faQuotaResetAt).toISOString():null,
+    tradeEcho:{enabled:!!TRADEECHO_PAT,requestCount:tradeEchoQuota?.count||0,requestLimit:TRADEECHO_MAX_REQUESTS_HOUR,hour:tradeEchoQuota?.hour||null,quotaBlocked:tradeEchoQuotaBlocked},
     classifierHealth: classifierHealth(),
     dailyLossLimit:(ACCOUNT_SIZE*MAX_DAILY_LOSS).toFixed(2),
     tradesDay:tradesDay+"/"+MAX_TRADES_DAY,
     orb:orbState,
-    flashAlpha:!!FLASHALPHA_KEY,
+    tradeEchoConfigured:!!TRADEECHO_PAT,
     gex:gexCache?{regime:gexCache.regime,gammaFlip:gexCache.gammaFlip,source:gexCache.source||"Alpaca",callWall:gexCache.callWall||null,putWall:gexCache.putWall||null,callWalls:(gexCache.callWalls||[]).slice(0,3).map(w=>"$"+w.price),putWalls:(gexCache.putWalls||[]).slice(0,3).map(w=>"$"+w.price),maxPain:gexCache.maxPain||null,zeroDteMagnet:gexCache.zeroDteMagnet||null,pinRisk:gexCache.pinRisk||null,dex:gexCache.dex||null,vex:gexCache.vex||null}:null,
     signals:{today:signalHistory.length,active:signalHistory.filter(s=>["FILLED","SENT"].includes(s.status)).length},
     db:{totalTrades:s.t||0,wins:s.w||0,totalPnL:s.p||0,winRate:s.t>0?((s.w/s.t)*100).toFixed(1)+"%":"—",persistent:!!RAILWAY_VOLUME,dir:DB_DIR},
@@ -2949,9 +3078,10 @@ setInterval(async()=>{
     const today=now.toLocaleDateString("en-CA");
     if(!((h>9||(h===9&&m>=25))&&h<16)) return;
     const key=today+"_"+h+"_"+m;
-    if(m % GEX_REFRESH_MINS === 0 && !gexFired.has(key)){
+    const tradeEchoRefreshMins=Math.max(GEX_REFRESH_MINS,15); // 4 data pulls/hour; leaves budget for MCP setup
+    if(m % tradeEchoRefreshMins === 0 && !gexFired.has(key)){
       gexFired.add(key);
-      log("GEX","Scheduled refresh "+String(h).padStart(2,"0")+":"+String(m).padStart(2,"0")+" (every "+GEX_REFRESH_MINS+"m)");
+      log("GEX","TradeEcho scheduled refresh "+String(h).padStart(2,"0")+":"+String(m).padStart(2,"0")+" (every "+tradeEchoRefreshMins+"m; hard cap 20 MCP requests/hour)");
       await getGEX(true);
     }
   } catch(e) { console.error("[SCHEDULER ERR] GEX tick:", e.message); }
@@ -2976,11 +3106,11 @@ app.listen(PORT,async()=>{
   else log("SECURITY","*** WARNING: DASHBOARD_PASS not set — app is PUBLIC. Set DASHBOARD_PASS in Railway to close it. *** (rate limit "+RATE_MAX+"/min/IP still active)");
   console.log(`
  ╔══════════════════════════════════════════════════════╗
- ║${("  SPX COMMAND v"+APP_VERSION.split("-")[0]+" · FlashAlpha · AutoMode").padEnd(54).slice(0,54)}║
+ ║${("  SPX COMMAND v"+APP_VERSION.split("-")[0]+" · TradeEcho · AutoMode").padEnd(54).slice(0,54)}║
  ╠══════════════════════════════════════════════════════╣
  ║  Signal engine : 5-min bar close scan               ║
  ║  Indicators    : ORB(15m) + VWAP + RSI + EMA        ║
- ║  GEX source    : ${(FLASHALPHA_KEY?"FlashAlpha API":"DISABLED").padEnd(35)}║
+ ║  GEX source    : ${(TRADEECHO_PAT?"TradeEcho MCP":"DISABLED").padEnd(35)}║
  ║  Signal mode   : ${SIGNAL_MODE.padEnd(35)}║
  ║  Exit          : Price monitor + DELETE position     ║
  ║  Database      : JSON files at ${DB_DIR.slice(-22).padEnd(22)}║
