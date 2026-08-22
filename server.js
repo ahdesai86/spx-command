@@ -273,6 +273,9 @@ const TRADEECHO_QUOTA_FILE = path.join(DB_DIR, "tradeecho_quota.json");
 let tradeEchoQuota = null;
 let tradeEchoQuotaBlocked = false;
 let tradeEchoSessionId = null;
+// Some JSON-RPC MCP servers are stateless and omit Mcp-Session-Id. Initialization
+// is still complete in that case; do not burn 2 extra requests before every tool call.
+let tradeEchoInitialized = false;
 let tradeEchoTools = null;
 let tradeEchoRpcId = 0;
 
@@ -1081,12 +1084,31 @@ function tradeEchoPick(obj, names){
   }
   return null;
 }
-function tradeEchoNumber(v){ const n=parseFloat(v); return Number.isFinite(n)?n:null; }
+function tradeEchoNumber(v){
+  const n=parseFloat(typeof v==="string" ? v.replace(/[$,]/g,"") : v);
+  return Number.isFinite(n)?n:null;
+}
+function tradeEchoLabeledNumber(obj, pattern){
+  for(const row of objectRows(obj)){
+    const label=String(row.label??row.name??row.type??row.level_name??row.description??"");
+    if(pattern.test(label)){
+      const v=tradeEchoNumber(row.price??row.strike??row.value??row.level??row.amount);
+      if(v!=null) return v;
+    }
+  }
+  return null;
+}
+function tradeEchoPayloadShape(payload){
+  const raw=tradeEchoValue(payload), keys=new Set();
+  for(const row of objectRows(raw)) for(const key of Object.keys(row)) keys.add(key);
+  return [...keys].slice(0,80).sort().join(", ")||"no object keys";
+}
 async function tradeEchoTool(name, opts={}){
-  if(!tradeEchoSessionId){
+  if(!tradeEchoInitialized){
     const init=await tradeEchoRpc("initialize",{protocolVersion:"2024-11-05",capabilities:{},clientInfo:{name:"spx-command",version:APP_VERSION}},opts);
     if(!init) return null;
     await tradeEchoRpc("notifications/initialized",{},opts);
+    tradeEchoInitialized=true;
   }
   if(!tradeEchoTools){
     const list=await tradeEchoRpc("tools/list",{},opts);
@@ -1113,11 +1135,14 @@ async function tradeEchoCallTool(name, context={}, opts={}){
 function normalizeTradeEchoDealerEdge(payload){
   const raw=tradeEchoValue(payload);
   if(!raw||typeof raw!=="object") return null;
-  const spot=tradeEchoNumber(tradeEchoPick(raw,["spot_price","spot","underlying_price","price"]));
-  const gammaFlip=tradeEchoNumber(tradeEchoPick(raw,["gamma_flip","gammaFlip","flip"]));
+  const spot=tradeEchoNumber(tradeEchoPick(raw,["spot_price","spot","underlying_price","underlying_last","last_price"]));
+  const gammaFlip=tradeEchoNumber(tradeEchoPick(raw,["gamma_flip","gammaFlip","gamma_flip_level","gamma_flip_price","zero_gamma","zero_gamma_level","flip","flip_level"]))
+    ??tradeEchoLabeledNumber(raw,/gamma\s*flip|zero\s*gamma/i);
   const netGex=tradeEchoNumber(tradeEchoPick(raw,["net_gex","netGamma","net_gamma"]));
-  const callWall=tradeEchoNumber(tradeEchoPick(raw,["call_wall","callWall"]));
-  const putWall=tradeEchoNumber(tradeEchoPick(raw,["put_wall","putWall"]));
+  const callWall=tradeEchoNumber(tradeEchoPick(raw,["call_wall","callWall","call_wall_level","call_wall_strike","call_resistance","upside_wall"]))
+    ??tradeEchoLabeledNumber(raw,/call\s*wall|call\s*resistance|upside\s*wall/i);
+  const putWall=tradeEchoNumber(tradeEchoPick(raw,["put_wall","putWall","put_wall_level","put_wall_strike","put_support","downside_wall"]))
+    ??tradeEchoLabeledNumber(raw,/put\s*wall|put\s*support|downside\s*wall/i);
   const magnet=tradeEchoNumber(tradeEchoPick(raw,["zero_dte_magnet","zeroDteMagnet","magnet","max_pain"]));
   const pinRisk=tradeEchoNumber(tradeEchoPick(raw,["pin_risk_score","pinRisk","pin_risk"]));
   const strikes=tradeEchoPick(raw,["strikes","strike_data","levels"]);
@@ -1129,15 +1154,15 @@ function normalizeTradeEchoDealerEdge(payload){
   }).filter(Boolean).sort((a,b)=>a.strike-b.strike);
   const callWalls=profile.filter(x=>x.callGex>0&&(!spot||x.strike>spot)).sort((a,b)=>b.callGex-a.callGex).slice(0,5).map(x=>({price:x.strike,gex:Math.round(x.callGex)}));
   const putWalls=profile.filter(x=>x.putGex<0&&(!spot||x.strike<spot)).sort((a,b)=>a.putGex-b.putGex).slice(0,5).map(x=>({price:x.strike,gex:Math.round(Math.abs(x.putGex))}));
-  if(!spot||gammaFlip==null||!callWall||!putWall) return null;
-  return {spotPrice:spot,gammaFlip,netGex:netGex??0,regime:(netGex??0)>=0?"positive":"negative",callWall,putWall,
+  if(gammaFlip==null||!callWall||!putWall) return null;
+  return {spotPrice:spot??null,gammaFlip,netGex:netGex??0,regime:(netGex??0)>=0?"positive":"negative",callWall,putWall,
     callWalls:callWalls.length?callWalls:[{price:callWall,gex:0}],putWalls:putWalls.length?putWalls:[{price:putWall,gex:0}],
     profile,zeroDteMagnet:magnet,maxPain:magnet,pinRisk,source:"TradeEcho MCP",hasRealGreeks:false,updatedAt:new Date().toISOString()};
 }
 async function calcTradeEchoGEX(){
   const result=await tradeEchoCallTool("get_dealer_edge_data",{symbol:"SPY",date:etDateString()});
   const normalized=normalizeTradeEchoDealerEdge(result);
-  if(!normalized){ log("TRADEECHO ERR","Dealer Edge response lacked required SPY GEX levels"); return null; }
+  if(!normalized){ log("TRADEECHO ERR","Dealer Edge response lacked required SPY GEX levels | shape: "+tradeEchoPayloadShape(result)); return null; }
   enrichWithPercentiles(normalized);
   log("GEX","TradeEcho — Flip:$"+normalized.gammaFlip+" | CallWall:$"+normalized.callWall+" | PutWall:$"+normalized.putWall+" | Net:"+(normalized.netGex/1e9).toFixed(2)+"B");
   broadcast({type:"gex_update",...normalized}); saveGEXSnapshot(normalized); return normalized;
