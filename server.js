@@ -55,7 +55,9 @@ const ALPACA_BASE      = (process.env.ALPACA_BASE_URL || "https://paper-api.alpa
 const ALPACA_DATA      = "https://data.alpaca.markets";
 // Single source of truth for the version — used by /, /status, and the startup banner so
 // they can never drift apart again (the banner was stale at v11.8 while the app was v11.27).
-const APP_VERSION      = "11.34-2dte-immediate-strikes";
+// Bump this for every pushed production-facing change; /status and the dashboard
+// expose it so a Railway deployment can be verified without inspecting logs.
+const APP_VERSION      = "11.35-tradeecho-mcp-hardening";
 // A stable cohort tag, deliberately separate from the display version. Every new
 // journal row carries it, so the 2DTE/immediate-strike strategy can be measured
 // without mixing it with the historical 0DTE/GEX-strike records.
