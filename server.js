@@ -1112,9 +1112,12 @@ async function tradeEchoTool(name, opts={}){
   }
   if(!tradeEchoTools){
     const list=await tradeEchoRpc("tools/list",{},opts);
+    // A quota/network error returns null. Do not turn that transient failure into
+    // a permanently cached empty tool list for the remainder of the process.
+    if(!Array.isArray(list?.tools)) return null;
     tradeEchoTools=new Map((list?.tools||[]).map(t=>[t.name,t]));
   }
-  return tradeEchoTools.get(name)||null;
+  return tradeEchoTools.has(name) ? tradeEchoTools.get(name) : false;
 }
 function tradeEchoToolArgs(tool, {symbol="SPY", date=etDateString(), direction=null, dte=null}={}){
   const props=tool?.inputSchema?.properties||{}, args={};
@@ -1129,7 +1132,8 @@ function tradeEchoToolArgs(tool, {symbol="SPY", date=etDateString(), direction=n
 }
 async function tradeEchoCallTool(name, context={}, opts={}){
   const tool=await tradeEchoTool(name,opts);
-  if(!tool){ log("TRADEECHO",""+name+" unavailable for this PAT — skipping"); return null; }
+  if(tool===false){ log("TRADEECHO",""+name+" unavailable for this PAT — skipping"); return null; }
+  if(!tool) return null; // transient quota/network failure; retry on a later scheduled call
   return tradeEchoRpc("tools/call",{name,arguments:tradeEchoToolArgs(tool,context)},opts);
 }
 function normalizeTradeEchoDealerEdge(payload){
