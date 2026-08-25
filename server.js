@@ -57,7 +57,7 @@ const ALPACA_DATA      = "https://data.alpaca.markets";
 // they can never drift apart again (the banner was stale at v11.8 while the app was v11.27).
 // Bump this for every pushed production-facing change; /status and the dashboard
 // expose it so a Railway deployment can be verified without inspecting logs.
-const APP_VERSION      = "11.35-tradeecho-mcp-hardening";
+const APP_VERSION      = "11.36-tradeecho-dealeredge-native";
 // A stable cohort tag, deliberately separate from the display version. Every new
 // journal row carries it, so the 2DTE/immediate-strike strategy can be measured
 // without mixing it with the historical 0DTE/GEX-strike records.
@@ -1100,6 +1100,34 @@ function tradeEchoLabeledNumber(obj, pattern){
   }
   return null;
 }
+// DealerEdge's current MCP response is level-oriented: anchorPoint is the main
+// gamma magnet and defenseLines are its secondary support/resistance levels.
+// Convert only explicitly labelled price-like values; do not recursively treat
+// every numeric metric (GEX, OI, greeks, ratings) as a tradable price level.
+function tradeEchoPriceLevels(value){
+  const levels=[];
+  const add=(value,label="level")=>{
+    const price=tradeEchoNumber(value);
+    // SPY price levels are positive, finite prices. The upper cap rejects GEX,
+    // OI, and dollar-notional metrics accidentally supplied in a `value` field.
+    if(price!=null&&price>1&&price<5000) levels.push({price,label});
+  };
+  const visit=(node,label="level")=>{
+    if(node==null) return;
+    if(typeof node==="number"||typeof node==="string"){ add(node,label); return; }
+    if(Array.isArray(node)){ for(const item of node) visit(item,label); return; }
+    if(typeof node!=="object") return;
+    const rowLabel=String(node.label??node.name??node.type??node.description??label);
+    const direct=node.price??node.strike??node.level??node.value??node.point;
+    if(direct!=null) add(direct,rowLabel);
+    // Arrays / nested objects sometimes arrive under these presentation keys.
+    for(const key of ["levels","lines","items","data","values"]){
+      if(node[key]!=null&&node[key]!==direct) visit(node[key],rowLabel);
+    }
+  };
+  visit(value);
+  return levels;
+}
 function tradeEchoPayloadShape(payload){
   const raw=tradeEchoValue(payload), keys=new Set();
   for(const row of objectRows(raw)) for(const key of Object.keys(row)) keys.add(key);
@@ -1141,13 +1169,14 @@ async function tradeEchoCallTool(name, context={}, opts={}){
 function normalizeTradeEchoDealerEdge(payload){
   const raw=tradeEchoValue(payload);
   if(!raw||typeof raw!=="object") return null;
-  const spot=tradeEchoNumber(tradeEchoPick(raw,["spot_price","spot","underlying_price","underlying_last","last_price"]));
-  const gammaFlip=tradeEchoNumber(tradeEchoPick(raw,["gamma_flip","gammaFlip","gamma_flip_level","gamma_flip_price","zero_gamma","zero_gamma_level","flip","flip_level"]))
+  const spot=tradeEchoNumber(tradeEchoPick(raw,["spot_price","spot","underlying_price","underlying_last","last_price","currentPrice"]));
+  const gammaFlip=tradeEchoNumber(tradeEchoPick(raw,["gamma_flip","gammaFlip","gamma_flip_level","gamma_flip_price","zero_gamma","zero_gamma_level","flip","flip_level","flipPoint"]))
     ??tradeEchoLabeledNumber(raw,/gamma\s*flip|zero\s*gamma/i);
   const netGex=tradeEchoNumber(tradeEchoPick(raw,["net_gex","netGamma","net_gamma"]));
-  const callWall=tradeEchoNumber(tradeEchoPick(raw,["call_wall","callWall","call_wall_level","call_wall_strike","call_resistance","upside_wall"]))
+  const anchorPoint=tradeEchoNumber(tradeEchoPick(raw,["anchorPoint","anchor_point","anchor","gamma_anchor"]));
+  let callWall=tradeEchoNumber(tradeEchoPick(raw,["call_wall","callWall","call_wall_level","call_wall_strike","call_resistance","upside_wall"]))
     ??tradeEchoLabeledNumber(raw,/call\s*wall|call\s*resistance|upside\s*wall/i);
-  const putWall=tradeEchoNumber(tradeEchoPick(raw,["put_wall","putWall","put_wall_level","put_wall_strike","put_support","downside_wall"]))
+  let putWall=tradeEchoNumber(tradeEchoPick(raw,["put_wall","putWall","put_wall_level","put_wall_strike","put_support","downside_wall"]))
     ??tradeEchoLabeledNumber(raw,/put\s*wall|put\s*support|downside\s*wall/i);
   const magnet=tradeEchoNumber(tradeEchoPick(raw,["zero_dte_magnet","zeroDteMagnet","magnet","max_pain"]));
   const pinRisk=tradeEchoNumber(tradeEchoPick(raw,["pin_risk_score","pinRisk","pin_risk"]));
@@ -1158,12 +1187,33 @@ function normalizeTradeEchoDealerEdge(payload){
     const call=tradeEchoNumber(s.call_gex??s.callGex)??0, put=tradeEchoNumber(s.put_gex??s.putGex)??0;
     return strike==null?null:{strike,netGex:tradeEchoNumber(s.net_gex??s.netGex)??call+put,callGex:call,putGex:put};
   }).filter(Boolean).sort((a,b)=>a.strike-b.strike);
-  const callWalls=profile.filter(x=>x.callGex>0&&(!spot||x.strike>spot)).sort((a,b)=>b.callGex-a.callGex).slice(0,5).map(x=>({price:x.strike,gex:Math.round(x.callGex)}));
-  const putWalls=profile.filter(x=>x.putGex<0&&(!spot||x.strike<spot)).sort((a,b)=>a.putGex-b.putGex).slice(0,5).map(x=>({price:x.strike,gex:Math.round(Math.abs(x.putGex))}));
-  if(gammaFlip==null||!callWall||!putWall) return null;
-  return {spotPrice:spot??null,gammaFlip,netGex:netGex??0,regime:(netGex??0)>=0?"positive":"negative",callWall,putWall,
-    callWalls:callWalls.length?callWalls:[{price:callWall,gex:0}],putWalls:putWalls.length?putWalls:[{price:putWall,gex:0}],
-    profile,zeroDteMagnet:magnet,maxPain:magnet,pinRisk,source:"TradeEcho MCP",hasRealGreeks:false,updatedAt:new Date().toISOString()};
+  let callWalls=profile.filter(x=>x.callGex>0&&(!spot||x.strike>spot)).sort((a,b)=>b.callGex-a.callGex).slice(0,5).map(x=>({price:x.strike,gex:Math.round(x.callGex)}));
+  let putWalls=profile.filter(x=>x.putGex<0&&(!spot||x.strike<spot)).sort((a,b)=>a.putGex-b.putGex).slice(0,5).map(x=>({price:x.strike,gex:Math.round(Math.abs(x.putGex))}));
+  const dealerLevels=[
+    ...(anchorPoint!=null?[{price:anchorPoint,label:"anchor"}]:[]),
+    ...tradeEchoPriceLevels(tradeEchoPick(raw,["defenseLines","defense_lines"])),
+    ...tradeEchoPriceLevels(tradeEchoPick(raw,["keyLevels","key_levels"]))
+  ];
+  const uniqueDealerLevels=[...new Map(dealerLevels.map(x=>[x.price,x])).values()];
+  // Native DealerEdge levels substitute for old call/put walls. A level above
+  // spot is an upside target; below spot it is downside support. We retain the
+  // legacy fields so dashboard, journaling, and exit logic remain compatible.
+  if(!callWalls.length) callWalls=uniqueDealerLevels.filter(x=>spot==null||x.price>spot).sort((a,b)=>a.price-b.price).slice(0,5).map(x=>({price:x.price,gex:0,label:x.label}));
+  if(!putWalls.length) putWalls=uniqueDealerLevels.filter(x=>spot==null||x.price<spot).sort((a,b)=>b.price-a.price).slice(0,5).map(x=>({price:x.price,gex:0,label:x.label}));
+  callWall=callWall??callWalls[0]?.price??null;
+  putWall=putWall??putWalls[0]?.price??null;
+  // A valid native DealerEdge response needs the two universal levels. Retain a
+  // conservative legacy fallback for a provider response that still exposes
+  // only two-sided walls (the old adapter contract).
+  const effectiveAnchor=anchorPoint??magnet??(callWall!=null&&putWall!=null?(spot??((callWall+putWall)/2)):null);
+  // Walls can be
+  // absent on one side of price and are handled directionally at entry time.
+  if(gammaFlip==null||effectiveAnchor==null) return null;
+  const rating=tradeEchoNumber(tradeEchoPick(raw,["gexRating","gex_rating","rating"]));
+  const inferredNetGex=rating!=null?(rating>=4?1:rating<=2?-1:0):0;
+  return {spotPrice:spot??null,gammaFlip,anchorPoint:effectiveAnchor,netGex:netGex??inferredNetGex,regime:(netGex??inferredNetGex)>=0?"positive":"negative",callWall,putWall,
+    callWalls,putWalls,profile,defenseLines:uniqueDealerLevels.filter(x=>x.label!=="anchor"),gexRating:rating,
+    zeroDteMagnet:magnet??anchorPoint??null,maxPain:magnet??anchorPoint??null,pinRisk,source:"TradeEcho MCP",hasRealGreeks:false,updatedAt:new Date().toISOString()};
 }
 async function calcTradeEchoGEX(){
   const result=await tradeEchoCallTool("get_dealer_edge_data",{symbol:"SPY",date:etDateString()});
