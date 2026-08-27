@@ -57,7 +57,7 @@ const ALPACA_DATA      = "https://data.alpaca.markets";
 // they can never drift apart again (the banner was stale at v11.8 while the app was v11.27).
 // Bump this for every pushed production-facing change; /status and the dashboard
 // expose it so a Railway deployment can be verified without inspecting logs.
-const APP_VERSION      = "11.36-tradeecho-dealeredge-native";
+const APP_VERSION      = "11.37-gex-observation-only";
 // A stable cohort tag, deliberately separate from the display version. Every new
 // journal row carries it, so the 2DTE/immediate-strike strategy can be measured
 // without mixing it with the historical 0DTE/GEX-strike records.
@@ -93,6 +93,9 @@ let TRAIL_TRIGGER_DOLLARS = parseFloat(process.env.TRAIL_TRIGGER_DOLLARS || "0")
 let TRAIL_DISTANCE_DOLLARS= parseFloat(process.env.TRAIL_DISTANCE_DOLLARS|| "0");    // > 0: trail $ below peak instead of %
 let MAX_OPTION_SPREAD_PCT = parseFloat(process.env.MAX_OPTION_SPREAD_PCT || "0.15"); // reject illiquid contracts
 let GEX_BUFFER         = parseFloat(process.env.GEX_BUFFER       || "1.0");
+// GEX remains fetched and journaled, but never controls entries, classification,
+// sizing, targets, or exits unless this is deliberately switched OFF later.
+let GEX_OBSERVATION_ONLY = (process.env.GEX_OBSERVATION_ONLY || "ON").toUpperCase(); // ON | OFF
 let SIGNAL_MODE        = (process.env.SIGNAL_MODE || "MODERATE").toUpperCase().split(" ")[0]; // MODERATE or STRICT
 let MAX_TRADES_DAY     = parseInt(process.env.MAX_TRADES_DAY || "3");
 let RSI_LONG_MAX       = parseFloat(process.env.RSI_LONG_MAX  || "65"); // RSI ceiling for LONG entries (avoid overbought)
@@ -119,6 +122,7 @@ const SETTINGS_SCHEMA = {
   TRAIL_DISTANCE_DOLLARS:{ type:"number", min:0,    max:50,   set:v=>TRAIL_DISTANCE_DOLLARS=v },
   MAX_OPTION_SPREAD_PCT:{ type:"number", min:0.01, max:1,     set:v=>MAX_OPTION_SPREAD_PCT=v },
   GEX_BUFFER:            { type:"number", min:0,    max:20,   set:v=>GEX_BUFFER=v },
+  GEX_OBSERVATION_ONLY:  { type:"enum",   values:["ON","OFF"], set:v=>GEX_OBSERVATION_ONLY=v },
   SIGNAL_MODE:           { type:"enum",   values:["MODERATE","STRICT"], set:v=>SIGNAL_MODE=v },
   MAX_TRADES_DAY:        { type:"number", min:0,    max:50, integer:true, set:v=>MAX_TRADES_DAY=v },
   RSI_LONG_MAX:          { type:"number", min:40,   max:90,  set:v=>RSI_LONG_MAX=v },
@@ -145,7 +149,7 @@ function getSettingsSnapshot(){
     TP1_MULTIPLIER, TP1_MIN_MULT, TP1_MAX_MULT,
     TRAIL_TRIGGER_PCT, TRAIL_DISTANCE_PCT,
     TRAIL_TRIGGER_DOLLARS, TRAIL_DISTANCE_DOLLARS, MAX_OPTION_SPREAD_PCT,
-    GEX_BUFFER, SIGNAL_MODE, MAX_TRADES_DAY,
+    GEX_BUFFER, GEX_OBSERVATION_ONLY, SIGNAL_MODE, MAX_TRADES_DAY,
     RSI_LONG_MAX, RSI_SHORT_MIN,
     DIRECTION_COOLDOWN, DIRECTION_COOLDOWN_MINS,
     MARKET_MODE_AUTO, MARKET_MODE_OVERRIDE,
@@ -347,6 +351,7 @@ function strategyConfigSnapshot(){
     strategy_id:STRATEGY_ID, app_version:APP_VERSION,
     expiry_dte:2, strike_selection:"immediate-directional-$1",
     signal_mode:SIGNAL_MODE, market_mode_auto:MARKET_MODE_AUTO,
+    gex_execution_mode:GEX_OBSERVATION_ONLY === "ON" ? "observation_only" : "gated",
     premium_stop_pct:PREMIUM_STOP_PCT, trail_trigger_pct:TRAIL_TRIGGER_PCT,
     trail_distance_pct:TRAIL_DISTANCE_PCT, max_option_spread_pct:MAX_OPTION_SPREAD_PCT,
   };
@@ -1890,7 +1895,7 @@ function startMonitor(signal, indicators) {
         let trailDist = sigTrailDistancePct;
         if (TRAIL_DISTANCE_DOLLARS > 0) {
           trailDist = TRAIL_DISTANCE_DOLLARS / signal.maxPrice;
-        } else if (gexCache) {
+        } else if (GEX_OBSERVATION_ONLY !== "ON" && gexCache) {
           const magnet = gexCache.zeroDteMagnet || (signal.direction==="LONG" ? gexCache.callWall : gexCache.putWall);
           if (magnet && price) {
             const headroom = signal.direction==="LONG"
@@ -2037,12 +2042,13 @@ function startMonitor(signal, indicators) {
 // ── Execute trade ─────────────────────────────────────────────────────────────
 async function executeTrade(direction, price, indicators, gexResult) {
   if(!ALPACA_KEY||!ALPACA_SECRET){log("ERROR","No Alpaca keys");return;}
-  // MAX_TRADES_DAY = 0 → auto mode: up to 5 when DEX strongly bullish and session is green
+  // MAX_TRADES_DAY = 0 → three trades by default; legacy DEX expansion is disabled
+  // while GEX is observation-only.
   const effectiveMaxTrades = MAX_TRADES_DAY === 0
-    ? (gexCache?.dex != null && gexCache.dex > 5e10 && sessionPnL > 0 ? 5 : 3)
+    ? (GEX_OBSERVATION_ONLY !== "ON" && gexCache?.dex != null && gexCache.dex > 5e10 && sessionPnL > 0 ? 5 : 3)
     : MAX_TRADES_DAY;
   if(tradesDay>=effectiveMaxTrades){
-    log("GUARD","Max "+effectiveMaxTrades+" trades/day reached"+(MAX_TRADES_DAY===0?" (auto: DEX="+((gexCache?.dex||0)/1e9).toFixed(0)+"B, PnL $"+sessionPnL.toFixed(0)+")":""));
+    log("GUARD","Max "+effectiveMaxTrades+" trades/day reached"+(MAX_TRADES_DAY===0&&GEX_OBSERVATION_ONLY!=="ON"?" (auto: DEX="+((gexCache?.dex||0)/1e9).toFixed(0)+"B, PnL $"+sessionPnL.toFixed(0)+")":""));
     return;
   }
   if(dailyLoss>=ACCOUNT_SIZE*MAX_DAILY_LOSS){log("GUARD","Daily loss limit reached");return;}
@@ -2067,7 +2073,7 @@ async function executeTrade(direction, price, indicators, gexResult) {
     stop:        indicators.orbLow,
     tp1:         gexResult.tp1, tp2:gexResult.tp2,
     gexTarget:   gexResult.target, gexReason:gexResult.reason, dexBias:gexResult.dexBias||"NEUTRAL",
-    gexPathResist: gexResult.pathResist??null, gexWallHardness: gexResult.wallHardness??null,
+    gexPathResist: gexResult.observation?.pathResist??gexResult.pathResist??null, gexWallHardness: gexResult.observation?.wallHardness??gexResult.wallHardness??null,
     squeezeAtEntry: indicators.squeeze ? {on:indicators.squeeze.on, fired:indicators.squeeze.fired, dir:indicators.squeeze.direction} : null,
     flagAtEntry: indicators.flag||null,
     expiry:      date.getFullYear()+String(date.getMonth()+1).padStart(2,"0")+String(date.getDate()).padStart(2,"0"),
@@ -2097,7 +2103,9 @@ async function executeTrade(direction, price, indicators, gexResult) {
       marketMode:   MARKET_MODE,         marketScore: marketScore,
       callWalls:    (gexCache.callWalls||[]).slice(0,3),
       putWalls:     (gexCache.putWalls||[]).slice(0,3),
-      gexRationale: gexResult.reason,    dexBias:    gexResult.dexBias,
+      gexRationale: gexResult.observation?.reason??gexResult.reason,
+      gexWouldAllow:gexResult.observation?.allowed??gexResult.allowed,
+      dexBias:    gexResult.observation?.dexBias??gexResult.dexBias,
     } : null,
   };
 
@@ -2296,8 +2304,9 @@ function detectMarketMode() {
     let score = 0;
     const reasons = [];
 
-    // Signal 1: GEX sign/magnitude (weight ×2) — most reliable signal
-    if (gexCache?.netGex != null) {
+    // Signal 1: GEX sign/magnitude. In observation-only mode it is recorded but
+    // has zero influence on active market mode and therefore on RSI/exit params.
+    if (GEX_OBSERVATION_ONLY !== "ON" && gexCache?.netGex != null) {
       const g = gexCache.netGex;
       // ANY positive net GEX is a pinning (chop) regime — dealers are long gamma and
       // suppress moves. The old $0-2B "neutral" band scored 0 and let a genuine pin day
@@ -2307,11 +2316,11 @@ function detectMarketMode() {
       else if (g < 0)    { score += 1; reasons.push("GEX neg (mild trend bias) +1"); }
       else if (g > 4e9)  { score -= 2; reasons.push("GEX>$4B (strong pinning) -2"); }
       else               { score -= 1; reasons.push("GEX>$0 (dealer long-gamma, pinning) -1"); }
-    } else { reasons.push("GEX unavailable"); }
+    } else { reasons.push(GEX_OBSERVATION_ONLY === "ON" ? "GEX observation-only (no mode weight)" : "GEX unavailable"); }
 
     // Signal 2: VEX — use percentile rank when available (normalised vs last 5 days),
     // fall back to absolute thresholds only when there is insufficient history (<5 snapshots).
-    if (gexCache?.vex != null) {
+    if (GEX_OBSERVATION_ONLY !== "ON" && gexCache?.vex != null) {
       const pct = gexCache.vexPctRank; // null when <5 historical records exist
       const vB  = (gexCache.vex / 1e9).toFixed(1);
       if (pct != null) {
@@ -2363,7 +2372,7 @@ function detectMarketMode() {
     let classified = score >= TREND_MIN_SCORE ? "TREND" : score <= -2 ? "CHOP" : "NEUTRAL";
 
     // Pin floor: positive GEX with VWAP on the gamma flip = pin/chop, never TREND.
-    if (classified === "TREND" && gexCache?.netGex > 0 && gexCache?.gammaFlip != null &&
+    if (GEX_OBSERVATION_ONLY !== "ON" && classified === "TREND" && gexCache?.netGex > 0 && gexCache?.gammaFlip != null &&
         lastVwap != null && Math.abs(lastVwap - gexCache.gammaFlip) < GEX_BUFFER) {
       reasons.push("PIN FLOOR: +GEX & VWAP $"+lastVwap.toFixed(2)+" on flip $"+gexCache.gammaFlip+" — capped TREND→NEUTRAL");
       classified = "NEUTRAL";
@@ -2373,7 +2382,7 @@ function detectMarketMode() {
     // within MAGNET_RANGE of the 0DTE magnet, it's not a trend: cap TREND→NEUTRAL so we use the
     // wide stop / run-to-TP1 profile instead of the scalp. Directly targets the 7/23 & 8/6
     // reverting-short days (negative GEX, price pinned to the magnet).
-    if (classified === "TREND" && gexCache?.zeroDteMagnet != null && lastVwap != null &&
+    if (GEX_OBSERVATION_ONLY !== "ON" && classified === "TREND" && gexCache?.zeroDteMagnet != null && lastVwap != null &&
         Math.abs(lastVwap - gexCache.zeroDteMagnet) < MAGNET_RANGE) {
       reasons.push("MAGNET PIN: VWAP $"+lastVwap.toFixed(2)+" within $"+MAGNET_RANGE+" of 0DTE magnet $"+gexCache.zeroDteMagnet+" — capped TREND→NEUTRAL (reverting, not trending)");
       classified = "NEUTRAL";
@@ -2539,7 +2548,7 @@ async function runSignalEngine() {
     // CHEX EOD bias filter — after 1 PM, charm decay forces directional MM hedging into close
     // Positive CHEX: MMs gain delta as time passes → must sell to stay neutral → headwind for LONGs
     // Negative CHEX: MMs lose delta as time passes → must buy to stay neutral → headwind for SHORTs
-    if(h>=13 && gexCache?.chex!=null){
+    if(GEX_OBSERVATION_ONLY !== "ON" && h>=13 && gexCache?.chex!=null){
       const CHEX_THRESHOLD=5e9; // $5B — filters only meaningful charm flow, not noise
       const chex=gexCache.chex;
       if(eval_result.direction==="LONG" && chex>CHEX_THRESHOLD){
@@ -2565,15 +2574,20 @@ async function runSignalEngine() {
       try{ await getGEX(false); }catch(e){ log("GEX ERR","pre-signal refresh: "+e.message); }
     }
 
-    // Apply GEX filter (walls, flip, magnet, DEX bias, VWAP-on-flip pin)
-    const gexResult=applyGEX(eval_result.direction,currentPrice,ind.vwap);
+    // Evaluate GEX for the journal, but do not let it change the order decision
+    // in observation-only mode. This preserves a clean counterfactual: each trade
+    // carries the exact GEX rule that would have allowed or blocked it.
+    const gexObservation=applyGEX(eval_result.direction,currentPrice,ind.vwap);
+    const gexResult=GEX_OBSERVATION_ONLY === "ON"
+      ? {allowed:true,reason:"GEX observation-only — no execution effect",tp1:null,tp2:null,target:null,dexBias:"NEUTRAL",observation:gexObservation}
+      : gexObservation;
     if(!gexResult.allowed){
       log("GEX","Signal BLOCKED — "+gexResult.reason);
-      saveSignalToDB({direction:eval_result.direction,spyEntry:currentPrice,gexTarget:gexResult.target,strength:eval_result.strength},{...ind,decisionChecks:{passed:eval_result.passed,failed:eval_result.failed,gex:{allowed:false,reason:gexResult.reason}}},false,"GEX: "+gexResult.reason);
+      saveSignalToDB({direction:eval_result.direction,spyEntry:currentPrice,gexTarget:gexResult.target,strength:eval_result.strength},{...ind,decisionChecks:{passed:eval_result.passed,failed:eval_result.failed,gex:{allowed:false,reason:gexResult.reason,executionGate:true}}},false,"GEX: "+gexResult.reason);
       scanActive=false;return;
     }
 
-    log("SIGNAL","FIRED ✓ | "+eval_result.direction+" | "+eval_result.reason+" | GEX: "+gexResult.reason);
+    log("SIGNAL","FIRED ✓ | "+eval_result.direction+" | "+eval_result.reason+" | GEX: "+gexResult.reason+(GEX_OBSERVATION_ONLY === "ON" ? " | would "+(gexObservation.allowed?"ALLOW":"BLOCK")+": "+gexObservation.reason : ""));
     broadcast({type:"signal_fired",direction:eval_result.direction,price:currentPrice,reason:eval_result.reason});
 
     // Flow and AlgoEdge are measurement-only. They are captured only after all
@@ -2582,7 +2596,7 @@ async function runSignalEngine() {
     const signalIntel=await collectSignalIntel(eval_result.direction);
     signalIntel.macro=macroIntel;
     await executeTrade(eval_result.direction, currentPrice, {...ind,strength:eval_result.strength,marketIntel:signalIntel,
-      decisionChecks:{passed:eval_result.passed,failed:eval_result.failed,gex:{allowed:true,reason:gexResult.reason},macro:{allowed:true,reason:macroResult.reason}}}, gexResult);
+      decisionChecks:{passed:eval_result.passed,failed:eval_result.failed,gex:{allowed:gexObservation.allowed,reason:gexObservation.reason,executionGate:false,observationOnly:GEX_OBSERVATION_ONLY === "ON"},macro:{allowed:true,reason:macroResult.reason}}}, gexResult);
 
   }catch(e){ log("SCAN ERR","runSignalEngine: "+e.message); }
   scanActive=false;
@@ -2645,9 +2659,8 @@ async function recoverPositions(){
 // AND, critically, the daily-loss circuit breaker and max-trades-per-day cap — the bot
 // would forget it was already down for the day. Rebuild all three from today's persisted
 // trades so the accounting and safety limits survive restarts.
-// Classifier health — the market-mode classifier's primary, highest-weighted input is
-// net GEX. When GEX is missing/stale/quota-blocked the classifier still runs but is flying
-// on secondary signals only (degraded). Surface this so the dashboard can warn loudly.
+// In observation-only mode GEX freshness is operational telemetry, not classifier health:
+// a missing or stale provider cannot change entry, sizing, targets, exits, or market mode.
 function classifierHealth(){
   const now=Date.now();
   const ageMin = gexCacheTime ? Math.round((now-gexCacheTime)/60000) : null;
@@ -2655,7 +2668,9 @@ function classifierHealth(){
   const available = !!(gexCache && gexCache.netGex != null);
   const stale = available && ageMin != null && ageMin > staleAfter;
   let status="OK", reason="GEX live";
-  if (tradeEchoQuotaBlocked) { status="FAILED"; reason="TradeEcho 20-request/hour cap reached — classifier paused until next hour"; }
+  if(GEX_OBSERVATION_ONLY === "ON") {
+    reason=available ? (stale ? "GEX stale — observation only; execution unaffected" : "GEX live — observation only; execution unaffected") : "GEX unavailable — observation only; execution unaffected";
+  } else if (tradeEchoQuotaBlocked) { status="FAILED"; reason="TradeEcho 20-request/hour cap reached — classifier paused until next hour"; }
   else if (!available)     { status="FAILED";   reason="No GEX data — classifier running without its primary signal"; }
   else if (stale)          { status="DEGRADED"; reason="GEX stale ("+ageMin+"m old) — classifier may be acting on outdated regime"; }
   return { status, reason, gexAvailable:available, gexAgeMin:ageMin, gexStale:stale,
@@ -3324,6 +3339,7 @@ app.get("/status",(req,res)=>{
   res.json({
     version:APP_VERSION, mode:IS_PAPER?"PAPER":"LIVE",
     signalMode:SIGNAL_MODE, marketMode:MARKET_MODE, marketScore, marketModeAuto:MARKET_MODE_AUTO,
+    gexExecutionMode:GEX_OBSERVATION_ONLY === "ON" ? "OBSERVATION_ONLY" : "GATED",
     SIGNAL_SCAN_MINS, GEX_REFRESH_MINS,
     noTradingView:true,
     exitStrategy:"price-monitor + DELETE /v2/positions",
