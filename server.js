@@ -57,7 +57,7 @@ const ALPACA_DATA      = "https://data.alpaca.markets";
 // they can never drift apart again (the banner was stale at v11.8 while the app was v11.27).
 // Bump this for every pushed production-facing change; /status and the dashboard
 // expose it so a Railway deployment can be verified without inspecting logs.
-const APP_VERSION      = "11.37-gex-observation-only";
+const APP_VERSION      = "11.38-premium-capped-sizing";
 // A stable cohort tag, deliberately separate from the display version. Every new
 // journal row carries it, so the 2DTE/immediate-strike strategy can be measured
 // without mixing it with the historical 0DTE/GEX-strike records.
@@ -160,12 +160,14 @@ function getSettingsSnapshot(){
 }
 
 function getRiskBudget() { return RISK_DOLLARS > 0 ? RISK_DOLLARS : ACCOUNT_SIZE * RISK_PER_TRADE; }
-// RISK_DOLLARS is a stop-loss budget, not premium outlay. Size from the per-contract
-// loss between the entry limit and the software stop; account/notional caps still apply.
-function calcContracts(entryPrice, stopPrice) {
-  const perContractRisk = (entryPrice - stopPrice) * 100;
-  return !Number.isFinite(perContractRisk) || perContractRisk <= 0
-    ? 0 : Math.floor(getRiskBudget() / perContractRisk);
+// The configured Risk per Trade is the maximum cash premium deployed for one
+// order. Stops remain active safety controls, but they never expand position size.
+// A buy-limit order cannot fill above quote.ask, and the final total-cost guard
+// below protects this cap against future changes to sizing behavior.
+function calcContracts(entryPrice) {
+  const perContractCost = entryPrice * 100;
+  return !Number.isFinite(perContractCost) || perContractCost <= 0
+    ? 0 : Math.floor(getRiskBudget() / perContractCost);
 }
 /**
  * TP1 now represents the trailing stop TRIGGER price — the option premium level
@@ -2131,9 +2133,10 @@ async function executeTrade(direction, price, indicators, gexResult) {
     const mpForRisk=MARKET_MODE_AUTO==="ON"?getModeParams():null;
     const plannedStopPct=(mpForRisk?.premiumStopPct&&quote.ask>0.70)?mpForRisk.premiumStopPct:PREMIUM_STOP_PCT;
     const plannedStop=parseFloat((quote.ask*(1-plannedStopPct)).toFixed(2));
-    let contracts=calcContracts(quote.ask,plannedStop);
-    if(contracts<1) throw new Error("SAFETY: risk budget is below one contract at the configured stop");
+    let contracts=calcContracts(quote.ask);
+    if(contracts<1) throw new Error("SAFETY: configured risk-per-trade budget is below one option contract");
     const totalCost=parseFloat((quote.ask*100*contracts).toFixed(2));
+    if(totalCost>getRiskBudget()) throw new Error("SAFETY: $"+totalCost+" premium exceeds configured $"+getRiskBudget()+" per-trade budget");
     if(contracts>50)               throw new Error("SAFETY: "+contracts+" contracts > 50");
     if(totalCost>ACCOUNT_SIZE*0.10) throw new Error("SAFETY: $"+totalCost+" > 10% of account");
 

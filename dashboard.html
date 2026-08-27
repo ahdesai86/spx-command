@@ -889,8 +889,8 @@ async function closeAll() {
 
 // ── Settings ──────────────────────────────────────────────────────────────────
 const SETTINGS_META = {
-  RISK_DOLLARS:          {label:"Risk per Trade",            unit:"$",        step:50},
-  RISK_PER_TRADE:        {label:"Risk % of Account",         unit:"",         step:0.01, hint:"used only if Risk per Trade = 0"},
+  RISK_DOLLARS:          {label:"Max Premium per Trade",     unit:"$",        step:50, hint:"Hard maximum cash deployed for one options order. Stop-loss risk may be lower."},
+  RISK_PER_TRADE:        {label:"Max Premium % of Account",  unit:"",         step:0.01, hint:"used only if Max Premium per Trade = 0"},
   MAX_DAILY_LOSS:        {label:"Daily Loss Limit",          unit:"× acct",   step:0.01},
   PREMIUM_STOP_PCT:      {label:"Stop Loss",                 unit:"× premium",step:0.01},
   TRAIL_TRIGGER_PCT:     {label:"Trail Trigger % (gain)",    unit:"× gain",   step:0.05, hint:"% unrealized gain to activate trailing stop (e.g. 0.5 = +50%). Ignored if $ version is set."},
