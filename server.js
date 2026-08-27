@@ -57,7 +57,7 @@ const ALPACA_DATA      = "https://data.alpaca.markets";
 // they can never drift apart again (the banner was stale at v11.8 while the app was v11.27).
 // Bump this for every pushed production-facing change; /status and the dashboard
 // expose it so a Railway deployment can be verified without inspecting logs.
-const APP_VERSION      = "11.38-premium-capped-sizing";
+const APP_VERSION      = "11.39-manual-close-reconciliation";
 // A stable cohort tag, deliberately separate from the display version. Every new
 // journal row carries it, so the 2DTE/immediate-strike strategy can be measured
 // without mixing it with the historical 0DTE/GEX-strike records.
@@ -526,6 +526,47 @@ function saveTradeToDB(trade, signalDbId, indicators) {
       })),
     });
   } catch(e) { log("DB ERR","saveTradeToDB: "+e.message); return null; }
+}
+
+// One-time, idempotent repair for the 2026-08-27 manual dashboard close that
+// reached Alpaca but bypassed the old journal path. Exit price is user-confirmed;
+// the exact close timestamp was not persisted, so the record says so explicitly.
+function backfillKnownManualClose(){
+  const signalJournalId="signal_75c639e1-5dca-4420-99a5-f644ef3d7314";
+  const trades=loadDB("trades");
+  if(trades.some(t=>t.signal_journal_id===signalJournalId)) return;
+  const signal=loadDB("signals").find(s=>s.journal_id===signalJournalId);
+  if(!signal){ log("DB ERR","Manual-close backfill skipped — source signal missing"); return; }
+  const fillPrice=2.95, closePrice=3.42, contracts=26;
+  const pnl=parseFloat(((closePrice-fillPrice)*100*contracts).toFixed(2));
+  const now=new Date();
+  insertDB("trades",{
+    journal_id:journalId("trade"), strategy_id:signal.strategy_id||STRATEGY_ID,
+    strategy_run_id:signal.strategy_run_id||STRATEGY_RUN_ID, journal_schema_version:JOURNAL_SCHEMA_VERSION,
+    signal_id:signal.id, signal_journal_id:signalJournalId,
+    timestamp:now.toISOString(), date:now.toLocaleDateString("en-CA",{timeZone:"America/New_York"}),
+    time:now.toLocaleTimeString("en-US",{hour12:false,timeZone:"America/New_York"}),
+    bot:"SPX-COMMAND", source:"manual_reconciled",
+    symbol:"SPY260831C00770000", direction:"LONG", right_type:"C", strike:770, expiry:"20260831",
+    contracts, fill_price:fillPrice, total_cost:fillPrice*100*contracts,
+    stop_price:2.21, tp1_price:4.43, tp1_armed:0,
+    close_price:closePrice, close_reason:"MANUAL_CLOSE_RECONCILED",
+    max_price:null, min_price:null, max_pnl_pct:null, min_pnl_pct:null,
+    pnl, pnl_pct:parseFloat((pnl/(fillPrice*100*contracts)*100).toFixed(1)), duration_min:null, outcome:"WIN",
+    gex_regime:signal.gex_regime??null, gex_flip:signal.gex_flip??null, net_gex_entry:signal.net_gex??null,
+    dex_entry:signal.dex??null, vex_entry:signal.vex??null, chex_entry:signal.chex??null, magnet_entry:null,
+    orb_high:signal.orb_high??null, orb_low:signal.orb_low??null, vwap_at_entry:signal.vwap??null,
+    rsi_at_entry:signal.rsi??null, squeeze_at_entry:null, flag_at_entry:signal.flag_pattern??null,
+    gex_path_resist:signal.gex_path_resist??null, ema9_at_entry:signal.ema9??null, ema21_at_entry:signal.ema21??null,
+    tp1_mode:"trail-trigger-50%", risk_budget:2000, signal_mode:signal.signal_mode??SIGNAL_MODE,
+    market_mode:signal.market_mode??"NEUTRAL", mode_at_fill:signal.market_mode??"NEUTRAL",
+    strategy_config:signal.strategy_config||strategyConfigSnapshot(),
+    entry_execution:{limit_price:2.98,planned_contracts:26,order_id:"59c611cc-04de-46e5-ba0e-7add79b65cba",filled_at:signal.timestamp,fill_price:fillPrice,source:"service_log"},
+    exit_execution:{fill_price:closePrice,source:"user_confirmed_manual_close",actual_close_timestamp:null,reconciled_at:now.toISOString()},
+    market_intel:signal.market_intel??null, shadow_exits:[],
+    manual_reconciliation:{reason:"Dashboard manual close bypassed legacy journal path",exit_price_confirmed_by:"user",reconciled_at:now.toISOString()},
+  });
+  log("DB","Backfilled manual close — 26x SPY260831C00770000 @ $3.42 | PnL $"+pnl.toFixed(2));
 }
 
 // Computes percentile rank of currentValue within the historical series (0-100).
@@ -1817,6 +1858,35 @@ async function closePositionConfirmed(symbol, fallbackPrice, trade=null){
   return { ok:true, fillPrice };
 }
 
+// Dashboard manual closes must use the same confirmed-close and journal path as
+// stops and EOD exits. The prior /cancel route cleared the monitor, sent DELETE,
+// then discarded the fill, P&L, and trade row.
+async function manualCloseSignal(signal){
+  if(!signal||!signal.optionSymbol||signal.status!=="FILLED") return {ok:false,error:"No filled position to close"};
+  let fallbackPrice=null;
+  try{
+    const pos=await aGet("/v2/positions/"+encodeURIComponent(signal.optionSymbol));
+    fallbackPrice=parseFloat(pos.current_price||0)||null;
+  }catch(_){}
+  const closed=await closePositionConfirmed(signal.optionSymbol,fallbackPrice,signal);
+  if(!closed.ok) return closed;
+  if(signal._monitorInterval) clearInterval(signal._monitorInterval);
+  const entry=signal.fillPrice||signal.midPrice;
+  const exitPx=closed.fillPrice;
+  const pnl=(entry!=null&&exitPx!=null) ? (exitPx-entry)*100*signal.contracts : null;
+  signal.status="MANUAL_CLOSED";
+  signal.closeReason="MANUAL_CLOSE";
+  signal.closePrice=exitPx;
+  signal.closePnl=pnl;
+  signal.durationMin=signal.entryTime?((Date.now()-signal.entryTime)/60000).toFixed(1):null;
+  signal.outcome=pnl==null?"UNKNOWN":(pnl>=0?"WIN":"LOSS");
+  if(pnl!=null){ sessionPnL+=pnl; if(pnl<0) dailyLoss+=Math.abs(pnl); }
+  saveTradeToDB(signal,signal._dbId,signal.indicators||{});
+  broadcast({type:"signal_update",id:signal.id,status:"MANUAL_CLOSED",closeReason:"MANUAL_CLOSE",pnl,closePrice:exitPx});
+  log("MANUAL","Closed "+signal.optionSymbol+" @ "+(exitPx!=null?"$"+exitPx:"unknown price")+(pnl!=null?" | PnL $"+pnl.toFixed(2):" | PnL unknown")+" — journaled");
+  return {ok:true,fillPrice:exitPx,pnl};
+}
+
 // ── Price monitor ─────────────────────────────────────────────────────────────
 // Stepped ladder ratchet — widening variant. Peak gain (pts) → locked profit (pts):
 //   <15: not armed | 15-19: breakeven | 20-40: lock 5 per 5 (20→5 ... 40→25)
@@ -2942,10 +3012,13 @@ app.post("/cancel/:id",async(req,res)=>{
   const id=parseInt(req.params.id);
   const sig=signalHistory.find(s=>s.id===id);
   if(!sig) return res.status(404).json({error:"Not found"});
-  if(sig._monitorInterval) clearInterval(sig._monitorInterval);
-  if(sig.optionSymbol&&["FILLED","SENT"].includes(sig.status)){
-    try{await closePosition(sig.optionSymbol);}catch(_){}
+  if(sig.status==="FILLED"){
+    const result=await manualCloseSignal(sig);
+    if(!result.ok) return res.status(409).json({status:"failed",error:result.error||"close not confirmed"});
+    return res.json({status:"manual_closed",result});
   }
+  if(["MANUAL_CLOSED","STOPPED","EOD_CLOSED"].includes(sig.status)) return res.status(409).json({status:"already_closed"});
+  if(sig._monitorInterval) clearInterval(sig._monitorInterval);
   sig.status="CANCELLED";
   broadcast({type:"signal_update",id,status:"CANCELLED"});
   res.json({status:"cancelled"});
@@ -2954,9 +3027,14 @@ app.post("/cancel/:id",async(req,res)=>{
 app.post("/closeall",async(req,res)=>{await forceCloseAll();res.json({status:"done"});});
 
 app.post("/closeposition/:symbol",async(req,res)=>{
+  const sig=signalHistory.find(s=>s.optionSymbol===req.params.symbol&&s.status==="FILLED");
+  if(sig){
+    const result=await manualCloseSignal(sig);
+    return res.status(result.ok?200:409).json({status:result.ok?"manual_closed":"failed",result});
+  }
   const r=await closePosition(req.params.symbol);
-  log("MANUAL","Closed "+req.params.symbol+" → "+r.status);
-  res.json({status:r.ok?"closed":"failed",result:r.data});
+  log("MANUAL","Closed untracked "+req.params.symbol+" → "+r.status);
+  res.json({status:r.ok?"closed_untracked":"failed",result:r.data});
 });
 
 // DB query endpoints for data mining
@@ -3471,6 +3549,7 @@ app.listen(PORT,async()=>{
  ╚══════════════════════════════════════════════════════╝
 `);
   initDB();
+  backfillKnownManualClose();
   await checkAccount();
   await fetchDailyEMAs(); // seed EMA9/21 from prior closes — always available from first bar
   await fetchPrevDayData(); // prev session close + 5-day ADR for market mode classifier
