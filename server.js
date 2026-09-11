@@ -57,7 +57,7 @@ const ALPACA_DATA      = "https://data.alpaca.markets";
 // they can never drift apart again (the banner was stale at v11.8 while the app was v11.27).
 // Bump this for every pushed production-facing change; /status and the dashboard
 // expose it so a Railway deployment can be verified without inspecting logs.
-const APP_VERSION      = "11.39-manual-close-reconciliation";
+const APP_VERSION      = "11.40-time-progress-late-delta";
 // A stable cohort tag, deliberately separate from the display version. Every new
 // journal row carries it, so the 2DTE/immediate-strike strategy can be measured
 // without mixing it with the historical 0DTE/GEX-strike records.
@@ -91,6 +91,11 @@ let TRAIL_TRIGGER_PCT     = parseFloat(process.env.TRAIL_TRIGGER_PCT     || "0.5
 let TRAIL_DISTANCE_PCT    = parseFloat(process.env.TRAIL_DISTANCE_PCT    || "0.20"); // trail this far below peak (overridden by $ if set)
 let TRAIL_TRIGGER_DOLLARS = parseFloat(process.env.TRAIL_TRIGGER_DOLLARS || "0");    // > 0: use $ gain to trigger instead of %
 let TRAIL_DISTANCE_DOLLARS= parseFloat(process.env.TRAIL_DISTANCE_DOLLARS|| "0");    // > 0: trail $ below peak instead of %
+// Close a position that has not proven momentum by reaching its fill-time trail trigger.
+// 75 minutes sits within the requested 60–90 minute window; 0 disables the protection.
+let TIME_PROGRESS_EXIT_MINS = parseInt(process.env.TIME_PROGRESS_EXIT_MINS || "75");
+// After 14:30 ET, compare T+1 and T+2 contracts and choose the delta nearest this target.
+let LATE_EXPIRY_TARGET_DELTA = parseFloat(process.env.LATE_EXPIRY_TARGET_DELTA || "0.50");
 let MAX_OPTION_SPREAD_PCT = parseFloat(process.env.MAX_OPTION_SPREAD_PCT || "0.15"); // reject illiquid contracts
 let GEX_BUFFER         = parseFloat(process.env.GEX_BUFFER       || "1.0");
 // GEX remains fetched and journaled, but never controls entries, classification,
@@ -120,6 +125,8 @@ const SETTINGS_SCHEMA = {
   TRAIL_DISTANCE_PCT:    { type:"number", min:0.01, max:0.95, set:v=>TRAIL_DISTANCE_PCT=v },
   TRAIL_TRIGGER_DOLLARS: { type:"number", min:0,    max:50,   set:v=>TRAIL_TRIGGER_DOLLARS=v },
   TRAIL_DISTANCE_DOLLARS:{ type:"number", min:0,    max:50,   set:v=>TRAIL_DISTANCE_DOLLARS=v },
+  TIME_PROGRESS_EXIT_MINS:{ type:"number", min:0,    max:240,  integer:true, set:v=>TIME_PROGRESS_EXIT_MINS=v },
+  LATE_EXPIRY_TARGET_DELTA:{ type:"number", min:0.05,max:0.95, set:v=>LATE_EXPIRY_TARGET_DELTA=v },
   MAX_OPTION_SPREAD_PCT:{ type:"number", min:0.01, max:1,     set:v=>MAX_OPTION_SPREAD_PCT=v },
   GEX_BUFFER:            { type:"number", min:0,    max:20,   set:v=>GEX_BUFFER=v },
   GEX_OBSERVATION_ONLY:  { type:"enum",   values:["ON","OFF"], set:v=>GEX_OBSERVATION_ONLY=v },
@@ -148,7 +155,8 @@ function getSettingsSnapshot(){
     RISK_DOLLARS, RISK_PER_TRADE, MAX_DAILY_LOSS, PREMIUM_STOP_PCT,
     TP1_MULTIPLIER, TP1_MIN_MULT, TP1_MAX_MULT,
     TRAIL_TRIGGER_PCT, TRAIL_DISTANCE_PCT,
-    TRAIL_TRIGGER_DOLLARS, TRAIL_DISTANCE_DOLLARS, MAX_OPTION_SPREAD_PCT,
+    TRAIL_TRIGGER_DOLLARS, TRAIL_DISTANCE_DOLLARS, TIME_PROGRESS_EXIT_MINS,
+    LATE_EXPIRY_TARGET_DELTA, MAX_OPTION_SPREAD_PCT,
     GEX_BUFFER, GEX_OBSERVATION_ONLY, SIGNAL_MODE, MAX_TRADES_DAY,
     RSI_LONG_MAX, RSI_SHORT_MIN,
     DIRECTION_COOLDOWN, DIRECTION_COOLDOWN_MINS,
@@ -348,14 +356,15 @@ function insertDB(table, row) {
 }
 
 function journalId(kind){ return kind+"_"+crypto.randomUUID(); }
-function strategyConfigSnapshot(){
+function strategyConfigSnapshot(expiryDte=2){
   return {
     strategy_id:STRATEGY_ID, app_version:APP_VERSION,
-    expiry_dte:2, strike_selection:"immediate-directional-$1",
+    expiry_dte:expiryDte, strike_selection:"immediate-directional-$1",
     signal_mode:SIGNAL_MODE, market_mode_auto:MARKET_MODE_AUTO,
     gex_execution_mode:GEX_OBSERVATION_ONLY === "ON" ? "observation_only" : "gated",
     premium_stop_pct:PREMIUM_STOP_PCT, trail_trigger_pct:TRAIL_TRIGGER_PCT,
-    trail_distance_pct:TRAIL_DISTANCE_PCT, max_option_spread_pct:MAX_OPTION_SPREAD_PCT,
+    trail_distance_pct:TRAIL_DISTANCE_PCT, time_progress_exit_mins:TIME_PROGRESS_EXIT_MINS,
+    late_expiry_target_delta:LATE_EXPIRY_TARGET_DELTA, max_option_spread_pct:MAX_OPTION_SPREAD_PCT,
   };
 }
 function decisionMeta(fired, reason=""){
@@ -390,6 +399,36 @@ function initDB() {
   } else {
     log("DB ERR", "No Railway Volume attached — DB at "+DB_DIR+" is EPHEMERAL and will be WIPED on next deploy/restart. Attach a volume in Railway dashboard (Settings -> Volumes) to persist trade history.");
   }
+  repairKnownJournalGaps();
+}
+
+// One-time, idempotent repair for the Aug 27 recovered-position exit. The restart
+// lost its original in-memory signal, so attach an explicitly-labelled recovery row
+// rather than incorrectly linking it to a different original trade signal.
+function repairKnownJournalGaps(){
+  try {
+    const trades=loadDB("trades"), signals=loadDB("signals");
+    const trade=trades.find(t=>t.journal_id==="trade_19ede60d-d7a7-49db-ae6e-ed10a9e54cc9");
+    if(!trade || trade.signal_id!=null) return;
+    const recoveredJournalId="signal_recovered_20260827_130953_spy771c";
+    let signal=signals.find(s=>s.journal_id===recoveredJournalId);
+    if(!signal){
+      const nextId=signals.length ? Math.max(...signals.map(s=>Number(s.id)||0))+1 : 1;
+      signal={id:nextId,journal_id:recoveredJournalId,strategy_id:trade.strategy_id||STRATEGY_ID,
+        strategy_run_id:trade.strategy_run_id||STRATEGY_RUN_ID,journal_schema_version:JOURNAL_SCHEMA_VERSION,
+        timestamp:"2026-08-27T17:09:53.390Z",date:"2026-08-27",time:"13:09:53",direction:"LONG",spy_price:null,
+        recovered_position:true,recovered_trade_journal_id:trade.journal_id,
+        decision_stage:"recovery",decision_code:"RECOVERED_POSITION",fired:1,blocked_reason:null,
+        strategy_config:trade.strategy_config||strategyConfigSnapshot(2)};
+      signals.push(signal); saveDB("signals",signals);
+    }
+    trade.signal_id=signal.id; trade.signal_journal_id=signal.journal_id;
+    const cost=Number(trade.total_cost)||Number(trade.fill_price)*100*Number(trade.contracts);
+    if(Number.isFinite(cost)&&cost>0&&Number.isFinite(Number(trade.pnl))) trade.pnl_pct=+((Number(trade.pnl)/cost)*100).toFixed(1);
+    trade.journal_repair={type:"recovered_position_link",repaired_at:new Date().toISOString(),source_signal:signal.journal_id};
+    saveDB("trades",trades);
+    log("DB","Repaired recovered Aug 27 trade linkage → signal #"+signal.id+" | PnL "+trade.pnl_pct+"%");
+  } catch(e) { log("DB ERR","repairKnownJournalGaps: "+e.message); }
 }
 
 
@@ -471,6 +510,9 @@ function saveTradeToDB(trade, signalDbId, indicators) {
       right_type:     trade.right,
       strike:         trade.strike,
       expiry:         trade.expiry,
+      expiry_dte:     trade.expiryDte??trade.strategyConfig?.expiry_dte??2,
+      expiry_selection:trade.expirySelection||null,
+      option_delta:   trade.optionDelta??null,
       contracts:      trade.contracts,
       fill_price:     trade.fillPrice,
       total_cost:     trade.totalCost,
@@ -486,6 +528,11 @@ function saveTradeToDB(trade, signalDbId, indicators) {
       pnl:            trade.closePnl||null,
       pnl_pct:        pnlPct,
       duration_min:   trade.durationMin||null,
+      time_progress_exit:{
+        limit_mins: trade.timeProgressExitMins??null,
+        target_price: trade.timeProgressTargetPrice??null,
+        exited: trade.closeReason==="TIME_PROGRESS_EXIT",
+      },
       outcome:        trade.outcome||null,
       // entry-time context (frozen at fill in executeTrade) — NOT the live close-time cache
       gex_regime:     trade.gexRegimeAtEntry ?? null,
@@ -1765,6 +1812,8 @@ function buildSymbol(strike,right,date) {
   return "SPY"+yy+mm+dd+right+String(Math.round(strike*1000)).padStart(8,"0");
 }
 function getETDate(){return new Date(new Date().toLocaleString("en-US",{timeZone:"America/New_York"}));}
+function isLateEntry(){const d=getETDate();return d.getHours()*60+d.getMinutes()>=14*60+30;}
+function yyyymmdd(date){return date.getFullYear()+String(date.getMonth()+1).padStart(2,"0")+String(date.getDate()).padStart(2,"0");}
 // DST-safe ET UTC-offset for a given YYYY-MM-DD ("-04:00" in EDT, "-05:00" in EST). Replaces
 // hardcoded "-04:00" which was wrong Nov–Mar (ORB window + bar filtering off by an hour).
 function etOffset(dateStr){
@@ -1802,14 +1851,34 @@ async function getOptionQuote(symbol){
     const bid=parseFloat(s.latestQuote.bp||0),ask=parseFloat(s.latestQuote.ap||0);
     if(!(bid>0&&ask>0&&ask>=bid)) return null;
     const mid=parseFloat(((bid+ask)/2).toFixed(2));
-    return { bid, ask, mid, spreadPct:(ask-bid)/mid,
+    const parsedDelta=s.greeks?.delta==null ? null : parseFloat(s.greeks.delta);
+    return { bid, ask, mid, spreadPct:(ask-bid)/mid, delta:Number.isFinite(parsedDelta)?parsedDelta:null,
       quoteTimestamp:s.latestQuote.t||null, capturedAt:new Date().toISOString() };
   }catch(_){return null;}
 }
 
 function quoteSnapshot(q){
-  return q ? {bid:q.bid,ask:q.ask,mid:q.mid,spread_pct:q.spreadPct,
+  return q ? {bid:q.bid,ask:q.ask,mid:q.mid,spread_pct:q.spreadPct,delta:q.delta??null,
     quote_timestamp:q.quoteTimestamp||null,captured_at:q.capturedAt||new Date().toISOString()} : null;
+}
+
+async function selectEntryExpiry(strike,right){
+  const late=isLateEntry(), offsets=late?[1,2]:[2], choices=[];
+  for(const dte of offsets){
+    const date=await getTradingDayOffset(dte), symbol=buildSymbol(strike,right,date), quote=await getOptionQuote(symbol);
+    choices.push({dte,date,symbol,quote,delta:quote?.delta??null});
+  }
+  if(!late) return choices[0];
+  const withDelta=choices.filter(c=>Number.isFinite(c.delta));
+  if(withDelta.length){
+    withDelta.sort((a,b)=>Math.abs(Math.abs(a.delta)-LATE_EXPIRY_TARGET_DELTA)-Math.abs(Math.abs(b.delta)-LATE_EXPIRY_TARGET_DELTA)||b.dte-a.dte);
+    const chosen=withDelta[0];
+    log("EXPIRY","Late entry: T+"+chosen.dte+" selected (delta "+Math.abs(chosen.delta).toFixed(2)+", target "+LATE_EXPIRY_TARGET_DELTA.toFixed(2)+")");
+    return chosen;
+  }
+  const fallback=choices.find(c=>c.dte===2)||choices[choices.length-1];
+  log("EXPIRY","Late entry: T+2 retained — option greeks unavailable for T+1/T+2 delta comparison");
+  return fallback;
 }
 async function captureExitQuote(trade){
   if(!trade?.optionSymbol) return null;
@@ -2025,6 +2094,22 @@ function startMonitor(signal, indicators) {
         return;
       }
 
+      const elapsedMinutes=(Date.now()-(signal.entryTime||entryTime))/60000;
+      if(signal.timeProgressExitMins>0 && elapsedMinutes>=signal.timeProgressExitMins &&
+         !signal.tp1Armed && signal.maxPrice<signal.timeProgressTargetPrice){
+        const cc=await closePositionConfirmed(signal.optionSymbol, price, signal);
+        if(!cc.ok){ log("MONITOR ERR","time-progress close FAILED — retrying next tick"); broadcast({type:"signal_update",id:signal.id,status:"CLOSE_FAILED"}); return; }
+        clearInterval(iv);
+        const exitPx=cc.fillPrice, pnl=(exitPx-entry)*100*signal.contracts;
+        signal.status="STOPPED"; signal.closePnl=pnl; signal.closePrice=exitPx;
+        signal.closeReason="TIME_PROGRESS_EXIT"; signal.durationMin=elapsedMinutes.toFixed(1); signal.outcome=pnl>=0?"WIN":"LOSS";
+        sessionPnL+=pnl; dailyLoss+=Math.abs(Math.min(0,pnl));
+        log("TIME EXIT",signal.optionSymbol+" closed @ $"+exitPx+" after "+elapsedMinutes.toFixed(1)+"m without reaching trail trigger $"+signal.timeProgressTargetPrice+" | peak $"+signal.maxPrice+" ("+signal.maxPnlPct+"%)");
+        broadcast({type:"signal_update",id:signal.id,status:"STOPPED",closeReason:"TIME_PROGRESS_EXIT",pnl});
+        saveTradeToDB(signal,signal._dbId,indicators);
+        return;
+      }
+
       log("MONITOR",signal.optionSymbol+" $"+price+" | P&L "+pct+"% | stop $"+signal.stopPrice+(signal.trailingActive?" (trailing)":signal.ratchetActive?" (ratchet +"+signal.ratchetLock+"%)":"")+" | tp1 $"+signal.tp1Price+" | max $"+signal.maxPrice+" | min $"+signal.minPrice);
       broadcast({type:"signal_update",id:signal.id,currentPrice:price,maxPrice:signal.maxPrice,minPrice:signal.minPrice,maxPnlPct:signal.maxPnlPct,minPnlPct:signal.minPnlPct});
 
@@ -2126,16 +2211,17 @@ async function executeTrade(direction, price, indicators, gexResult) {
   if(dailyLoss>=ACCOUNT_SIZE*MAX_DAILY_LOSS){log("GUARD","Daily loss limit reached");return;}
 
   const right = direction==="LONG"?"C":"P";
-  let date;
-  try { date=await getTradingDayOffset(2); }
-  catch(e){ log("SAFETY","2DTE calendar lookup failed — entry blocked: "+e.message); return; }
+  let expiryChoice;
   const si=selectStrike(price, direction);
+  try { expiryChoice=await selectEntryExpiry(si.strike, right); }
+  catch(e){ log("SAFETY","2DTE calendar lookup failed — entry blocked: "+e.message); return; }
+  const {date}=expiryChoice;
 
   const sig = {
     id:          Date.now(),
     journalId:   journalId("signal"),
     strategyId:  STRATEGY_ID,
-    strategyConfig:strategyConfigSnapshot(),
+    strategyConfig:strategyConfigSnapshot(expiryChoice.dte),
     time:        new Date().toLocaleTimeString("en-US",{hour12:false,timeZone:"America/New_York"}),
     symbol:      "SPY", direction, right,
     spyEntry:    price, strike:si.strike,
@@ -2148,8 +2234,9 @@ async function executeTrade(direction, price, indicators, gexResult) {
     gexPathResist: gexResult.observation?.pathResist??gexResult.pathResist??null, gexWallHardness: gexResult.observation?.wallHardness??gexResult.wallHardness??null,
     squeezeAtEntry: indicators.squeeze ? {on:indicators.squeeze.on, fired:indicators.squeeze.fired, dir:indicators.squeeze.direction} : null,
     flagAtEntry: indicators.flag||null,
-    expiry:      date.getFullYear()+String(date.getMonth()+1).padStart(2,"0")+String(date.getDate()).padStart(2,"0"),
-    is2DTE:      true,
+    expiry:      yyyymmdd(date), expiryDte:expiryChoice.dte,
+    expirySelection:isLateEntry()?"late-delta":"standard-t+2", optionDelta:expiryChoice.delta,
+    is2DTE:      expiryChoice.dte===2,
     riskBudget:getRiskBudget(),
     contracts:null, midPrice:null, totalCost:null,
     fillPrice:null, stopPrice:null, tp1Price:null,
@@ -2193,11 +2280,11 @@ async function executeTrade(direction, price, indicators, gexResult) {
   broadcast({type:"signal_update",id:sig.id,status:"EXECUTING"});
 
   try{
-    const symbol = buildSymbol(si.strike, right, date);
+    const symbol = expiryChoice.symbol;
     if(!/^SPY\d{6}[CP]\d{8}$/.test(symbol)) throw new Error("SAFETY: Bad OCC symbol: "+symbol);
     sig.optionSymbol = symbol;
 
-    const quote=await getOptionQuote(symbol);
+    const quote=expiryChoice.quote||await getOptionQuote(symbol);
     if(!quote||quote.ask<0.05||quote.ask>50) throw new Error("No valid quote for immediate 2DTE strike");
     if(quote.spreadPct>MAX_OPTION_SPREAD_PCT) throw new Error("SAFETY: option spread "+(quote.spreadPct*100).toFixed(1)+"% exceeds "+(MAX_OPTION_SPREAD_PCT*100).toFixed(1)+"% cap");
     const mpForRisk=MARKET_MODE_AUTO==="ON"?getModeParams():null;
@@ -2288,10 +2375,12 @@ async function executeTrade(direction, price, indicators, gexResult) {
 
     sig.stopPrice=stop; sig.tp1Price=tp1; sig.status="FILLED";
     sig.entryTime=Date.now();
+    sig.timeProgressExitMins=TIME_PROGRESS_EXIT_MINS;
+    sig.timeProgressTargetPrice=tp1;
     tradesDay++;
 
     broadcast({type:"signal_update",id:sig.id,status:"FILLED",fillPrice:sig.fillPrice,stopPrice:stop,tp1Price:tp1,modeAtFill:sig.modeAtFill,stopPct:effectiveStopPct});
-    log("FILL","Filled @ $"+sig.fillPrice+" | stop $"+stop+" ("+Math.round(effectiveStopPct*100)+"%) | tp1 $"+tp1+" | R:R "+((tp1-sig.fillPrice)/(sig.fillPrice-stop)).toFixed(1)+":1 | mode:"+sig.modeAtFill);
+    log("FILL","Filled @ $"+sig.fillPrice+" | stop $"+stop+" ("+Math.round(effectiveStopPct*100)+"%) | tp1 $"+tp1+" | time exit "+TIME_PROGRESS_EXIT_MINS+"m | R:R "+((tp1-sig.fillPrice)/(sig.fillPrice-stop)).toFixed(1)+":1 | mode:"+sig.modeAtFill);
     log("EXIT","Price monitor active — exits via DELETE /v2/positions (no sell orders)");
 
     startMonitor(sig, indicators);
@@ -3429,7 +3518,7 @@ app.get("/status",(req,res)=>{
     realGreeks:gexCache?.hasRealGreeks||false,
     tp1Config:{mode:"trail-trigger",value:TRAIL_TRIGGER_DOLLARS>0?"$"+TRAIL_TRIGGER_DOLLARS:"+"+(TRAIL_TRIGGER_PCT*100)+"%"},
     strikeSelection:"immediate $1 strike in signal direction",
-    expiry:"2DTE (Alpaca trading calendar)",
+    expiry:"T+2 normally; after 14:30 ET, T+1/T+2 closest eligible delta",
     strategyJournal:{strategyId:STRATEGY_ID,schemaVersion:JOURNAL_SCHEMA_VERSION,runId:STRATEGY_RUN_ID},
     trailingStop:{triggerPct:(TRAIL_TRIGGER_PCT*100)+"%",trailDistance:(TRAIL_DISTANCE_PCT*100)+"%"},
     sessionPnL:sessionPnL.toFixed(2), dailyLoss:dailyLoss.toFixed(2),

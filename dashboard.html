@@ -897,6 +897,8 @@ const SETTINGS_META = {
   TRAIL_TRIGGER_DOLLARS: {label:"Trail Trigger $ (gain)",    unit:"$",        step:0.05, hint:"$ gain above entry to activate trailing stop. Overrides % trigger when > 0. (e.g. 0.60 = triggers at entry + $0.60)"},
   TRAIL_DISTANCE_PCT:    {label:"Trail Distance % (below peak)",unit:"× peak",step:0.05, hint:"% below peak to place trailing stop. Dynamic when GEX magnet available. Ignored if $ version is set."},
   TRAIL_DISTANCE_DOLLARS:{label:"Trail Distance $ (below peak)",unit:"$",     step:0.05, hint:"$ below peak to place trailing stop. Overrides % distance when > 0."},
+  TIME_PROGRESS_EXIT_MINS:{label:"Time & Progress Exit",      unit:"min",   step:5, hint:"Close after this many minutes if the option never reaches its fill-time trail trigger. Set 0 to disable. Default 75."},
+  LATE_EXPIRY_TARGET_DELTA:{label:"Late Expiry Target Delta", unit:"Δ",     step:0.05, hint:"After 2:30 PM ET, choose T+1 or T+2 with delta closest to this target. T+2 is used if greeks are unavailable."},
   GEX_BUFFER:            {label:"GEX Wall Buffer",           unit:"$",        step:0.25, hint:"don't enter within this $ of a GEX wall"},
   SIGNAL_MODE:           {label:"Signal Mode",               enum:true},
   MAX_TRADES_DAY:        {label:"Max Trades / Session",      unit:"",         step:1,    hint:"0 = auto-adjust: up to 5 trades when DEX > 50B bullish + session P&L > 0, otherwise 3. Set manually to override."},
